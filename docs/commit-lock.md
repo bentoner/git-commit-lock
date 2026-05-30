@@ -96,6 +96,19 @@ the lock (e.g. a pre-commit hook rejects it), unstage your paths
 `lock_release` **before** you investigate, then retry. Never acquire the lock
 and then read, build, or ask the user.
 
+This is enforced by a **fail-open lease, not a guarantee**. The dir mtime (the
+staleness clock) is stamped once at `mkdir` and never refreshed, so a hold
+longer than `AGENT_LOCK_STALE_SECS` can be stolen by a waiter mid-work — two
+holders would then coexist. We accept that (no background heartbeat keeps the
+tool a single synchronous script) and instead make it *loud and detectable*:
+each acquire writes a unique token; release re-reads it and, if it no longer
+matches, the lease was stolen → return 2 + WARNING rather than claim success.
+So a robbed slow holder learns at release that its commit wasn't serialised and
+must redo it. A slow but *uncontended* holder is fine — nothing moved its dir,
+the token still matches, release succeeds. The defence is therefore: keep
+commits fast (well under the window), and if you must run something slow under
+the lock, raise `AGENT_LOCK_STALE_SECS` for that invocation.
+
 Never `git stash` in a shared checkout — it rewrites the working tree on disk and
 clobbers other agents' uncommitted edits.
 
@@ -140,6 +153,8 @@ Under `~/.agents/bin/` (canonical `C:\code\dotfiles\agents\bin\`):
 bash ~/.agents/bin/commit-lock.test.sh   # prints "RESULT: N passed, 0 failed"
 ```
 
-Covers mutual exclusion over 8×25 concurrent workers, stale-lock theft, the
-epoch-less-orphan regression, refusal to steal a live lock, exit-code
-propagation, and the git-dir lock location.
+Covers mutual exclusion over 8×25 concurrent workers (clean acquire/release
+path), stale-lock theft, the epoch-less-orphan regression, refusal to steal a
+*live* lock, a robbed slow holder detecting the theft and failing on release
+(plus the thief succeeding on its own fresh hold), an uncontended slow holder
+*not* failing, exit-code propagation, and the git-dir lock location.

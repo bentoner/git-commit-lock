@@ -86,6 +86,36 @@ wait "$holder"
   && ok "ordering correct" || bad "ordering wrong: $(tr '\n' ',' < "$ORDER")"
 grep -q STOLE "$LOG" && bad "waiter wrongly STOLE a live lock" || ok "no wrongful steal of live lock"
 
+echo "== Test 4b: holder TOO SLOW for the window detects theft + FAILS on release =="
+# The fail-open ceiling: a hold longer than the stale window gets stolen. The
+# slow holder must DETECT this at release and return non-zero (not silently
+# succeed). Regression guard for the lease bug found in review 2026-05-31.
+# (Would fail if lock_release skipped the token check.)
+LOCK="$WORK/slow.lock"; LOG="$WORK/slow.log"; : > "$LOG"; ORDER="$WORK/slow-order"; : > "$ORDER"
+# Slow holder: stale=1s, but holds ~3s -> its lease expires mid-hold.
+AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 \
+  bash "$LIB" run -- bash -c 'echo victim-work >> "$1"; sleep 3' _ "$ORDER"
+victim_rc=$?
+[ "$victim_rc" -ne 0 ] && ok "slow holder returns non-zero (got $victim_rc) when its lock was stolen" \
+                       || bad "slow holder returned 0 despite losing the lock (silent fail-open)"
+grep -q "WARNING: lock LOST" "$LOG" && ok "slow holder logged a loud theft WARNING" || bad "no theft WARNING logged"
+
+echo "== Test 4c: a thief that ran during the slow hold did its own work cleanly =="
+# While the victim slept past its lease, a thief should be able to steal and run
+# (fail-open), and the thief's OWN release must succeed (it held its fresh lock
+# cleanly). Run a thief concurrently with a fresh slow victim.
+LOCK="$WORK/slow2.lock"; LOG="$WORK/slow2.log"; : > "$LOG"; OUT="$WORK/slow2-out"; : > "$OUT"
+AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 \
+  bash "$LIB" run -- bash -c 'sleep 3; echo victim-done >> "$1"' _ "$OUT" &
+vpid=$!
+sleep 1.5   # let the victim's lease go stale
+AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 \
+  bash "$LIB" run -- bash -c 'echo thief-done >> "$1"' _ "$OUT"
+thief_rc=$?
+wait "$vpid" 2>/dev/null
+[ "$thief_rc" = 0 ] && ok "thief (fresh hold) released cleanly (rc 0)" || bad "thief rc=$thief_rc (should be 0)"
+grep -q thief-done "$OUT" && ok "thief did its work" || bad "thief work missing"
+
 echo "== Test 5: run propagates the command's exit code, releases either way =="
 LOCK="$WORK/rc.lock"; LOG="$WORK/rc.log"; : > "$LOG"
 AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" bash "$LIB" run -- bash -c 'exit 0'; [ "$?" = 0 ] && ok "exit 0 propagated" || bad "exit 0 not propagated"
