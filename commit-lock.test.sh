@@ -86,35 +86,41 @@ wait "$holder"
   && ok "ordering correct" || bad "ordering wrong: $(tr '\n' ',' < "$ORDER")"
 grep -q STOLE "$LOG" && bad "waiter wrongly STOLE a live lock" || ok "no wrongful steal of live lock"
 
-echo "== Test 4b: holder TOO SLOW for the window detects theft + FAILS on release =="
-# The fail-open ceiling: a hold longer than the stale window gets stolen. The
-# slow holder must DETECT this at release and return non-zero (not silently
-# succeed). Regression guard for the lease bug found in review 2026-05-31.
-# (Would fail if lock_release skipped the token check.)
-LOCK="$WORK/slow.lock"; LOG="$WORK/slow.log"; : > "$LOG"; ORDER="$WORK/slow-order"; : > "$ORDER"
-# Slow holder: stale=1s, but holds ~3s -> its lease expires mid-hold.
+echo "== Test 4b: a ROBBED slow holder detects the theft and FAILS on release =="
+# The fail-open ceiling: a hold longer than the stale window CAN be stolen by a
+# contender. The robbed holder must DETECT this at release (its token no longer
+# matches the dir) and return non-zero + log a WARNING, rather than silently
+# claim a serialised commit. The thief, holding its own fresh lock, must succeed.
+# Note: theft requires an actual contender — a slow but UNCONTENDED holder keeps
+# its lock (Test 4c). Regression guard for the lease bug found in review
+# 2026-05-31; would fail if lock_release skipped the token check.
+LOCK="$WORK/robbed.lock"; LOG="$WORK/robbed.log"; : > "$LOG"; OUT="$WORK/robbed-out"; : > "$OUT"
+# Victim: stale=1s but holds ~3s, so its lease expires while it works.
 AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 \
-  bash "$LIB" run -- bash -c 'echo victim-work >> "$1"; sleep 3' _ "$ORDER"
-victim_rc=$?
-[ "$victim_rc" -ne 0 ] && ok "slow holder returns non-zero (got $victim_rc) when its lock was stolen" \
-                       || bad "slow holder returned 0 despite losing the lock (silent fail-open)"
-grep -q "WARNING: lock LOST" "$LOG" && ok "slow holder logged a loud theft WARNING" || bad "no theft WARNING logged"
-
-echo "== Test 4c: a thief that ran during the slow hold did its own work cleanly =="
-# While the victim slept past its lease, a thief should be able to steal and run
-# (fail-open), and the thief's OWN release must succeed (it held its fresh lock
-# cleanly). Run a thief concurrently with a fresh slow victim.
-LOCK="$WORK/slow2.lock"; LOG="$WORK/slow2.log"; : > "$LOG"; OUT="$WORK/slow2-out"; : > "$OUT"
-AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 \
-  bash "$LIB" run -- bash -c 'sleep 3; echo victim-done >> "$1"' _ "$OUT" &
+  bash "$LIB" run -- bash -c 'echo victim-work >> "$1"; sleep 3' _ "$OUT" &
 vpid=$!
-sleep 1.5   # let the victim's lease go stale
+sleep 1.5   # let the victim's lease go stale, then a thief steals it
 AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 \
-  bash "$LIB" run -- bash -c 'echo thief-done >> "$1"' _ "$OUT"
+  bash "$LIB" run -- bash -c 'echo thief-work >> "$1"' _ "$OUT"
 thief_rc=$?
-wait "$vpid" 2>/dev/null
-[ "$thief_rc" = 0 ] && ok "thief (fresh hold) released cleanly (rc 0)" || bad "thief rc=$thief_rc (should be 0)"
-grep -q thief-done "$OUT" && ok "thief did its work" || bad "thief work missing"
+wait "$vpid"; victim_rc=$?
+[ "$victim_rc" -ne 0 ] && ok "robbed holder returns non-zero (got $victim_rc)" \
+                       || bad "robbed holder returned 0 — silent fail-open (token check missing?)"
+grep -q "WARNING: lock LOST" "$LOG" && ok "robbed holder logged a loud theft WARNING" || bad "no theft WARNING logged"
+[ "$thief_rc" = 0 ] && ok "thief (its own fresh hold) released cleanly (rc 0)" || bad "thief rc=$thief_rc (should be 0)"
+grep -q thief-work "$OUT" && ok "thief did its work" || bad "thief work missing"
+
+echo "== Test 4c: a slow but UNCONTENDED holder keeps its lock (slowness != failure) =="
+# Documents the boundary: exceeding the stale window is only dangerous when a
+# contender actually steals. With no waiter, the dir is never moved, the token
+# still matches, and release succeeds. (If this failed, the lock would punish
+# every slow hold even when perfectly safe.)
+LOCK="$WORK/slowok.lock"; LOG="$WORK/slowok.log"; : > "$LOG"; OUT="$WORK/slowok-out"; : > "$OUT"
+AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 \
+  bash "$LIB" run -- bash -c 'sleep 3; echo solo-done >> "$1"' _ "$OUT"; solo_rc=$?
+[ "$solo_rc" = 0 ] && ok "uncontended slow holder released cleanly (rc 0)" || bad "uncontended slow holder rc=$solo_rc (should be 0)"
+grep -q "WARNING: lock LOST" "$LOG" && bad "spurious theft WARNING with no contender" || ok "no spurious WARNING when uncontended"
+grep -q solo-done "$OUT" && ok "uncontended slow holder did its work" || bad "work missing"
 
 echo "== Test 5: run propagates the command's exit code, releases either way =="
 LOCK="$WORK/rc.lock"; LOG="$WORK/rc.log"; : > "$LOG"
