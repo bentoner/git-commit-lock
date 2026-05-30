@@ -158,3 +158,7 @@ path), stale-lock theft, the epoch-less-orphan regression, refusal to steal a
 *live* lock, a robbed slow holder detecting the theft and failing on release
 (plus the thief succeeding on its own fresh hold), an uncontended slow holder
 *not* failing, exit-code propagation, and the git-dir lock location.
+
+Last verified 2026-05-31: **19 passed, 0 failed**. Note the suite spawns ~200
+short-lived processes (Test 1 is 8×25 workers); on a loaded machine it can take
+several minutes, so allow a generous timeout rather than assuming a hang.
