@@ -117,7 +117,7 @@ clobbers other agents' uncommitted edits.
 Normal case — commit the paths you changed:
 
 ```sh
-~/.agents/bin/commit-lock.sh run -- bash -c '
+bash ~/.agents/bin/commit-lock.sh run -- bash -c '
   git add -- path/a path/b && git commit -m "msg"'
 ```
 
@@ -125,7 +125,7 @@ Shared file (you own only part of it) — stage just your hunk, commit the index
 
 ```sh
 git diff HEAD -- path/to/file > /tmp/mine.patch   # outside lock; trim to your hunk(s)
-~/.agents/bin/commit-lock.sh run -- bash -c '
+bash ~/.agents/bin/commit-lock.sh run -- bash -c '
   git diff --cached --quiet || { echo "index not clean" >&2; exit 1; }
   git apply --cached /tmp/mine.patch && git commit -m "msg"'   # BARE commit
 ```
