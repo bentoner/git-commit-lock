@@ -73,6 +73,50 @@ any repo), and correctly scoped: every worktree has its own git dir, so
 independent worktrees get independent locks, while all sub-agents sharing one
 checkout resolve the same git dir and share one lock.
 
+**One caveat on the mtime clock (added 2026-06-03).** A just-created lock dir can
+transiently report the Windows FILETIME zero (1601-01-01) in the window between
+creation and its first metadata write — a ~400-year bogus "age" that would
+spuriously steal a *live, brand-new* lock and put two holders in the tree. Both
+implementations therefore refuse to steal on any mtime below a sane floor
+(2000-01-01), treating a sub-floor reading as "just created — wait", and
+`commit-lock.ps1` additionally stamps the dir's mtime the instant it wins the
+create. This race only became reachable once the PowerShell port (whose atomic
+create is a temp-dir + rename, which leaves a longer unsettled-mtime window than
+`mkdir`) began sharing the lock with the bash path; the interop self-test catches
+it (~1-in-4 runs before the fix, 0 after).
+
+## The PowerShell port (`commit-lock.ps1`)
+
+Codex on Windows runs commands in **PowerShell**, where a bare `bash` resolves to
+`C:\Windows\system32\bash.exe` — the **WSL** launcher. WSL's Linux git can't reach
+the Windows SSH commit signer (no private key in WSL; the dotfiles agent-forward
+only fires in *interactive* WSL shells, not Codex's `bash -c`), so a bash-wrapped
+commit under Codex fails to sign (`No private key found … failed to write commit
+object`). Claude is immune — it ships its own MINGW64 Git-Bash. So Codex commits
+via `commit-lock.ps1` from PowerShell, where `git` is Git-for-Windows and signs.
+
+The port is **wire-compatible** with `commit-lock.sh`, so a `.ps1` holder and a
+`.sh` holder serialise against each other in one tree:
+
+- **Same lock dir / log:** `git rev-parse --absolute-git-dir` prints the same
+  forward-slash drive path (`C:/repo/.git`) under both MINGW git and Windows git,
+  so both compute `…/.git/commit.lock` and contend on the same NTFS directory.
+- **Same protocol:** atomic create-or-fail, dir-mtime staleness with the steal
+  threshold, rename-aside steal, unique-token release check. Tokens are written
+  BOM-free so each side reads the other's cleanly (only *inequality* matters for
+  steal detection, so the formats needn't match).
+- **PowerShell specifics that matter:** the atomic create is a temp-dir +
+  `[IO.Directory]::Move` (because `New-Item -ItemType Directory` has a
+  check-then-create TOCTOU and `[IO.Directory]::CreateDirectory` silently succeeds
+  on an existing dir — neither is a mutex gate). The load-bearing token write and
+  the release-time token read each retry briefly to ride out transient Windows
+  sharing violations (a dropped token write would later look like a false theft).
+
+Usage (Codex): `& ~/.agents/bin/commit-lock.ps1 run "git add -- <paths>; if ($LASTEXITCODE -eq 0) { git commit -m '<msg>' }"`. Chain with
+`if ($LASTEXITCODE -eq 0)` (not `&&`, not `exit`); exit code 2 = lock lost
+mid-hold, redo. Verified end-to-end 2026-06-03: a commit through the port carries
+a Good SSH signature.
+
 ## API
 
 Source it (`source ~/.agents/bin/commit-lock.sh`) for:
@@ -144,21 +188,35 @@ Under `~/.agents/bin/` (canonical `C:\code\dotfiles\agents\bin\`):
 
 | File | Role |
 |------|------|
-| `commit-lock.sh`      | the mutex: source for `lock_acquire/lock_release/lock_run`, or `commit-lock.sh run -- <cmd>` |
-| `commit-lock.test.sh` | self-contained tests (throwaway temp dirs); exit 0 == all pass |
+| `commit-lock.sh`             | the mutex (bash, used by Claude): source for `lock_acquire/lock_release/lock_run`, or `commit-lock.sh run -- <cmd>` |
+| `commit-lock.ps1`            | wire-compatible PowerShell port (used by Codex on Windows — see below): `commit-lock.ps1 run "<pwsh cmd>"`, or dot-source for `Lock-Acquire`/`Lock-Release` |
+| `commit-lock.test.sh`        | self-contained bash tests (throwaway temp dirs); exit 0 == all pass |
+| `commit-lock.interop.test.sh`| cross-impl tests: pwsh + bash workers share one lock and serialise; run from MINGW/Git-Bash |
 
 ## Verifying on a new machine
 
 ```
-bash ~/.agents/bin/commit-lock.test.sh   # prints "RESULT: N passed, 0 failed"
+bash ~/.agents/bin/commit-lock.test.sh            # bash impl; "RESULT: N passed, 0 failed"
+bash ~/.agents/bin/commit-lock.interop.test.sh    # cross-impl (needs pwsh); "INTEROP RESULT: …"
 ```
 
-Covers mutual exclusion over 8×25 concurrent workers (clean acquire/release
-path), stale-lock theft, the epoch-less-orphan regression, refusal to steal a
-*live* lock, a robbed slow holder detecting the theft and failing on release
-(plus the thief succeeding on its own fresh hold), an uncontended slow holder
-*not* failing, exit-code propagation, and the git-dir lock location.
+`commit-lock.test.sh` covers mutual exclusion over 8×25 concurrent workers (clean
+acquire/release path), stale-lock theft, the epoch-less-orphan regression,
+refusal to steal a *live* lock, a robbed slow holder detecting the theft and
+failing on release (plus the thief succeeding on its own fresh hold), an
+uncontended slow holder *not* failing, exit-code propagation, and the git-dir
+lock location.
 
-Last verified 2026-05-31: **19 passed, 0 failed**. Note the suite spawns ~200
-short-lived processes (Test 1 is 8×25 workers); on a loaded machine it can take
-several minutes, so allow a generous timeout rather than assuming a hang.
+`commit-lock.interop.test.sh` proves `.ps1` and `.sh` interlock: 8 bash + 8 pwsh
+workers serialise on one lock with zero concurrent-holder violations and zero
+spurious steals; a bash holder blocks a pwsh waiter and vice-versa (no wrongful
+steal); and each side steals the other's genuinely stale lock. Run it from
+MINGW/Git-Bash (NOT WSL) so both sides agree on the `C:/…` lock path.
+
+Last verified 2026-06-03: bash suite **19 passed, 0 failed**; interop suite
+**11/11, stable across 10 runs**. Note both suites spawn many short-lived
+processes (and pwsh startup is slow), so on a loaded machine they can take several
+minutes — allow a generous timeout rather than assuming a hang. A worker
+occasionally failing to *launch* under heavy Cygwin fan-out is environmental, not
+a lock failure; the interop test scores exclusion by violations/steals, not by
+that count.

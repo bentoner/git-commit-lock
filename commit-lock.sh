@@ -139,9 +139,15 @@ lock_acquire() {
     # Lock exists. Steal it if the DIR's mtime is older than the stale window.
     # (Using dir mtime, not a file inside, so a crashed/partial-rm orphan with
     # no readable token is still classed stale and can be reclaimed.)
+    # BUT only on a PLAUSIBLE mtime (>= 2000-01-01): a freshly created dir can
+    # transiently report the Windows FILETIME zero (1601) before its first
+    # metadata write, which would look ~400 years old and spuriously steal a live,
+    # just-acquired lock (notably one created by commit-lock.ps1's atomic rename;
+    # cross-impl race the interop self-test caught 2026-06-03). A sub-floor read is
+    # unsettled, not stale, so we wait instead.
     local mt age
     mt="$(_lock_dir_mtime)"
-    if [ -n "$mt" ]; then
+    if [ -n "$mt" ] && [ "$mt" -gt 946684800 ] 2>/dev/null; then
       age=$(( $(_lock_now) - mt ))
       if [ "$age" -ge "$AGENT_LOCK_STALE_SECS" ]; then
         local holder; holder="$(cat "$AGENT_LOCK_DIR/owner" 2>/dev/null || echo '?')"
