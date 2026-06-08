@@ -34,7 +34,7 @@
 #   try { git add -- path; git commit -m 'msg' } finally { Lock-Release | Out-Null }
 #
 # Hold the lock ONLY for the stage+commit (sub-second). Decide what to stage,
-# build any patch, resolve hook failures OUTSIDE the lock. See 060-committing.md.
+# build any patch, resolve hook failures OUTSIDE the lock. See 210-using-git.md.
 #
 # CONFIG (env, mainly for tests) — identical names/semantics to commit-lock.sh:
 #   AGENT_LOCK_DIR, AGENT_LOCK_STALE_SECS (default 300), AGENT_LOCK_POLL_SECS

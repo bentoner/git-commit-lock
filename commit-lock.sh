@@ -8,7 +8,7 @@
 # several agents commit into the SAME working tree at once. This is the ONLY
 # automated piece of the shared-checkout commit story — the git steps themselves
 # (what to stage, what to commit) are done MANUALLY by the agent, under this
-# lock. See agents/060-committing.md for the operating rules and
+# lock. See agents/210-using-git.md for the operating rules and
 # agents/details/commit-lock.md for the design.
 #
 # WHY THIS EXISTS

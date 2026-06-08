@@ -1,9 +1,9 @@
-<!-- agents/details/commit-lock.md | canonical: C:\code\dotfiles\agents\details\commit-lock.md | shared reference | linked from agents/060-committing.md -->
+<!-- agents/details/commit-lock.md | canonical: C:\code\dotfiles\agents\details\commit-lock.md | shared reference | linked from agents/210-using-git.md -->
 
 # `commit-lock`: a mutex for committing from a shared working tree
 
 Design reference for the commit lock. Operating rules live in
-[`../060-committing.md`](../060-committing.md); read that first. This file is the
+[`../210-using-git.md`](../210-using-git.md); read that first. This file is the
 "why" and "how it works".
 
 ## Scope: lock only, git by hand
