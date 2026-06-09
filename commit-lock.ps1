@@ -1,14 +1,14 @@
-# agents/bin/commit-lock.ps1
-# Canonical path: C:\code\dotfiles\agents\bin\commit-lock.ps1
-# Reachable at runtime as ~/.agents/bin/commit-lock.ps1
-# (~/.agents is a junction to C:\code\dotfiles\agents).
+# commit-lock.ps1 — repo: ben/commit-lock
+# Canonical path: C:\code\commit-lock\commit-lock.ps1
+# Reachable at runtime as ~/.local/bin/commit-lock.ps1
+# (symlinked there by this repo's install.sh).
 #
 # PowerShell port of commit-lock.sh, for agents whose native shell is PowerShell
 # (notably Codex on Windows). It is WIRE-COMPATIBLE with commit-lock.sh: same lock
 # directory, same dir-mtime staleness / rename-steal / token-release protocol, so
 # a .ps1 holder and a .sh holder in the SAME working tree (e.g. Codex and Claude)
 # correctly serialise against EACH OTHER. commit-lock.sh remains the authoritative
-# design; agents/details/commit-lock.md is the "why". Keep the two in lock-step.
+# design; docs/commit-lock.md is the "why". Keep the two in lock-step.
 #
 # WHY A SEPARATE PS PORT (instead of Codex calling commit-lock.sh):
 #   On Windows the bare name `bash` on the plain PATH resolves to
@@ -22,19 +22,20 @@
 #   using commit-lock.sh (it ships its own MINGW64 Git-Bash, immune to this).
 #
 # USAGE (Codex's normal path — run a command string under the lock):
-#   & ~/.agents/bin/commit-lock.ps1 run "git add -- path/a path/b; if (`$LASTEXITCODE -eq 0) { git commit -m 'msg' }"
+#   & ~/.local/bin/commit-lock.ps1 run "git add -- path/a path/b; if (`$LASTEXITCODE -eq 0) { git commit -m 'msg' }"
 #   Exit code is the command's; or 2 if the lock was lost mid-hold (NOT exclusive
 #   — verify with `git log` and redo). Use the `if (`$LASTEXITCODE -eq 0)` guard
 #   instead of `&&` (works on Windows PowerShell 5.1 too) and avoid `exit` inside
 #   the command (the lock still releases, but the exit code stops propagating).
 #
 # Or dot-source for the primitives (mirrors `source commit-lock.sh`):
-#   . ~/.agents/bin/commit-lock.ps1
+#   . ~/.local/bin/commit-lock.ps1
 #   if (-not (Lock-Acquire)) { exit 1 }
 #   try { git add -- path; git commit -m 'msg' } finally { Lock-Release | Out-Null }
 #
 # Hold the lock ONLY for the stage+commit (sub-second). Decide what to stage,
-# build any patch, resolve hook failures OUTSIDE the lock. See 210-using-git.md.
+# build any patch, resolve hook failures OUTSIDE the lock. See dotfiles
+# agents/210-using-git.md.
 #
 # CONFIG (env, mainly for tests) — identical names/semantics to commit-lock.sh:
 #   AGENT_LOCK_DIR, AGENT_LOCK_STALE_SECS (default 300), AGENT_LOCK_POLL_SECS

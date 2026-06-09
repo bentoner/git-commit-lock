@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# agents/bin/commit-lock.test.sh — self-contained tests for commit-lock.sh.
-# Canonical path: C:\code\dotfiles\agents\bin\commit-lock.test.sh
+# commit-lock.test.sh — self-contained tests for commit-lock.sh.
+# Canonical path: C:\code\commit-lock\commit-lock.test.sh
 #
 # Runs entirely against throwaway temp dirs, so it never touches the repo you
 # launch it from. Exit 0 == all pass.
-#   bash ~/.agents/bin/commit-lock.test.sh
+#   bash ~/.local/bin/commit-lock.test.sh
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

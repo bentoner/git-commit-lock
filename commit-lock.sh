@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# agents/bin/commit-lock.sh
-# Canonical path: C:\code\dotfiles\agents\bin\commit-lock.sh
-# Reachable at runtime as ~/.agents/bin/commit-lock.sh
-# (~/.agents is a junction to C:\code\dotfiles\agents).
+# commit-lock.sh — repo: ben/commit-lock
+# Canonical path: C:\code\commit-lock\commit-lock.sh
+# Reachable at runtime as ~/.local/bin/commit-lock.sh
+# (symlinked there by this repo's install.sh).
 #
 # Portable, flock-free mutex that serialises git's shared index/HEAD when
 # several agents commit into the SAME working tree at once. This is the ONLY
 # automated piece of the shared-checkout commit story — the git steps themselves
 # (what to stage, what to commit) are done MANUALLY by the agent, under this
-# lock. See agents/210-using-git.md for the operating rules and
-# agents/details/commit-lock.md for the design.
+# lock. The agent operating rules live in dotfiles agents/210-using-git.md;
+# the design rationale is in docs/commit-lock.md.
 #
 # WHY THIS EXISTS
 #   git has ONE index (.git/index, or .git/worktrees/<wt>/index) and ONE HEAD
@@ -72,10 +72,10 @@
 # USAGE (two modes; pick one — both keep the critical section tiny)
 #   1. Wrap your git in `run` (auto-releases; exit code is your command's,
 #      OR 2 if the lock was lost mid-hold — treat 2 as "NOT exclusive, redo"):
-#        ~/.agents/bin/commit-lock.sh run -- bash -c '
+#        ~/.local/bin/commit-lock.sh run -- bash -c '
 #          git add -- path/to/file && git commit -m "msg"'
 #   2. Source it and drive the lock yourself, in ONE shell invocation:
-#        source ~/.agents/bin/commit-lock.sh
+#        source ~/.local/bin/commit-lock.sh
 #        lock_acquire || exit 1
 #        git add -- path/to/file && git commit -m "msg"
 #        lock_release || echo "WARNING: lock was lost; commit was not exclusive" >&2

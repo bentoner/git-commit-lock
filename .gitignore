@@ -1,0 +1,7 @@
+# scratch / testing (house convention — never committed)
+.agent-testing/
+*.log
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db

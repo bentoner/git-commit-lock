@@ -1,10 +1,10 @@
-<!-- agents/details/commit-lock.md | canonical: C:\code\dotfiles\agents\details\commit-lock.md | shared reference | linked from agents/210-using-git.md -->
+<!-- docs/commit-lock.md | repo: ben/commit-lock (C:\code\commit-lock) | design/rationale for the commit-lock tool | operating rules live in dotfiles agents/210-using-git.md -->
 
 # `commit-lock`: a mutex for committing from a shared working tree
 
-Design reference for the commit lock. Operating rules live in
-[`../210-using-git.md`](../210-using-git.md); read that first. This file is the
-"why" and "how it works".
+Design reference for the commit lock. The agent operating rules live in the
+dotfiles repo at `agents/210-using-git.md` ("Shared checkouts: the commit lock");
+read that first. This file is the "why" and "how it works".
 
 ## Scope: lock only, git by hand
 
@@ -112,14 +112,14 @@ The port is **wire-compatible** with `commit-lock.sh`, so a `.ps1` holder and a
   the release-time token read each retry briefly to ride out transient Windows
   sharing violations (a dropped token write would later look like a false theft).
 
-Usage (Codex): `& ~/.agents/bin/commit-lock.ps1 run "git add -- <paths>; if ($LASTEXITCODE -eq 0) { git commit -m '<msg>' }"`. Chain with
+Usage (Codex): `& ~/.local/bin/commit-lock.ps1 run "git add -- <paths>; if ($LASTEXITCODE -eq 0) { git commit -m '<msg>' }"`. Chain with
 `if ($LASTEXITCODE -eq 0)` (not `&&`, not `exit`); exit code 2 = lock lost
 mid-hold, redo. Verified end-to-end 2026-06-03: a commit through the port carries
 a Good SSH signature.
 
 ## API
 
-Source it (`source ~/.agents/bin/commit-lock.sh`) for:
+Source it (`source ~/.local/bin/commit-lock.sh`) for:
 
 - `lock_acquire` — block until held (steal-if-stale); returns non-zero only on
   the `AGENT_LOCK_MAX_WAIT` timeout. Arms an EXIT/INT/TERM trap that releases.
@@ -161,7 +161,7 @@ clobbers other agents' uncommitted edits.
 Normal case — commit the paths you changed:
 
 ```sh
-bash ~/.agents/bin/commit-lock.sh run -- bash -c '
+bash ~/.local/bin/commit-lock.sh run -- bash -c '
   git add -- path/a path/b && git commit -m "msg"'
 ```
 
@@ -169,7 +169,7 @@ Shared file (you own only part of it) — stage just your hunk, commit the index
 
 ```sh
 git diff HEAD -- path/to/file > /tmp/mine.patch   # outside lock; trim to your hunk(s)
-bash ~/.agents/bin/commit-lock.sh run -- bash -c '
+bash ~/.local/bin/commit-lock.sh run -- bash -c '
   git diff --cached --quiet || { echo "index not clean" >&2; exit 1; }
   git apply --cached /tmp/mine.patch && git commit -m "msg"'   # BARE commit
 ```
@@ -184,7 +184,7 @@ ignores the clean index and stages the whole working-tree file.)
 
 ## Files
 
-Under `~/.agents/bin/` (canonical `C:\code\dotfiles\agents\bin\`):
+Under `~/.local/bin/` (repo `C:\code\commit-lock\`):
 
 | File | Role |
 |------|------|
@@ -196,8 +196,8 @@ Under `~/.agents/bin/` (canonical `C:\code\dotfiles\agents\bin\`):
 ## Verifying on a new machine
 
 ```
-bash ~/.agents/bin/commit-lock.test.sh            # bash impl; "RESULT: N passed, 0 failed"
-bash ~/.agents/bin/commit-lock.interop.test.sh    # cross-impl (needs pwsh); "INTEROP RESULT: …"
+bash ~/.local/bin/commit-lock.test.sh            # bash impl; "RESULT: N passed, 0 failed"
+bash ~/.local/bin/commit-lock.interop.test.sh    # cross-impl (needs pwsh); "INTEROP RESULT: …"
 ```
 
 `commit-lock.test.sh` covers mutual exclusion over 8×25 concurrent workers (clean
