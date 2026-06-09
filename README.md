@@ -9,49 +9,42 @@ stage+commit step so that doesn't happen.
 It is the only automated piece of the shared-checkout commit story — *what* to
 stage and commit is still done manually by the caller, under the lock.
 
-## When to use this
+## When this makes sense
 
-Prefer isolation when it is cheap. A [git worktree][git-worktree] gives each
-agent its own working directory, `HEAD`, and index, which is the cleanest way to
-run independent coding sessions in parallel. Claude Code, Codex, and Cursor all
-have worktree-based agent flows:
+`commit-lock` is for agent workflows where several processes share one Git
+checkout and each process may need to create commits. In that setup, all agents
+share one `HEAD` and one Git index, so concurrent `git add` / `git commit`
+operations can collide.
 
-- [Claude Code worktrees][claude-worktrees], including optional worktree
-  isolation for subagents.
-- [Codex app worktrees][codex-worktrees], for running independent tasks without
-  touching the local checkout.
-- [Cursor worktrees][cursor-worktrees], including `/worktree` and `/best-of-n`
-  agent runs.
+Typical cases:
 
-Use `commit-lock` for the narrower case where several agents are intentionally
-sharing one checkout and you still want them to make commits. Typical examples:
+- a workflow / Ultracode-style swarm where short-lived subagents run in the
+  parent checkout;
+- a manually coordinated subagent swarm where review/fix agents commit focused
+  changes as they finish;
+- a shared checkout where creating and bootstrapping a worktree for every small
+  agent task is more machinery than the task needs.
 
-- a workflow / Ultracode-style agent swarm where many short-lived subagents run
-  in the parent checkout;
-- a manually coordinated subagent swarm where review/fix agents should commit
-  focused changes as they finish;
-- a shared `main` checkout where spinning up, bootstrapping, and cleaning up a
-  worktree for every tiny agent would cost more than the task itself.
+`commit-lock` covers only the brief stage+commit critical section. It serialises
+that section so agents do not race on `.git/index.lock` or interleave staging
+operations.
 
-In that situation, the problem is not branch isolation. The problem is that all
-agents share one git index. `commit-lock` serialises only the short
-stage+commit critical section so two agents do not race on `.git/index.lock` or
-interleave staging operations.
+It does not isolate working-tree edits, assign file ownership, or make broad Git
+operations safe. Agents still need to stage only the paths or hunks they own and
+avoid `git add -A`, `git commit -a`, and `git stash` in shared checkouts.
 
-This is not a replacement for worktrees, branches, or careful file ownership. It
-does not prevent two agents from editing the same file at the same time, and it
-does not make `git add -A`, `git commit -a`, or `git stash` safe in a shared
-checkout. Agents must still stage only the paths or hunks they own.
+Related approaches:
 
-Other useful tools solve adjacent problems:
-
-- [Git worktrees][git-worktree] are the baseline primitive for per-agent
-  filesystem/index isolation.
+- [Git worktrees][git-worktree] give each agent its own working directory,
+  `HEAD`, and index. Claude Code, Codex, and Cursor all document worktree-based
+  agent flows: [Claude Code worktrees][claude-worktrees],
+  [Codex app worktrees][codex-worktrees], and
+  [Cursor worktrees][cursor-worktrees].
 - [GitButler parallel branches][gitbutler-parallel] keep multiple logical
   branches in one working directory, with branch-aware change assignment.
 - Cloud PR agents such as [GitHub Copilot cloud agent][copilot-cloud] and
-  [Jules][jules] avoid the local shared-checkout problem by cloning into an
-  isolated environment and returning branch/PR-shaped work.
+  [Jules][jules] clone into isolated environments and return branch/PR-shaped
+  work.
 
 Two wire-compatible implementations share one lock dir + protocol, so a bash
 holder (Claude) and a PowerShell holder (Codex) in the same tree serialise
