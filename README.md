@@ -25,6 +25,13 @@ Typical cases:
 - a shared checkout where creating and bootstrapping a worktree for every small
   agent task is more machinery than the task needs.
 
+This fits workflows where a coordinator is already thinking about conflicts:
+partitioning work, sending execution agents sequentially when their edits would
+overlap, and using the shared checkout mainly for planning-doc iteration,
+reviews, small fixes, and other low-conflict tasks. If many execution agents will
+edit the same code paths concurrently, add file-level coordination as well or use
+separate checkouts.
+
 `commit-lock` covers only the brief stage+commit critical section. It serialises
 that section so agents do not race on `.git/index.lock` or interleave staging
 operations.
@@ -42,6 +49,11 @@ Related approaches:
   [Cursor worktrees][cursor-worktrees].
 - [GitButler parallel branches][gitbutler-parallel] keep multiple logical
   branches in one working directory, with branch-aware change assignment.
+- Jeffrey Emanuel's [MCP Agent Mail][agent-mail] gives agents identities,
+  threaded messages, advisory file reservations before editing, and an optional
+  pre-commit guard. The public [Agent Mail skill][agent-mail-skill] documents
+  that workflow for agents. His older [Claude Code Agent Farm][agent-farm] also
+  uses lock files for work/file claiming before agents edit.
 - Cloud PR agents such as [GitHub Copilot cloud agent][copilot-cloud] and
   [Jules][jules] clone into isolated environments and return branch/PR-shaped
   work.
@@ -169,5 +181,8 @@ repo you launch them from.
 [codex-worktrees]: https://developers.openai.com/codex/app/worktrees
 [cursor-worktrees]: https://cursor.com/docs/configuration/worktrees
 [gitbutler-parallel]: https://docs.gitbutler.com/features/branch-management/virtual-branches
+[agent-mail]: https://github.com/Dicklesworthstone/mcp_agent_mail_rust
+[agent-mail-skill]: https://github.com/Dicklesworthstone/agent_flywheel_clawdbot_skills_and_integrations/blob/main/skills/agent-mail/SKILL.md
+[agent-farm]: https://github.com/Dicklesworthstone/claude_code_agent_farm
 [copilot-cloud]: https://docs.github.com/en/copilot/concepts/agents/cloud-agent/about-cloud-agent
 [jules]: https://jules.google/docs/
