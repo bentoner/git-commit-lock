@@ -275,13 +275,3 @@ New items:
     Do NOT touch the slow-for-good-reason set: unit T1's 8×25/poll-rate/gap,
     interop T1/T6 fan-out, stale-window waits, unit T9's MAX_WAIT, the
     integration suite's real-commit costs.
-
-## Fresh-context review of the lockfile plan (2026-06-10)
-
-57. **[NIT]** docs/git-commit-lock.md:42 opens with "`flock` is unavailable in
-    Git-Bash/Cygwin environments", but the new "Why not flock" section it
-    points to is more precise: absent from Git for Windows (verified — no
-    `flock(1)` on this box's MINGW bash), while Cygwin/MSYS2 *can* install one
-    that is in any case invisible to .NET. Tighten the intro line to match the
-    section (e.g. "not reliably available, and never cross-runtime — see
-    below").

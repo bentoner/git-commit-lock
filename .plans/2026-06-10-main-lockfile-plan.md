@@ -1,5 +1,13 @@
 ## Review findings (2026-06-10 fresh-context review)
 
+> **Status: all six findings folded into the plan body (same day), per their
+> recommended dispositions** — steal guard now rejects symlinks and
+> non-lock-shaped content (1, 2; line 1's `tok.` prefix is now wire format),
+> empty-at-release pinned to the unverifiable lane in both impls (3), TODO
+> 53–56 added to the impact table + Logging (4), read-only-attribute caveat
+> recorded beside the deleted rename-aside (5), NFS claim reworded (6).
+> Findings kept below for the record. TODO #57 (docs wording) fixed directly.
+
 Reviewed against the code, all three suites, TODO-main.md, and the probes.
 Probes re-run for this review: **B** (cross-runtime create race: 0 bad rounds
 of 4, exactly one winner each, content matches), **F** (empty-read window:
@@ -194,8 +202,10 @@ invariant the dir had.
 <owner>\n        # informational: "pid=<pid> host=<host>"
 ```
 
-Line 1 is load-bearing (theft detection); line 2 is for the `STALE
-(holder=...)` log line only. `epoch` is dropped — the file mtime and the log
+Line 1 is load-bearing (theft detection) and **must start with `tok.`** — the
+steal's content guard keys on that prefix, so it is part of the wire format,
+not an implementation detail. Line 2 is for the `STALE (holder=...)` log line
+only. `epoch` is dropped — the file mtime and the log
 timestamps carry that information. Readers take line 1, strip CR/whitespace;
 they must tolerate a missing line 2 and an entirely empty file.
 
@@ -227,13 +237,24 @@ wait", in both impls.
 **Steal** — rename-aside, as today, with one new guard:
 
 1. mtime above floor and age ≥ stale window;
-2. **the lock path must be a regular file** (`[ -f ]` / not `PSIsContainer`);
-   anything else (e.g. a directory: a config typo, or a leftover old-protocol
-   lock) ⇒ log a loud one-time config warning, never steal, let waiters reach
-   97. This is what makes `AGENT_LOCK_DIR=$HOME` harmless;
-3. re-read mtime immediately before acting; any change ⇒ abort attempt (as
+2. **the lock path must be a regular file and not a symlink**
+   (`[ -f ] && ! [ -L ]`; ps1: not `PSIsContainer` and no `ReparsePoint`
+   attribute — `[ -f ]` alone follows links, and acquire's O_EXCL/CreateNew
+   refuses a symlinked path anyway, so a symlink can never be a legitimate
+   lock); anything else (a directory: config typo or leftover old-protocol
+   lock; a symlink; a device) ⇒ log a loud one-time config warning, never
+   steal, let waiters reach 97. This is what makes `AGENT_LOCK_DIR=$HOME`
+   harmless;
+3. **the content must be lock-shaped**: steal only when the file is empty
+   (the crash-orphan lane) or line 1 starts with `tok.` (both impls' token
+   prefix — now a wire-format constraint on line 1, binding for future
+   implementations; pre-release this is free). Real user files are neither,
+   so a typo'd `AGENT_LOCK_DIR` pointing at an existing regular file becomes
+   non-stealable instead of renamed-and-deleted — closing most of what
+   remained of TODO #11;
+4. re-read mtime immediately before acting; any change ⇒ abort attempt (as
    today);
-4. read line 2 (best-effort) for the log; `mv "$LOCK" "$LOCK.dead.$$.<ts>"` /
+5. read line 2 (best-effort) for the log; `mv "$LOCK" "$LOCK.dead.$$.<ts>"` /
    `[IO.File]::Move(...)` — atomic on NTFS for files, exactly one concurrent
    stealer wins (probe E4: 60/60), losers get ENOENT/`FileNotFoundException`
    and re-race the create; winner `rm -f`s the grave and logs `STOLE`.
@@ -245,8 +266,12 @@ wait", in both impls.
    escalating backoff, `FileNotFoundException` ⇒ gone). Probe F proves the
    empty-read window is real (555/198k reads caught the file created but not
    yet written), so these retries carry over verbatim;
-2. mismatch or gone ⇒ restore traps, warn, **98** (unchanged); ps1 'unreadable'
-   ⇒ unchanged semantics (don't delete, don't claim success);
+2. classification is pinned identically in BOTH impls: a **non-empty foreign
+   token, or a gone file** ⇒ restore traps, warn, **98** (theft); a file that
+   still reads **empty after the retry ladder** is NOT definitive theft
+   evidence (it is the probe-F create→write window of a successor after a
+   boundary steal, or our own 10×-failed write) ⇒ the unverifiable lane
+   (bash rc 2 / ps1 'unreadable'): don't delete, don't claim success;
 3. match ⇒ re-read once (boundary-shrink, unchanged), then delete:
    `rm -f -- "$LOCK" 2>/dev/null`; rc 0 ⇒ released (`-f` masks only ENOENT,
    which is the "vanished mid-race = already released" branch). On failure the
@@ -254,8 +279,14 @@ wait", in both impls.
    failure ⇒ **leftover**: warn, return 1, stale window reclaims (unchanged
    contract). ps1: `File.Delete` (silent on missing = same vanished branch),
    `IOException` + still-exists ⇒ retry ⇒ leftover. **No rename-aside**: probe
-   D1 shows a handle that blocks unlink blocks rename identically for files,
-   so the fallback can never fire usefully — replaced by the retry.
+   D1 shows a handle that blocks unlink blocks rename identically for files
+   (a share-mode fact: both ops need DELETE access on the source), so the
+   fallback can never fire usefully — replaced by the retry. One non-handle
+   exception, for the header comment: the Windows **read-only attribute**
+   fails `File.Delete` but not `File.Move` (and bash `rm -f` clears it).
+   Nothing in the protocol ever sets read-only; if something external does,
+   the leftover warning fires and the stale steal (a rename) recovers the
+   path, so the deleted fallback stays deleted.
 
 **Unchanged:** exit-code contract (96/97/98 + command's own), all `AGENT_LOCK_*`
 knobs and validation, lock/log location in the git dir, trap/signal handling,
@@ -273,7 +304,7 @@ release cries 98 — see "races" below).
 | UNSETTLED (mtime < floor) | observer-side FILETIME-zero transient on a brand-new lock | waiters treat as live and wait; settles in ms |
 | STALE (age ≥ window) | crash, or contract-breach slow hold | exactly one stealer renames it aside; victim (if alive) gets 98 at release |
 | LEFTOVER (release unlink blocked persistently) | foreign no-delete-share handle (AV, naive reader) | release returns 1 loudly; stale window reclaims |
-| NON-FILE at lock path | config typo; old-protocol dir lock | never stolen; loud config warning; waiters reach 97 |
+| NON-LOCK at lock path (dir, symlink, device, or non-lock-shaped content) | config typo; old-protocol dir lock; user file at a typo'd path | never stolen; loud config warning; waiters reach 97 |
 
 ### Residual races (unchanged, for the record)
 
@@ -301,9 +332,10 @@ detected, not closed"; record the option in the header comment only.
 - A leftover old-protocol *directory* at `.git/commit.lock` (only possible if
   an old agent crashed mid-hold) is deliberately not auto-deleted: the
   non-file guard warns and names the fix (`rmdir`/`rm -rf` it once, by hand).
-- O_EXCL is atomic on local POSIX filesystems and NTFS (probed); ancient-NFS
-  caveats are the same class the dir protocol already had and stay out of
-  scope.
+- O_EXCL is atomic on local POSIX filesystems and NTFS (probed). On ancient
+  NFS it is historically *weaker* than `mkdir` (the classic reason mkdir-locks
+  were the NFS-safe idiom) — out of scope rather than equivalent: the docs now
+  exclude network/sync-backed filesystems outright.
 
 ## Empirical probe results (2026-06-10, Win 11 / MINGW bash 5.3.9 / pwsh 7.5.5, NTFS)
 
@@ -339,8 +371,11 @@ branch), sweep (one `rm -f` for `.dead.*`), and the header comment block
 #23/#24 wording). Port the suite: T2/T9 fabricate with `printf`+`backdate`
 (backdate works on files unchanged); T3 becomes the **empty-file orphan**
 regression; T6/T10 assert `-f` not `-d`; T15 fabricates file graves. New tests:
-sub-floor file (T9 port), non-file-at-lock-path refusal, token-line-1 parsing
-with owner line present. Done = `git-commit-lock.test.sh` green.
+sub-floor file (T9 port), non-file-at-lock-path refusal (dir AND symlink),
+non-lock-shaped-content steal refusal (a stale "user file" at the lock path
+survives), empty-but-exists release classification (unverifiable lane, not
+98), token-line-1 parsing with owner line present. Done =
+`git-commit-lock.test.sh` green.
 
 **Phase 2 — ps1 implementation + interop suite.**
 Replace `Lock-TryCreateDir` with the CreateNew open+write (delete-share);
@@ -375,8 +410,10 @@ no stale "lock dir(ectory)" wording outside the changelog.
   wholesale), **30** (rename-aside fallback deleted; replaced by
   retry+leftover, which gains the deterministic open-handle test it could
   never have), **52** (ps1 post-create stamp deleted; token retry comments
-  reworded), **11** (severity collapses: no `rm -rf`, steal refuses
-  non-regular-files; residual = validate-the-path niceties only).
+  reworded), **11** (largely closed: no `rm -rf` anywhere, the steal refuses
+  non-regular-files and symlinks, and the token-shape content guard makes a
+  typo'd path at a real user file non-stealable; residual = an *empty* user
+  file at a typo'd path is still stealable, plus validate-the-path niceties).
 - **Confirmed still required (do NOT drop):** **25** — the mtime-floor guard
   and its deterministic test stay; probes C/C1b show files need it too. **16**
   — token read/write retry asymmetry still applies, now against the lock file
@@ -386,6 +423,12 @@ no stale "lock dir(ectory)" wording outside the changelog.
   file; same fix), **26–29, 31–39, 50, 51** (fabrication sites and `-d`/`-f`
   assertions move; behavioural content identical), **48/49** (re-run linters
   after the rewrite).
+- **Performance pass (53–56, landed after the plan's first draft): fold into
+  the rewrite.** 53 (lazy gitdir) and 54 (builtin hot-forks) touch exactly the
+  code Phases 1–2 rewrite — apply them as part of the port rather than twice;
+  55 (marker-polling) and 56 (`WAITING` log line) land with the suite ports in
+  Phases 1–3. If 56 lands here, its log line is included in the Logging
+  section below.
 - **Unaffected:** **3, 4, 5, 8, 9, 10, 12–15, 17–19, 21, 22, 40–47** (traps,
   exit-code plumbing, 5.1 encoding, CLI guards, docs errata — orthogonal to
   the lock's on-disk shape; the Phase-4 doc rewrite should land their fixes in
@@ -418,6 +461,8 @@ The log design carries over unchanged: same `ACQUIRED`/`RELEASED`/`STALE
 `<gitdir>/git-commit-lock.log` default, same 1MB truncation cap, per-acquire
 tokens in the lines. Changes: message text says "lock file" not "lock dir";
 the `SWEPT stale litter` line survives only for `.dead.*` file graves; one new
-loud line for the non-file-at-lock-path config warning (logged once per
+loud line for the non-lock-at-lock-path config warning (logged once per
 process, like the mtime-probe warning). The blocked-release retry logs its
-final leftover WARNING exactly as today.
+final leftover WARNING exactly as today. If TODO #56 lands with this change
+(recommended above), the contended path also gains its one-line `WAITING`
+entry on the first blocked poll.

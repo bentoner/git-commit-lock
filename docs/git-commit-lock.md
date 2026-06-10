@@ -39,9 +39,10 @@ have worktrees, so we need a lock inside the shared tree.
 
 ## How the lock works
 
-`flock` is unavailable in Git-Bash/Cygwin environments (see [Why not
-`flock`?](#why-not-flock-or-another-os-lock-primitive) for the full story), so
-the lock is built from primitives that are atomic on NTFS:
+`flock(1)` is not reliably available here — Git for Windows ships none, and a
+Cygwin/MSYS2-installed one is invisible to .NET anyway (see [Why not
+`flock`?](#why-not-flock-or-another-os-lock-primitive) for the full story) —
+so the lock is built from primitives that are atomic on NTFS:
 
 - **acquire** = `mkdir <lock>` — atomic create-or-fail.
 - **steal** = `mv <lock> <grave>` — `rename(2)` is atomic, so exactly one
