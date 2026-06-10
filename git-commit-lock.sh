@@ -52,6 +52,22 @@
 #   genuinely must run something slow under the lock (e.g. a heavy pre-commit
 #   hook), raise AGENT_LOCK_STALE_SECS for that invocation.
 #
+# KNOWN RESIDUAL RACES (detected, not silent)
+#   The mkdir/mv/rm primitives cannot make check-then-act fully atomic, so two
+#   narrow windows remain even after the re-checks below shrink them:
+#     * acquire-side: between re-reading the stale dir's mtime and the steal
+#       `mv`, a rival stealer can complete steal+re-acquire, so our `mv` would
+#       move a brand-new live lock aside;
+#     * release-side: between the final token re-read and `rm -rf`, a
+#       boundary-stale steal + re-acquire can slip in, so the `rm` would delete
+#       the successor's live lock.
+#   Both need a hold that already overran the stale window (a contract breach),
+#   and both are DETECTED: the displaced holder's lock_release finds a missing/
+#   foreign token and fails loudly with 98, so no silent lost update — the cost
+#   is a spurious "redo" plus a transient double-hold. (A rename-the-lock-aside
+#   release design was considered and rejected: after a boundary steal it can
+#   yank a SUCCESSOR's live lock, which is strictly worse.)
+#
 # LOCK LOCATION
 #   By default the lock and its log live in the repo's git dir
 #   (`git rev-parse --absolute-git-dir`), e.g. <repo>/.git/commit.lock.
@@ -340,6 +356,18 @@ lock_acquire() {
       age=$(( $(_lock_now) - mt ))
       if [ "$age" -ge "$AGENT_LOCK_STALE_SECS" ]; then
         local holder; holder="$(cat "$AGENT_LOCK_DIR/owner" 2>/dev/null || echo '?')"
+        # Re-read the mtime IMMEDIATELY before the steal: a rival stealer may
+        # have completed steal+re-acquire since our read above, in which case
+        # the dir is now a brand-new LIVE lock and `mv`-ing it aside would rob
+        # it. Any change (fresher, sub-floor, or gone) aborts this attempt and
+        # re-enters the loop. This SHRINKS the check-then-act window; it cannot
+        # close it with these primitives — see KNOWN RESIDUAL RACES in the
+        # header (the residual is detected at the victim's release, not silent).
+        local mt2; mt2="$(_lock_dir_mtime)"
+        if [ "$mt2" != "$mt" ]; then
+          _lock_log "steal aborted: lock dir mtime changed underneath us (was $mt, now ${mt2:-<gone>})"
+          continue
+        fi
         _lock_log "STALE (age=${age}s holder=$holder) -> stealing"
         # Atomic steal: rename the stale dir aside. Only one concurrent stealer
         # wins (the rest get ENOENT); then everyone re-races the mkdir above.
@@ -375,8 +403,15 @@ lock_release() {
   [ "${_LOCK_HELD:-0}" = "1" ] || return 0
   _LOCK_HELD=0
 
-  # Did we keep the lock the whole time? Compare the dir's current token to ours.
+  # Did we keep the lock the whole time? Compare the dir's current token to
+  # ours — and on a match, re-read it once more IMMEDIATELY before the rm to
+  # shrink the steal-between-check-and-delete window. (It cannot be closed
+  # with these primitives — see KNOWN RESIDUAL RACES in the header; the
+  # residual case is detected by the displaced party, never silent.)
   local cur; cur="$(_lock_cur_token)"
+  if [ "$cur" = "$_LOCK_TOKEN" ]; then
+    cur="$(_lock_cur_token)"
+  fi
   if [ "$cur" != "$_LOCK_TOKEN" ]; then
     # Our lease expired and the lock was stolen (and possibly re-acquired by
     # someone else). Do NOT delete the dir — it may be a successor's LIVE lock.
