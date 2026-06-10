@@ -1,4 +1,4 @@
-# commit-lock
+# git-commit-lock
 
 A small mutex that lets several agents **commit from one shared Git checkout
 without tripping over each other**.
@@ -7,8 +7,8 @@ A Git working tree has one index and one `HEAD`. Git's own `index.lock`
 protects them from corruption, but it does so by making the loser of a race
 *fail* ("Unable to create '.../index.lock'"), not wait — and it doesn't stop
 two agents' staging operations from interleaving, so one agent's commit can
-sweep up paths another agent had just staged. `commit-lock` adds the queueing
-Git doesn't provide: each agent wraps its stage+commit step in the lock, and
+sweep up paths another agent had just staged. `git-commit-lock` adds the
+queueing Git doesn't provide: each agent wraps its stage+commit step in the lock, and
 concurrent committers take turns.
 
 The tool automates only the lock. What to stage and commit stays in the
@@ -27,7 +27,7 @@ might fan out a dozen subagents doing uncoupled work in parallel — drafting
 plans for several features at once, fixing independent review findings,
 updating docs file-by-file — and when each one commits its own change as it
 finishes, the history records how the work evolved, instead of arriving as one
-squashed blob at the end. `commit-lock` exists to make those concurrent
+squashed blob at the end. `git-commit-lock` exists to make those concurrent
 commits safe.
 
 Typical setups:
@@ -85,7 +85,7 @@ Requirements:
 After cloning this repository, run the installer:
 
 ```sh
-cd commit-lock
+cd git-commit-lock
 bash install.sh
 ```
 
@@ -93,7 +93,7 @@ This symlinks `commit-lock.sh` and `commit-lock.ps1` into `~/.local/bin/` and
 is idempotent — re-run any time, e.g. after moving the repo. On Windows, real
 symlinks require Developer Mode; if symlinks are unavailable, skip the
 installer and invoke the scripts by path from the clone (e.g.
-`path/to/commit-lock/commit-lock.sh`). Installing is only a convenience so
+`path/to/git-commit-lock/commit-lock.sh`). Installing is only a convenience so
 every checkout can use the same command names.
 
 ## Suggested agent instructions
@@ -221,14 +221,14 @@ lock:
   worktree-based agent flows: [Claude Code worktrees][claude-worktrees],
   [Codex app worktrees][codex-worktrees], and
   [Cursor worktrees][cursor-worktrees]. Note that subagents still run inside
-  their parent's worktree, which is where `commit-lock` comes in.
+  their parent's worktree, which is where `git-commit-lock` comes in.
 - [GitButler parallel branches][gitbutler-parallel] keep multiple logical
   branches in one working directory, with branch-aware change assignment.
 - Jeffrey Emanuel's [MCP Agent Mail][agent-mail] gives agents identities,
   threaded messages, advisory file reservations before editing, and an
   optional pre-commit guard (see also the [Agent Mail
   skill][agent-mail-skill]). Those reservations coordinate editing intent;
-  `commit-lock` can still be used underneath them for the shared-index
+  `git-commit-lock` can still be used underneath them for the shared-index
   stage+commit step. His older [Claude Code Agent Farm][agent-farm] also uses
   lock files for work/file claiming before agents edit.
 - Cloud PR agents such as [GitHub Copilot cloud agent][copilot-cloud] and
@@ -246,6 +246,10 @@ Both suites print a summary line and exit 0 when everything passes.
 They use throwaway temp dirs and never touch the repo you launch them from.
 On Windows, run them from Git Bash/MSYS2 bash, **not** WSL bash, so the bash
 and PowerShell sides resolve the same `C:/...` lock path.
+
+## Licence
+
+[MIT](LICENSE).
 
 [git-worktree]: https://git-scm.com/docs/git-worktree
 [claude-worktrees]: https://code.claude.com/docs/en/worktrees

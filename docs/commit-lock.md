@@ -1,6 +1,6 @@
 <!-- docs/commit-lock.md — design/rationale for the commit-lock tool; suggested agent operating rules live in README.md -->
 
-# `commit-lock`: a mutex for committing from a shared working tree
+# `git-commit-lock`: a mutex for committing from a shared working tree
 
 Design reference for the commit lock. The suggested agent operating rules live
 in the README ("Suggested agent instructions"); read that first. This file is
