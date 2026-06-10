@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # install.sh — symlink commit-lock.{sh,ps1} into ~/.local/bin.
-# Canonical path: C:\code\commit-lock\install.sh | repo: ben/commit-lock
 #
 # Idempotent: re-run any time (e.g. after moving the repo). Real Windows symlinks
-# need Developer Mode on (Ben's box has it) plus the MSYS flag below; on Linux
-# plain `ln -s` makes a real link. Logs each link it creates (old + new target).
+# need Developer Mode on, plus the MSYS flag below; on Linux plain `ln -s` makes
+# a real link. Logs each link it creates (old + new target).
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

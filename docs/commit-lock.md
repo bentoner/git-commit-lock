@@ -1,10 +1,10 @@
-<!-- docs/commit-lock.md | repo: ben/commit-lock (C:\code\commit-lock) | design/rationale for the commit-lock tool | operating rules live in dotfiles agents/210-using-git.md -->
+<!-- docs/commit-lock.md — design/rationale for the commit-lock tool; suggested agent operating rules live in README.md -->
 
 # `commit-lock`: a mutex for committing from a shared working tree
 
-Design reference for the commit lock. The agent operating rules live in the
-dotfiles repo at `agents/210-using-git.md` ("Shared checkouts: the commit lock");
-read that first. This file is the "why" and "how it works".
+Design reference for the commit lock. The suggested agent operating rules live
+in the README ("Suggested agent instructions"); read that first. This file is
+the "why" and "how it works".
 
 ## Scope: lock only, git by hand
 
@@ -40,7 +40,7 @@ have worktrees, so we need a lock inside the shared tree.
 
 ## How the lock works
 
-`flock` is unavailable in our Cygwin/Git-Bash environment, so the lock is built
+`flock` is unavailable in Git-Bash/Cygwin environments, so the lock is built
 from primitives that are atomic on NTFS:
 
 - **acquire** = `mkdir <lock>` — atomic create-or-fail.
@@ -89,8 +89,8 @@ it (~1-in-4 runs before the fix, 0 after).
 
 Codex on Windows runs commands in **PowerShell**, where a bare `bash` resolves to
 `C:\Windows\system32\bash.exe` — the **WSL** launcher. WSL's Linux git can't reach
-the Windows SSH commit signer (no private key in WSL; the dotfiles agent-forward
-only fires in *interactive* WSL shells, not Codex's `bash -c`), so a bash-wrapped
+the Windows SSH commit signer (no private key in WSL; SSH-agent forwarding into
+WSL typically only fires in *interactive* shells, not an agent's `bash -c`), so a bash-wrapped
 commit under Codex fails to sign (`No private key found … failed to write commit
 object`). Claude is immune — it ships its own MINGW64 Git-Bash. So Codex commits
 via `commit-lock.ps1` from PowerShell, where `git` is Git-for-Windows and signs.
@@ -184,7 +184,7 @@ ignores the clean index and stages the whole working-tree file.)
 
 ## Files
 
-Under `~/.local/bin/` (repo `C:\code\commit-lock\`):
+Under `~/.local/bin/` (symlinked from the repo by `install.sh`):
 
 | File | Role |
 |------|------|

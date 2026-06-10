@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # commit-lock.interop.test.sh
-# Canonical path: C:\code\commit-lock\commit-lock.interop.test.sh
 #
-# Cross-implementation test: proves commit-lock.ps1 (PowerShell, used by Codex)
-# and commit-lock.sh (bash, used by Claude) share ONE lock and serialise against
-# EACH OTHER in the same working tree. Run from a Windows MINGW/Git-Bash (the same
-# bash Claude uses) — NOT from WSL — because both sides must agree on the lock path
-# in `C:/...` form. Spawns pwsh + git-bash workers, so it needs both on PATH.
+# Cross-implementation test: proves commit-lock.ps1 (PowerShell) and
+# commit-lock.sh (bash) share ONE lock and serialise against EACH OTHER in the
+# same working tree. On Windows, run from MINGW/Git-Bash — NOT from WSL —
+# because both sides must agree on the lock path in `C:/...` form. Spawns
+# pwsh + bash workers, so it needs both on PATH.
 #   bash ~/.local/bin/commit-lock.interop.test.sh
 # Exit 0 == all pass. Uses a throwaway temp dir; never touches your repo.
 set -uo pipefail

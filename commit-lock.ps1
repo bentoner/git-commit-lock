@@ -1,5 +1,4 @@
-# commit-lock.ps1 — repo: ben/commit-lock
-# Canonical path: C:\code\commit-lock\commit-lock.ps1
+# commit-lock.ps1 — the commit-lock mutex (PowerShell port).
 # Reachable at runtime as ~/.local/bin/commit-lock.ps1
 # (symlinked there by this repo's install.sh).
 #
@@ -13,8 +12,9 @@
 # WHY A SEPARATE PS PORT (instead of Codex calling commit-lock.sh):
 #   On Windows the bare name `bash` on the plain PATH resolves to
 #   C:\Windows\system32\bash.exe = the WSL launcher, whose Linux git cannot reach
-#   the Windows SSH signer (the private key isn't in WSL, and the dotfiles
-#   agent-forward only fires in *interactive* WSL shells, not Codex's `bash -c`).
+#   the Windows SSH signer (the private key isn't in WSL, and SSH-agent
+#   forwarding into WSL typically only fires in *interactive* shells, not an
+#   agent's `bash -c`).
 #   So a bash-wrapped commit under Codex runs WSL git and fails to sign
 #   ("No private key found ... fatal: failed to write commit object"). Codex's
 #   native shell is PowerShell, where `git` = Git-for-Windows and signs fine, so
@@ -34,8 +34,8 @@
 #   try { git add -- path; git commit -m 'msg' } finally { Lock-Release | Out-Null }
 #
 # Hold the lock ONLY for the stage+commit (sub-second). Decide what to stage,
-# build any patch, resolve hook failures OUTSIDE the lock. See dotfiles
-# agents/210-using-git.md.
+# build any patch, resolve hook failures OUTSIDE the lock. See README.md
+# ("Suggested agent instructions").
 #
 # CONFIG (env, mainly for tests) — identical names/semantics to commit-lock.sh:
 #   AGENT_LOCK_DIR, AGENT_LOCK_STALE_SECS (default 300), AGENT_LOCK_POLL_SECS

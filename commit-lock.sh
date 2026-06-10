@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
-# commit-lock.sh — repo: ben/commit-lock
-# Canonical path: C:\code\commit-lock\commit-lock.sh
+# commit-lock.sh — the commit-lock mutex (bash implementation).
 # Reachable at runtime as ~/.local/bin/commit-lock.sh
 # (symlinked there by this repo's install.sh).
 #
 # Portable, flock-free mutex that serialises git's shared index/HEAD when
-# several agents commit into the SAME working tree at once. This is the ONLY
-# automated piece of the shared-checkout commit story — the git steps themselves
-# (what to stage, what to commit) are done MANUALLY by the agent, under this
-# lock. The agent operating rules live in dotfiles agents/210-using-git.md;
-# the design rationale is in docs/commit-lock.md.
+# several agents commit into the SAME working tree at once. The tool automates
+# only the lock — the git steps themselves (what to stage, what to commit) are
+# done MANUALLY by the agent, under this lock. Suggested agent operating rules
+# live in README.md ("Suggested agent instructions"); the design rationale is
+# in docs/commit-lock.md.
 #
 # WHY THIS EXISTS
 #   git has ONE index (.git/index, or .git/worktrees/<wt>/index) and ONE HEAD

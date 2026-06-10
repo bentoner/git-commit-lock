@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # commit-lock.test.sh — self-contained tests for commit-lock.sh.
-# Canonical path: C:\code\commit-lock\commit-lock.test.sh
 #
 # Runs entirely against throwaway temp dirs, so it never touches the repo you
 # launch it from. Exit 0 == all pass.
