@@ -1,3 +1,120 @@
+## Review findings (2026-06-10 fresh-context review)
+
+Reviewed against the code, all three suites, TODO-main.md, and the probes.
+Probes re-run for this review: **B** (cross-runtime create race: 0 bad rounds
+of 4, exactly one winner each, content matches), **F** (empty-read window:
+442 empty reads against ~722k non-empty — real, retries needed), **D** (full
+re-run: D1 share=Read blocks mv/rm/Delete/Move alike; D2 delete-share blocks
+nothing; D3 Cygwin fds never block; D4 0/200), **C1b** (40/4449 sub-floor
+FILETIME-zero readings via the pwsh observer on pwsh-created *files* — the
+floor stays needed). Residual-race walk and TODO spot-checks (11/16/25/30/52)
+done; details under the findings.
+
+**Adjudication of the foreign-model counterpoints** (no findings needed):
+
+- *"Lock files have the same stale/release problems as dirs, and are worse on
+  POSIX because unlinking an open file removes the path under the holder."*
+  Settled: **not a defect of this protocol, and not a file-vs-dir
+  differentiator.** The objection is real for *fd-based* locks (flock), where
+  ownership = an open descriptor and losing the path silently invalidates it.
+  Here ownership is the **path name + token content**; no holder keeps an fd
+  open. On POSIX a third party can equally `rm -rf` a held lock *dir* —
+  path-removal-under-the-holder is precisely the displacement case the
+  state machine already owns, and it is detected identically in both designs:
+  the displaced holder's release finds gone/foreign token ⇒ 98. The plan's
+  "same stale/release machinery carries over" framing is honest about the
+  first half of the objection. POSIX note (probes were Windows-only): on POSIX
+  unlink/rename of the lock file always succeed regardless of open handles, so
+  the LEFTOVER lane is effectively Windows-only and POSIX behaviour is
+  strictly *simpler* than probed; the floor and retries are harmless there.
+- *Local-filesystem assumption*: now stated explicitly in
+  docs/git-commit-lock.md (the new flock section + closing paragraph); claims
+  checked against the code and spot-verified empirically (no `flock(1)` in
+  this Git-for-Windows bash, rc=1). One wording nit filed as TODO #57.
+- *Residual races "unchanged"* — **confirmed** by walking both windows under
+  the file protocol. Acquire-side: mtime re-read → `mv` window identical in
+  shape; a rival steal+re-acquire in the gap moves a brand-new live *file*
+  instead of dir; victim's release sees gone/foreign ⇒ 98. Release-side: token
+  re-read → `rm -f` window identical; an ENOENT there (`-f` masks it) can mean
+  "stolen in the gap", but the steal then post-dates the token match and hence
+  the completed work — benign, exactly as in the dir design. No new window is
+  introduced: the create→write gap (probe F) is covered by fresh mtime (waiters
+  wait) and the read retries; the steal renames token-with-file atomically,
+  preserving the dir design's token-travels-with-the-lock property.
+
+**Findings** (numbered continuously; none is a blocker):
+
+1. **[MINOR] The steal's regular-file guard does not reject symlinks; `[ -f ]`
+   follows them.** TODO #11 explicitly lists "reject symlinks". A symlink at
+   the lock path passes the proposed guard with staleness judged on the
+   *target's* mtime (`stat` follows links) while `mv`/`rm -f` act on the link
+   itself — damage is capped at destroying the user's symlink, but the lane is
+   incoherent: acquire's O_EXCL/CreateNew refuses a symlink path (EEXIST even
+   when dangling), so symlinks should land in the same never-steal/loud-warning
+   lane as directories. Disposition: add `! -L` (bash) / a reparse-point check
+   (ps1) to guard step 2.
+2. **[MINOR] "#11 residual = validate-the-path niceties only" understates the
+   residual.** A typo'd `AGENT_LOCK_DIR` pointing at any existing **regular
+   file** older than the stale window is still renamed and **deleted** by the
+   steal. Not a regression (today's dir protocol `mv`+`rm -rf`s it too — there
+   is no `-d` check before the steal), but the file design enables a cheap
+   near-complete fix the dir design couldn't have: steal only when the file is
+   **empty OR line 1 matches the token shape** (both impls' tokens start
+   `tok.`). Real user files are neither, so a typo'd path becomes
+   non-stealable; the empty-orphan lane stays stealable. Cost: a wire-format
+   constraint on line 1 (pre-release, free; note it would bind future
+   implementations). Disposition: adopt (recommended) or explicitly decline in
+   the protocol section; either way reword the #11 entry in the impact table.
+3. **[MINOR] Release classification of a successfully-read EMPTY lock file is
+   unspecified, and the dir-era ps1 rationale does not port.** Dir era: token
+   file *missing* with the dir present was a definitive "not ours" (ps1
+   Status='ok', Token='' ⇒ stolen/98), while bash mapped empty+present to the
+   rc-2 unverifiable lane. File era: an empty read is the probe-F window (a
+   successor mid-create after a boundary steal) **or** the holder's own
+   10×-failed write — not definitive theft evidence, but also possibly genuine
+   theft. Both verdicts are safe (98 is conservative; 2 is honest), but the two
+   impls would diverge on the wire. Disposition: pin it — both impls map
+   empty-but-exists (after the retry ladder) to the unverifiable lane (bash 2 /
+   ps1 'unreadable'), reserving 98 for a non-empty foreign token or a gone
+   file. One sentence in the Release section settles it.
+4. **[MINOR] The TODO impact table stops at item 52, but items 53–56 exist**
+   (performance pass, committed 37afd82, *before* the plan commit 950ad3e):
+   53 lazy gitdir, 54 builtin hot-forks, 55 marker-polling, 56 the WAITING log
+   line — all touch exactly the code and tests Phases 1–3 rewrite. Disposition:
+   add a table row (likely "fold into the rewrite / mechanical"); if 56 lands
+   with this change, its WAITING line belongs in the plan's Logging section.
+5. **[NIT] D1's "unlink-blocked ⇒ rename-blocked" is a share-mode fact, with
+   one non-handle exception.** The equivalence is sound for handles (both
+   delete and rename open the source for DELETE access, so the same
+   FILE_SHARE_DELETE check gates both — re-verified today), and POSIX failure
+   modes (parent perms, EROFS) block both alike. But the Windows **read-only
+   attribute** breaks it: verified today, `File.Delete` fails while
+   `File.Move` succeeds (and bash `rm -f` clears the attribute and succeeds).
+   Nothing in the protocol ever sets read-only, and the stale steal (a rename)
+   recovers the path, so deleting the fallback stands; ps1's grave delete can
+   leave litter the bash sweep later clears. Disposition: one caveat line in
+   the header comment; no design change.
+6. **[NIT] "ancient-NFS caveats are the same class the dir protocol already
+   had" overstates equivalence.** `mkdir` is atomic even on old NFS;
+   `O_CREAT|O_EXCL` is the primitive with the historical NFSv2 caveat (the
+   classic reason mkdir-locks were the NFS-safe idiom) — the file design is
+   strictly weaker on ancient NFS. Moot in practice: the docs now exclude
+   network filesystems outright. Disposition: reword to "out of scope — the
+   docs exclude network filesystems", dropping the same-class claim.
+
+**Verdict: concur with GO.** The protocol as specified is sound on both
+Windows and POSIX; every load-bearing empirical claim I re-ran reproduced
+(B, C1b, D, F); the deleted machinery (rename-aside release, `.new.*` dance,
+metadata-less-orphan special case) is genuinely the hard-to-reason-about part;
+the residual races are unchanged as claimed; and the plan is candid about
+what does *not* simplify (floor, retries). Findings 1–4 should be folded into
+the protocol/plan text before Phase 1 — they are spec amendments, not
+redesigns — and none changes the decision. Open questions 1–4:
+recommendations all look right to me (rename the knob; rename-aside steal;
+drop epoch; drop the ps1 stamp).
+
+---
+
 # Plan: switch the commit lock from a DIRECTORY to an O_EXCL lock FILE
 
 2026-06-10 · branch `main` · pre-release (no back-compat constraint).
