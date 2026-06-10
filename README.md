@@ -80,7 +80,7 @@ etc.). Full design/rationale: [`docs/commit-lock.md`](docs/commit-lock.md).
 Requirements:
 
 - Git and a POSIX-like shell for `commit-lock.sh`.
-- PowerShell for `commit-lock.ps1` (`pwsh` is needed for the interop tests).
+- PowerShell 7+ (`pwsh`) for `commit-lock.ps1` and the interop tests.
 - `~/.local/bin` on `PATH` if you want the installed command names to resolve.
 - On Windows, use Windows Git Bash/MSYS2 bash for install and shell tests, not
   WSL bash. WSL installation only affects the WSL environment.
@@ -115,9 +115,9 @@ commit lock for the brief moment you stage and commit. Stage only the paths or
 hunks you own. Never use `git add -A`, `git commit -a`, `git commit -am`, or
 `git stash` in a shared checkout.
 
-Use the shell-native lock command for the agent. On Windows/PowerShell, use
-`commit-lock.ps1` rather than a bash wrapper unless you know that bash resolves
-to the same Git and signing environment.
+Use the shell-native lock command for the agent. On Windows, use
+`commit-lock.ps1` through `pwsh` rather than a bash wrapper unless you know that
+bash resolves to the same Git and signing environment.
 
 Bash:
 
@@ -130,7 +130,7 @@ bash ~/.local/bin/commit-lock.sh run -- bash -c '
 PowerShell:
 
 ```powershell
-& ~/.local/bin/commit-lock.ps1 run "git add -- path/a path/b; if (`$LASTEXITCODE -eq 0) { git commit -m 'your message' }"
+pwsh -NoProfile -File "$HOME/.local/bin/commit-lock.ps1" run "git add -- path/a path/b; if (`$LASTEXITCODE -eq 0) { git commit -m 'your message' }"
 ```
 
 Hold the lock only for stage+commit. Decide what to stage, build patches, run
@@ -171,7 +171,7 @@ bash ~/.local/bin/commit-lock.sh run -- bash -c '
 PowerShell:
 
 ```powershell
-& ~/.local/bin/commit-lock.ps1 run "git add -- path/a path/b; if (`$LASTEXITCODE -eq 0) { git commit -m 'msg' }"
+pwsh -NoProfile -File "$HOME/.local/bin/commit-lock.ps1" run "git add -- path/a path/b; if (`$LASTEXITCODE -eq 0) { git commit -m 'msg' }"
 ```
 
 Exit code is the command's. If it exits 2 with the lock-stolen warning, the lock
