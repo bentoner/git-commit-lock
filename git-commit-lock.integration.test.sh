@@ -15,6 +15,11 @@
 # you launch it from. The mixed bash+pwsh section skips cleanly when pwsh is
 # absent; the bash-only section always runs. Exit 0 == all pass.
 #   bash ~/.local/bin/git-commit-lock.integration.test.sh
+#
+# On failure the work dir (scratch repo, per-worker stdout/stderr/rc captures,
+# lock log) is PRESERVED (path printed) for post-mortem; set
+# GCL_TEST_PRESERVE_DIR=<dir> to additionally copy everything there regardless
+# of outcome (used by CI) — same semantics as the unit suite.
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,7 +32,18 @@ command -v pwsh >/dev/null 2>&1 && HAVE_PWSH=1
 
 WORK="$(mktemp -d 2>/dev/null || echo "${TMPDIR:-/tmp}/git-commit-lock-itest.$$")"
 mkdir -p "$WORK"
-cleanup() { rm -rf "$WORK" 2>/dev/null || true; }
+cleanup() {
+  if [ -n "${GCL_TEST_PRESERVE_DIR:-}" ]; then
+    mkdir -p "$GCL_TEST_PRESERVE_DIR" 2>/dev/null || true
+    cp -R "$WORK"/. "$GCL_TEST_PRESERVE_DIR"/ 2>/dev/null || true
+    echo "note: copied test artifacts to $GCL_TEST_PRESERVE_DIR"
+  fi
+  if [ "${FAIL:-0}" -gt 0 ]; then
+    echo "note: failures detected — work dir preserved for post-mortem: $WORK"
+  else
+    rm -rf "$WORK" 2>/dev/null || true
+  fi
+}
 trap cleanup EXIT
 
 PASS=0; FAIL=0

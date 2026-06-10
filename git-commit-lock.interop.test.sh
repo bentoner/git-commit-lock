@@ -5,7 +5,8 @@
 # git-commit-lock.sh (bash) share ONE lock and serialise against EACH OTHER in
 # the same working tree, and that the .ps1 side honours the shared behavioural
 # contract (exit-code propagation; 97 timeout; 98 stolen mid-hold; steal of
-# genuinely stale locks; <gitdir>/commit.lock default location). On Windows,
+# genuinely stale locks; <gitdir>/commit.lock default location; identical
+# unverifiable-release and numeric-knob verdicts). On Windows,
 # run from MINGW/Git-Bash — NOT from WSL — because both sides must agree on
 # the lock path in `C:/...` form. Spawns pwsh + bash workers, so it needs both
 # on PATH.
@@ -54,6 +55,15 @@ wait_for() {  # $1=file $2=max iterations of 50ms (default 200 = 10s)
   local i; for i in $(seq 1 "${2:-200}"); do [ -e "$1" ] && return 0; sleep 0.05; done
   return 1
 }
+
+# Backdate a path's mtime by $2 seconds — how a test fakes a stale lock (the
+# staleness clock is the lock DIR's own mtime). Portable: BSD/macOS touch has
+# no `-d @epoch`, so convert the target epoch to a `touch -t` stamp via GNU
+# `date -d @` with BSD `date -r` as fallback (same helper as the unit suite).
+epoch_to_stamp() {
+  date -d "@$1" +%Y%m%d%H%M.%S 2>/dev/null || date -r "$1" +%Y%m%d%H%M.%S 2>/dev/null
+}
+backdate() { touch -t "$(epoch_to_stamp "$(( $(date +%s) - $2 ))")" "$1"; }
 
 # Workers increment a shared integer file. Written WITHOUT a trailing newline and
 # read whitespace-trimmed on BOTH sides, so bash and PowerShell agree on the value
@@ -157,7 +167,7 @@ echo "== Test 4: pwsh steals a STALE lock left by bash (old dir mtime) =="
 # AGENT_LOCK_MAX_WAIT caps the run so a steal regression fails in ~20s, not 420s.
 LOCK="$WORK/b4.lock"; LOG="$WORK/b4.log"; : > "$LOG"; MARK="$WORK/b4.mark"; printf '%s' before > "$MARK"
 mkdir -p "$LOCK"; printf 'pid=99999 host=ghost\n' > "$LOCK/owner"; printf '%s' "tok.sh.ghost" > "$LOCK/token"
-touch -d "@$(( $(date +%s) - 9999 ))" "$LOCK"   # ancient dir mtime -> stale
+backdate "$LOCK" 9999                           # ancient dir mtime -> stale
 AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=2 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=20 \
   pwsh -NoProfile -File "$PS1WIN" run "[IO.File]::WriteAllText('$MARK','after')"; rc=$?
 [ "$rc" = 0 ] && ok "pwsh run exited 0 after stealing bash's stale lock" || bad "pwsh run exited $rc"
@@ -181,7 +191,7 @@ if wait_for "$READY"; then
     tok.ps.*) ok "dead pwsh holder left its own lock behind (token $tok)" ;;
     *)        bad "expected a tok.ps.* token in the orphan lock, got '$tok'" ;;
   esac
-  touch -d "@$(( $(date +%s) - 9999 ))" "$LOCK"   # age the orphan past any stale window
+  backdate "$LOCK" 9999                           # age the orphan past any stale window
   AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=2 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=20 \
     bash "$SH" run -- bash -c 'printf "%s" after > "$1"' _ "$MARK"; rc=$?
   [ "$rc" = 0 ] && ok "bash run exited 0 after stealing pwsh's stale lock" || bad "bash run exited $rc"
@@ -307,6 +317,46 @@ nps="$(grep -c "ACQUIRED.*tok=tok\.ps\." "$DLOG" 2>/dev/null)"
   && ok "shared <gitdir> log shows 1 bash + 1 pwsh acquisition" \
   || bad "default-log evidence wrong: ACQUIRED=$na (want 2), pwsh tokens=$nps (want 1) in $DLOG"
 [ -e "$GITDIR2/commit.lock" ] && bad "leftover default lock" || ok "no leftover default lock"
+
+echo "== Test 11: missing token at release — BOTH impls take the unverifiable lane (exit 1, not 98) =="
+# Lock dir present, token file ABSENT at release: neither impl can prove its
+# own acquire-time token write succeeded (both swallow write failures after
+# retries), so neither may call this state a theft. Aligned contract: `run`
+# fails a successful command with exit 1 (exclusivity unproven), leaves the
+# dir for the stale window, and does NOT exit 98. Locks the alignment in —
+# the bash lane itself is unit-tested; this asserts cross-impl agreement.
+LOCK="$WORK/nt.lock"; LOG="$WORK/nt.log"; : > "$LOG"
+AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_MAX_WAIT=20 \
+  bash "$SH" run -- bash -c 'rm -f "$AGENT_LOCK_DIR/token"' 2> "$WORK/nt-sh.err"; rc_sh=$?
+sh_dir_left=$([ -d "$LOCK" ] && echo yes || echo no)
+rm -rf "$LOCK"
+AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_MAX_WAIT=20 \
+  pwsh -NoProfile -File "$PS1WIN" run "Remove-Item -LiteralPath '$LOCK/token' -Force" 2> "$WORK/nt-ps.err"; rc_ps=$?
+ps_dir_left=$([ -d "$LOCK" ] && echo yes || echo no)
+rm -rf "$LOCK"
+[ "$rc_sh" = 1 ] && ok "bash: missing token -> exit 1 (unverifiable), not 98" || bad "bash missing-token rc=$rc_sh (want 1)"
+[ "$rc_ps" = 1 ] && ok "pwsh: missing token -> exit 1 (unverifiable), not 98" || bad "pwsh missing-token rc=$rc_ps (want 1)"
+[ "$sh_dir_left" = yes ] && [ "$ps_dir_left" = yes ] \
+  && ok "both impls left the dir for the stale window to reclaim" \
+  || bad "dir left in place: bash=$sh_dir_left pwsh=$ps_dir_left (want yes/yes)"
+
+echo "== Test 12: fractional STALE/MAX_WAIT rejected identically by both impls (note + default) =="
+# These two knobs are integers in both impls; a fractional value silently
+# rounded by one side but rejected by the other would give the two impls
+# DIFFERENT steal thresholds for the same env. Both must note + use defaults.
+LOCK="$WORK/frac.lock"; LOG="$WORK/frac.log"; : > "$LOG"
+AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=2.5 AGENT_LOCK_MAX_WAIT=10.5 \
+  bash "$SH" run -- bash -c 'true' 2> "$WORK/frac-sh.err"; rc_sh=$?
+n_sh="$(grep -c 'ignoring invalid' "$WORK/frac-sh.err")"
+[ "$rc_sh" = 0 ] && [ "$n_sh" = 2 ] \
+  && ok "bash rejects fractional STALE/MAX_WAIT with notes (rc 0, 2 notes)" \
+  || bad "bash fractional knobs: rc=$rc_sh notes=$n_sh (want 0/2)"
+AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=2.5 AGENT_LOCK_MAX_WAIT=10.5 \
+  pwsh -NoProfile -File "$PS1WIN" run "exit 0" 2> "$WORK/frac-ps.err"; rc_ps=$?
+n_ps="$(grep -c 'ignoring invalid' "$WORK/frac-ps.err")"
+[ "$rc_ps" = 0 ] && [ "$n_ps" = 2 ] \
+  && ok "pwsh rejects fractional STALE/MAX_WAIT with notes (rc 0, 2 notes)" \
+  || bad "pwsh fractional knobs: rc=$rc_ps notes=$n_ps (want 0/2)"
 
 echo
 echo "==== INTEROP RESULT: $PASS passed, $FAIL failed ===="

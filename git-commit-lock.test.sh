@@ -334,7 +334,10 @@ echo "$out" | grep -q CALLER-EXIT-TRAP && ok "caller's pre-existing EXIT trap fi
 
 # 12c: exiting WHILE HOLDING releases the lock AND still runs the caller's
 # original EXIT trap (chained by our handler), preserving the exit code.
-out="$(AGENT_LOCK_DIR="$WORK/src3.lock" AGENT_LOCK_LOG="$LOG" bash -c '
+# Own log file: the shared $LOG already carries RELEASED lines from 12a/12b,
+# so a grep there could never fail — the assertion needs an unpolluted log.
+LOG12C="$WORK/src3.log"; : > "$LOG12C"
+out="$(AGENT_LOCK_DIR="$WORK/src3.lock" AGENT_LOCK_LOG="$LOG12C" bash -c '
   trap "echo CHAINED-EXIT-TRAP" EXIT
   source "$1" || exit 70
   lock_acquire || exit 72
@@ -344,7 +347,7 @@ out="$(AGENT_LOCK_DIR="$WORK/src3.lock" AGENT_LOCK_LOG="$LOG" bash -c '
 echo "$out" | grep -q CHAINED-EXIT-TRAP && ok "caller's EXIT trap still ran on exit-while-holding" \
                                         || bad "caller's EXIT trap skipped on exit-while-holding"
 [ -d "$WORK/src3.lock" ] && bad "lock left held after exit-while-holding" || ok "EXIT trap released the lock"
-grep -q RELEASED "$LOG" && ok "release logged on EXIT path" || bad "no RELEASED entry on EXIT path"
+grep -q RELEASED "$LOG12C" && ok "release logged on EXIT path" || bad "no RELEASED entry on EXIT path"
 
 # 12d: caller's signal traps are restored verbatim; absent traps reset to default.
 out="$(AGENT_LOCK_DIR="$WORK/src4.lock" AGENT_LOCK_LOG="$LOG" bash -c '
@@ -405,16 +408,51 @@ grep -q "AGENT_LOCK_DIR" "$WORK/t14.err" && ok "refusal message mentions AGENT_L
     bash "$LIB" run -- bash -c 'true' ) 2>/dev/null; rc=$?
 [ "$rc" = 0 ] && ok "explicit AGENT_LOCK_DIR works outside a repo" || bad "explicit AGENT_LOCK_DIR outside repo rc=$rc"
 
-echo "== Test 15: grave litter (.dead.*/.rel.*) is swept at acquire =="
+echo "== Test 15: AGED litter (.new.*/.dead.*/.rel.*) is swept at acquire; FRESH litter survives =="
+# The sweep is age-gated (mirrors the ps1 port): only entries older than the
+# stale window (default 300s here) are collected, which is what makes sweeping
+# .new.* — a concurrent ps1 acquirer's LIVE staging dir when fresh — safe.
 LOCK="$WORK/lit.lock"; LOG="$WORK/lit.log"; : > "$LOG"
-mkdir -p "$LOCK.dead.1.2/sub" "$LOCK.rel.3.4"
+mkdir -p "$LOCK.dead.1.2/sub" "$LOCK.rel.3.4" "$LOCK.new.5.6"
+backdate "$LOCK.dead.1.2" 9999; backdate "$LOCK.rel.3.4" 9999; backdate "$LOCK.new.5.6" 9999
+mkdir -p "$LOCK.new.7.8"     # FRESH: stands in for a live acquirer's staging dir
 AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" bash "$LIB" run -- bash -c 'true'; rc=$?
 [ "$rc" = 0 ] || bad "T15 run rc=$rc"
-if [ -e "$LOCK.dead.1.2" ] || [ -e "$LOCK.rel.3.4" ]; then
-  bad "grave litter not swept at acquire"
+if [ -e "$LOCK.dead.1.2" ] || [ -e "$LOCK.rel.3.4" ] || [ -e "$LOCK.new.5.6" ]; then
+  bad "aged litter not swept at acquire"
 else
-  ok "grave litter swept at acquire"
+  ok "aged litter (.new/.dead/.rel) swept at acquire"
 fi
+[ -e "$LOCK.new.7.8" ] && ok "fresh .new.* staging dir NOT swept (live acquirer protected)" \
+                       || bad "fresh .new.* was swept — age gate broken"
+rm -rf "$LOCK.new.7.8"
+
+echo "== Test 16: missing token at release — unverifiable lane, NOT a theft verdict =="
+# Lock dir present but the token file GONE at release. Neither impl can prove
+# its acquire-time token write ever landed (write failures are swallowed after
+# retries), so this state must NOT be called a theft (98): sourced release
+# returns 2, and `run` fails a successful command with 1 while keeping a
+# failing command's own exit code. The dir is left for the stale window.
+# (The interop suite asserts the ps1 gives the same verdicts for this state.)
+LOCK="$WORK/notok.lock"; LOG="$WORK/notok.log"; : > "$LOG"
+AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" bash -c '
+  source "$1" || exit 70
+  lock_acquire || exit 72
+  rm -f "$2/token"
+  lock_release 2>/dev/null; rc=$?
+  exit "$rc"
+' _ "$LIB" "$LOCK"; rc=$?
+[ "$rc" = 2 ] && ok "sourced release returns 2 (unverifiable), not 98" || bad "sourced missing-token release rc=$rc (want 2)"
+[ -d "$LOCK" ] && ok "lock dir left in place for the stale window" || bad "lock dir removed despite unverifiable ownership"
+rm -rf "$LOCK"
+AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" \
+  bash "$LIB" run -- bash -c 'rm -f "$AGENT_LOCK_DIR/token"' 2>/dev/null; rc=$?
+[ "$rc" = 1 ] && ok "run maps unverifiable release to 1 for a successful command" || bad "run missing-token rc=$rc (want 1)"
+rm -rf "$LOCK"
+AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" \
+  bash "$LIB" run -- bash -c 'rm -f "$AGENT_LOCK_DIR/token"; exit 7' 2>/dev/null; rc=$?
+[ "$rc" = 7 ] && ok "run keeps a failing command's own code (7) over the unverifiable 1" || bad "run missing-token+exit-7 rc=$rc (want 7)"
+rm -rf "$LOCK"
 
 # NOTE (deliberately untested): lock_release's rename-aside recovery (rm -rf
 # fails -> mv the dir to a .rel.* grave -> rm the grave) only triggers when the
