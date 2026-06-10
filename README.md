@@ -109,7 +109,10 @@ pwsh -NoProfile -File "$HOME/.local/bin/commit-lock.ps1" run "git add -- path/a 
 
 The exit code is the wrapped command's. If it exits 2 with the lock-stolen
 warning, the lock was lost mid-hold and the commit was NOT serialised — verify
-with `git log` and redo. See [`docs/commit-lock.md`](docs/commit-lock.md) for
+with `git log` and redo. If the lock can't be acquired within
+`AGENT_LOCK_MAX_WAIT` (default 7 minutes), the command isn't run and the exit
+code is 1 with a timeout message on stderr. See
+[`docs/commit-lock.md`](docs/commit-lock.md) for
 the `run` vs source-the-library forms, the `AGENT_LOCK_*` config knobs, and
 how staleness and stealing work.
 
@@ -197,14 +200,14 @@ lock:
   [Jules][jules] clone into isolated environments and return branch/PR-shaped
   work, avoiding the shared checkout entirely.
 
-## Verifying on a new machine
+## Running the tests
 
 ```sh
 bash commit-lock.test.sh           # bash implementation
 bash commit-lock.interop.test.sh   # bash + PowerShell interop (skips if pwsh is absent)
 ```
 
-Both suites print a `RESULT:` summary line and exit 0 when everything passes.
+Both suites print a summary line and exit 0 when everything passes.
 They use throwaway temp dirs and never touch the repo you launch them from.
 On Windows, run them from Git Bash/MSYS2 bash, **not** WSL bash, so the bash
 and PowerShell sides resolve the same `C:/...` lock path.
