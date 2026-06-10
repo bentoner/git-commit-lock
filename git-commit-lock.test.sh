@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# commit-lock.test.sh — self-contained tests for commit-lock.sh.
+# git-commit-lock.test.sh — self-contained tests for git-commit-lock.sh.
 #
 # Runs entirely against throwaway temp dirs, so it never touches the repo you
 # launch it from. Exit 0 == all pass.
-#   bash ~/.local/bin/commit-lock.test.sh
+#   bash ~/.local/bin/git-commit-lock.test.sh
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LIB="$DIR/commit-lock.sh"
+LIB="$DIR/git-commit-lock.sh"
 
-WORK="$(mktemp -d 2>/dev/null || echo "${TMPDIR:-/tmp}/commit-lock-test.$$")"
+WORK="$(mktemp -d 2>/dev/null || echo "${TMPDIR:-/tmp}/git-commit-lock-test.$$")"
 mkdir -p "$WORK"
 cleanup() { rm -rf "$WORK" 2>/dev/null || true; }
 trap cleanup EXIT
@@ -132,7 +132,7 @@ SCRATCH="$WORK/scratch"; mkdir -p "$SCRATCH"
 git -C "$SCRATCH" init -q; git -C "$SCRATCH" config user.email t@t; git -C "$SCRATCH" config user.name t
 ( cd "$SCRATCH" && bash "$LIB" run -- bash -c 'true' >/dev/null 2>&1 )
 GITDIR="$(git -C "$SCRATCH" rev-parse --absolute-git-dir)"
-[ -f "$GITDIR/commit-lock.log" ] && ok "lock log created in git dir ($GITDIR)" || bad "no log in git dir"
+[ -f "$GITDIR/git-commit-lock.log" ] && ok "lock log created in git dir ($GITDIR)" || bad "no log in git dir"
 
 echo
 echo "==== RESULT: $PASS passed, $FAIL failed ===="

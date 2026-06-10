@@ -1,15 +1,15 @@
-# commit-lock.ps1 — the commit-lock mutex (PowerShell port).
-# Reachable at runtime as ~/.local/bin/commit-lock.ps1
+# git-commit-lock.ps1 — the git-commit-lock mutex (PowerShell port).
+# Reachable at runtime as ~/.local/bin/git-commit-lock.ps1
 # (symlinked there by this repo's install.sh).
 #
-# PowerShell port of commit-lock.sh, for agents whose native shell is PowerShell
-# (notably Codex on Windows). It is WIRE-COMPATIBLE with commit-lock.sh: same lock
+# PowerShell port of git-commit-lock.sh, for agents whose native shell is PowerShell
+# (notably Codex on Windows). It is WIRE-COMPATIBLE with git-commit-lock.sh: same lock
 # directory, same dir-mtime staleness / rename-steal / token-release protocol, so
 # a .ps1 holder and a .sh holder in the SAME working tree (e.g. Codex and Claude)
-# correctly serialise against EACH OTHER. commit-lock.sh remains the authoritative
-# design; docs/commit-lock.md is the "why". Keep the two in lock-step.
+# correctly serialise against EACH OTHER. git-commit-lock.sh remains the authoritative
+# design; docs/git-commit-lock.md is the "why". Keep the two in lock-step.
 #
-# WHY A SEPARATE PS PORT (instead of Codex calling commit-lock.sh):
+# WHY A SEPARATE PS PORT (instead of Codex calling git-commit-lock.sh):
 #   On Windows the bare name `bash` on the plain PATH resolves to
 #   C:\Windows\system32\bash.exe = the WSL launcher, whose Linux git cannot reach
 #   the Windows SSH signer (the private key isn't in WSL, and SSH-agent
@@ -19,17 +19,17 @@
 #   ("No private key found ... fatal: failed to write commit object"). Codex's
 #   native shell is PowerShell, where `git` = Git-for-Windows and signs fine, so
 #   running the lock + commit in PowerShell avoids bash/WSL entirely. Claude keeps
-#   using commit-lock.sh (it ships its own MINGW64 Git-Bash, immune to this).
+#   using git-commit-lock.sh (it ships its own MINGW64 Git-Bash, immune to this).
 #
 # USAGE (Codex's normal path — run a command string under the lock):
-#   & ~/.local/bin/commit-lock.ps1 run "git add -- path/a path/b; if (`$LASTEXITCODE -eq 0) { git commit -m 'msg' }"
+#   & ~/.local/bin/git-commit-lock.ps1 run "git add -- path/a path/b; if (`$LASTEXITCODE -eq 0) { git commit -m 'msg' }"
 #   Exit code is the command's; or 2 if the lock was lost mid-hold (NOT exclusive
 #   — verify with `git log` and redo). Use the `if (`$LASTEXITCODE -eq 0)` guard
 #   instead of `&&` (works on Windows PowerShell 5.1 too) and avoid `exit` inside
 #   the command (the lock still releases, but the exit code stops propagating).
 #
-# Or dot-source for the primitives (mirrors `source commit-lock.sh`):
-#   . ~/.local/bin/commit-lock.ps1
+# Or dot-source for the primitives (mirrors `source git-commit-lock.sh`):
+#   . ~/.local/bin/git-commit-lock.ps1
 #   if (-not (Lock-Acquire)) { exit 1 }
 #   try { git add -- path; git commit -m 'msg' } finally { Lock-Release | Out-Null }
 #
@@ -37,7 +37,7 @@
 # build any patch, resolve hook failures OUTSIDE the lock. See README.md
 # ("Suggested agent instructions").
 #
-# CONFIG (env, mainly for tests) — identical names/semantics to commit-lock.sh:
+# CONFIG (env, mainly for tests) — identical names/semantics to git-commit-lock.sh:
 #   AGENT_LOCK_DIR, AGENT_LOCK_STALE_SECS (default 300), AGENT_LOCK_POLL_SECS
 #   (default 2), AGENT_LOCK_MAX_WAIT (default 420), AGENT_LOCK_LOG.
 
@@ -52,9 +52,9 @@ Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
 # --- resolve defaults (git-dir aware, CWD-independent within the repo) --------
-# Mirrors commit-lock.sh: lock + log live in `git rev-parse --absolute-git-dir`
+# Mirrors git-commit-lock.sh: lock + log live in `git rev-parse --absolute-git-dir`
 # (e.g. C:/repo/.git/commit.lock). Windows git prints a forward-slash drive path
-# (C:/repo/.git), exactly what MINGW git prints for commit-lock.sh, so both sides
+# (C:/repo/.git), exactly what MINGW git prints for git-commit-lock.sh, so both sides
 # compute the SAME lock-dir string and contend on the same NTFS directory.
 function Get-LockBase {
     $gd = $null
@@ -73,7 +73,7 @@ if ($env:AGENT_LOCK_DIR)        { $script:LockDir = $env:AGENT_LOCK_DIR }       
 if ($env:AGENT_LOCK_STALE_SECS) { $script:LockStale = [int]$env:AGENT_LOCK_STALE_SECS } else { $script:LockStale = 300 }
 if ($env:AGENT_LOCK_POLL_SECS)  { $script:LockPoll = [double]$env:AGENT_LOCK_POLL_SECS }  else { $script:LockPoll = 2 }
 if ($env:AGENT_LOCK_MAX_WAIT)   { $script:LockMaxWait = [int]$env:AGENT_LOCK_MAX_WAIT }   else { $script:LockMaxWait = 420 }
-if ($env:AGENT_LOCK_LOG)        { $script:LockLog = $env:AGENT_LOCK_LOG }        else { $script:LockLog = "$script:LockBase/commit-lock.log" }
+if ($env:AGENT_LOCK_LOG)        { $script:LockLog = $env:AGENT_LOCK_LOG }        else { $script:LockLog = "$script:LockBase/git-commit-lock.log" }
 
 # Floor for a PLAUSIBLE lock mtime (epoch secs; 2000-01-01). A freshly created
 # dir can transiently report the Windows FILETIME zero (1601-01-01 -> a NEGATIVE
@@ -201,7 +201,7 @@ function Lock-Acquire {
         # A live holder has it — wait, unless we have waited too long.
         if (((script:Lock-Now) - $start) -ge $script:LockMaxWait) {
             script:Lock-Log "TIMEOUT after $($script:LockMaxWait)s waiting for lock"
-            [Console]::Error.WriteLine("commit-lock: timed out after $($script:LockMaxWait)s waiting for commit lock")
+            [Console]::Error.WriteLine("git-commit-lock: timed out after $($script:LockMaxWait)s waiting for commit lock")
             return $false
         }
         Start-Sleep -Seconds $script:LockPoll
@@ -222,7 +222,7 @@ function Lock-Release {
         # Our lease expired and the lock was stolen (possibly re-acquired by
         # someone else). Do NOT delete the dir — it may be a successor's LIVE lock.
         script:Lock-Log "WARNING: lock LOST before release (held longer than $($script:LockStale)s stale window; stolen). This commit was NOT exclusive — redo it. (ours=$script:LockToken now=$cur)"
-        [Console]::Error.WriteLine("commit-lock: WARNING - lock was stolen mid-hold (held > $($script:LockStale)s). Your commit was NOT serialised; verify with 'git log' and redo under the lock.")
+        [Console]::Error.WriteLine("git-commit-lock: WARNING - lock was stolen mid-hold (held > $($script:LockStale)s). Your commit was NOT serialised; verify with 'git log' and redo under the lock.")
         return $false
     }
 
@@ -278,15 +278,15 @@ if ($MyInvocation.InvocationName -ne '.') {
             $parts = @($Rest)
             if ($parts.Count -gt 0 -and $parts[0] -eq '--') { $parts = $parts[1..($parts.Count - 1)] }
             if ($parts.Count -eq 0) {
-                [Console]::Error.WriteLine('usage: commit-lock.ps1 run "<powershell command>"')
+                [Console]::Error.WriteLine('usage: git-commit-lock.ps1 run "<powershell command>"')
                 exit 2
             }
             Invoke-WithLock -CommandString ($parts -join ' ')
             exit $script:LockRunRc
         }
         default {
-            [Console]::Error.WriteLine('usage: commit-lock.ps1 run "<powershell command>"')
-            [Console]::Error.WriteLine('   or: . commit-lock.ps1; Lock-Acquire; <git...>; Lock-Release')
+            [Console]::Error.WriteLine('usage: git-commit-lock.ps1 run "<powershell command>"')
+            [Console]::Error.WriteLine('   or: . git-commit-lock.ps1; Lock-Acquire; <git...>; Lock-Release')
             exit 2
         }
     }

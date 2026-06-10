@@ -1,4 +1,4 @@
-<!-- docs/commit-lock.md — design/rationale for the commit-lock tool; suggested agent operating rules live in README.md -->
+<!-- docs/git-commit-lock.md — design/rationale for the git-commit-lock tool; suggested agent operating rules live in README.md -->
 
 # `git-commit-lock`: a mutex for committing from a shared working tree
 
@@ -68,7 +68,7 @@ lock (two holders → lost update — the second bug the self-test caught).
 
 **Location.** The lock and its log default to the repo's git dir
 (`git rev-parse --absolute-git-dir`), e.g. `<repo>/.git/commit.lock` and
-`<repo>/.git/commit-lock.log`. Never tracked by git (no `.gitignore` needed in
+`<repo>/.git/git-commit-lock.log`. Never tracked by git (no `.gitignore` needed in
 any repo), and correctly scoped: every worktree has its own git dir, so
 independent worktrees get independent locks, while all sub-agents sharing one
 checkout resolve the same git dir and share one lock.
@@ -79,13 +79,13 @@ creation and its first metadata write — a ~400-year bogus "age" that would
 spuriously steal a *live, brand-new* lock and put two holders in the tree. Both
 implementations therefore refuse to steal on any mtime below a sane floor
 (2000-01-01), treating a sub-floor reading as "just created — wait", and
-`commit-lock.ps1` additionally stamps the dir's mtime the instant it wins the
+`git-commit-lock.ps1` additionally stamps the dir's mtime the instant it wins the
 create. This race only became reachable once the PowerShell port (whose atomic
 create is a temp-dir + rename, which leaves a longer unsettled-mtime window than
 `mkdir`) began sharing the lock with the bash path; the interop self-test catches
 it (~1-in-4 runs before the fix, 0 after).
 
-## The PowerShell port (`commit-lock.ps1`)
+## The PowerShell port (`git-commit-lock.ps1`)
 
 Codex on Windows runs commands in **PowerShell**, where a bare `bash` resolves to
 `C:\Windows\system32\bash.exe` — the **WSL** launcher. WSL's Linux git can't reach
@@ -93,9 +93,9 @@ the Windows SSH commit signer (no private key in WSL; SSH-agent forwarding into
 WSL typically only fires in *interactive* shells, not an agent's `bash -c`), so a bash-wrapped
 commit under Codex fails to sign (`No private key found … failed to write commit
 object`). Claude is immune — it ships its own MINGW64 Git-Bash. So Codex commits
-via `commit-lock.ps1` from PowerShell, where `git` is Git-for-Windows and signs.
+via `git-commit-lock.ps1` from PowerShell, where `git` is Git-for-Windows and signs.
 
-The port is **wire-compatible** with `commit-lock.sh`, so a `.ps1` holder and a
+The port is **wire-compatible** with `git-commit-lock.sh`, so a `.ps1` holder and a
 `.sh` holder serialise against each other in one tree:
 
 - **Same lock dir / log:** `git rev-parse --absolute-git-dir` prints the same
@@ -112,21 +112,21 @@ The port is **wire-compatible** with `commit-lock.sh`, so a `.ps1` holder and a
   the release-time token read each retry briefly to ride out transient Windows
   sharing violations (a dropped token write would later look like a false theft).
 
-Usage (Codex): `& ~/.local/bin/commit-lock.ps1 run "git add -- <paths>; if ($LASTEXITCODE -eq 0) { git commit -m '<msg>' }"`. Chain with
+Usage (Codex): `& ~/.local/bin/git-commit-lock.ps1 run "git add -- <paths>; if ($LASTEXITCODE -eq 0) { git commit -m '<msg>' }"`. Chain with
 `if ($LASTEXITCODE -eq 0)` (not `&&`, not `exit`); exit code 2 = lock lost
 mid-hold, redo. Verified end-to-end 2026-06-03: a commit through the port carries
 a Good SSH signature.
 
 ## API
 
-Source it (`source ~/.local/bin/commit-lock.sh`) for:
+Source it (`source ~/.local/bin/git-commit-lock.sh`) for:
 
 - `lock_acquire` — block until held (steal-if-stale); returns non-zero only on
   the `AGENT_LOCK_MAX_WAIT` timeout. Arms an EXIT/INT/TERM trap that releases.
 - `lock_release` — release if held (idempotent).
 - `lock_run <cmd...>` — acquire, run the command, always release, propagate its
   exit code. The `run` CLI subcommand is this:
-  `commit-lock.sh run -- <cmd...>`.
+  `git-commit-lock.sh run -- <cmd...>`.
 
 Config knobs (env, mainly for tests): `AGENT_LOCK_DIR`, `AGENT_LOCK_STALE_SECS`,
 `AGENT_LOCK_POLL_SECS`, `AGENT_LOCK_MAX_WAIT`, `AGENT_LOCK_LOG`.
@@ -161,7 +161,7 @@ clobbers other agents' uncommitted edits.
 Normal case — commit the paths you changed:
 
 ```sh
-bash ~/.local/bin/commit-lock.sh run -- bash -c '
+bash ~/.local/bin/git-commit-lock.sh run -- bash -c '
   git add -- path/a path/b && git commit -m "msg"'
 ```
 
@@ -169,7 +169,7 @@ Shared file (you own only part of it) — stage just your hunk, commit the index
 
 ```sh
 git diff HEAD -- path/to/file > /tmp/mine.patch   # outside lock; trim to your hunk(s)
-bash ~/.local/bin/commit-lock.sh run -- bash -c '
+bash ~/.local/bin/git-commit-lock.sh run -- bash -c '
   git diff --cached --quiet || { echo "index not clean" >&2; exit 1; }
   git apply --cached /tmp/mine.patch && git commit -m "msg"'   # BARE commit
 ```
@@ -188,26 +188,26 @@ Under `~/.local/bin/` (symlinked from the repo by `install.sh`):
 
 | File | Role |
 |------|------|
-| `commit-lock.sh`             | the mutex (bash, used by Claude): source for `lock_acquire/lock_release/lock_run`, or `commit-lock.sh run -- <cmd>` |
-| `commit-lock.ps1`            | wire-compatible PowerShell port (used by Codex on Windows — see below): `commit-lock.ps1 run "<pwsh cmd>"`, or dot-source for `Lock-Acquire`/`Lock-Release` |
-| `commit-lock.test.sh`        | self-contained bash tests (throwaway temp dirs); exit 0 == all pass |
-| `commit-lock.interop.test.sh`| cross-impl tests: pwsh + bash workers share one lock and serialise; run from MINGW/Git-Bash |
+| `git-commit-lock.sh`             | the mutex (bash, used by Claude): source for `lock_acquire/lock_release/lock_run`, or `git-commit-lock.sh run -- <cmd>` |
+| `git-commit-lock.ps1`            | wire-compatible PowerShell port (used by Codex on Windows — see below): `git-commit-lock.ps1 run "<pwsh cmd>"`, or dot-source for `Lock-Acquire`/`Lock-Release` |
+| `git-commit-lock.test.sh`        | self-contained bash tests (throwaway temp dirs); exit 0 == all pass |
+| `git-commit-lock.interop.test.sh`| cross-impl tests: pwsh + bash workers share one lock and serialise; run from MINGW/Git-Bash |
 
 ## Verifying on a new machine
 
 ```
-bash ~/.local/bin/commit-lock.test.sh            # bash impl; "RESULT: N passed, 0 failed"
-bash ~/.local/bin/commit-lock.interop.test.sh    # cross-impl (needs pwsh); "INTEROP RESULT: …"
+bash ~/.local/bin/git-commit-lock.test.sh            # bash impl; "RESULT: N passed, 0 failed"
+bash ~/.local/bin/git-commit-lock.interop.test.sh    # cross-impl (needs pwsh); "INTEROP RESULT: …"
 ```
 
-`commit-lock.test.sh` covers mutual exclusion over 8×25 concurrent workers (clean
+`git-commit-lock.test.sh` covers mutual exclusion over 8×25 concurrent workers (clean
 acquire/release path), stale-lock theft, the epoch-less-orphan regression,
 refusal to steal a *live* lock, a robbed slow holder detecting the theft and
 failing on release (plus the thief succeeding on its own fresh hold), an
 uncontended slow holder *not* failing, exit-code propagation, and the git-dir
 lock location.
 
-`commit-lock.interop.test.sh` proves `.ps1` and `.sh` interlock: 8 bash + 8 pwsh
+`git-commit-lock.interop.test.sh` proves `.ps1` and `.sh` interlock: 8 bash + 8 pwsh
 workers serialise on one lock with zero concurrent-holder violations and zero
 spurious steals; a bash holder blocks a pwsh waiter and vice-versa (no wrongful
 steal); and each side steals the other's genuinely stale lock. Run it from

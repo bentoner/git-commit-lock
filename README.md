@@ -60,14 +60,14 @@ on the same lock. A lock held longer than 5 minutes (configurable) is presumed
 crashed and is stolen, so a dead agent can't wedge the others; a holder that
 loses the lock mid-hold finds out at release (exit code 2) rather than
 silently claiming success. Full design and rationale:
-[`docs/commit-lock.md`](docs/commit-lock.md).
+[`docs/git-commit-lock.md`](docs/git-commit-lock.md).
 
 Two wire-compatible implementations share one lock directory and protocol, so
 a bash holder and a PowerShell holder in the same tree serialise against
 **each other**:
 
-- `commit-lock.sh` — bash (the authoritative implementation)
-- `commit-lock.ps1` — PowerShell port, for agents whose native shell is pwsh
+- `git-commit-lock.sh` — bash (the authoritative implementation)
+- `git-commit-lock.ps1` — PowerShell port, for agents whose native shell is pwsh
 
 The scripts use only portable primitives, but so far they have been exercised
 mainly on Windows (Git Bash + PowerShell 7).
@@ -76,9 +76,9 @@ mainly on Windows (Git Bash + PowerShell 7).
 
 Requirements:
 
-- Git, and bash for `commit-lock.sh`. On Windows use Git Bash/MSYS2 bash, not
+- Git, and bash for `git-commit-lock.sh`. On Windows use Git Bash/MSYS2 bash, not
   WSL bash — an install done from WSL is only visible inside WSL.
-- PowerShell 7+ (`pwsh`), only for `commit-lock.ps1` and the interop tests.
+- PowerShell 7+ (`pwsh`), only for `git-commit-lock.ps1` and the interop tests.
 - `~/.local/bin` on `PATH` if you want the installed command names to resolve
   (the installer warns if it isn't).
 
@@ -89,11 +89,11 @@ cd git-commit-lock
 bash install.sh
 ```
 
-This symlinks `commit-lock.sh` and `commit-lock.ps1` into `~/.local/bin/` and
+This symlinks `git-commit-lock.sh` and `git-commit-lock.ps1` into `~/.local/bin/` and
 is idempotent — re-run any time, e.g. after moving the repo. On Windows, real
 symlinks require Developer Mode; if symlinks are unavailable, skip the
 installer and invoke the scripts by path from the clone (e.g.
-`path/to/git-commit-lock/commit-lock.sh`). Installing is only a convenience so
+`path/to/git-commit-lock/git-commit-lock.sh`). Installing is only a convenience so
 every checkout can use the same command names.
 
 ## Suggested agent instructions
@@ -111,13 +111,13 @@ hunks you own. Never use `git add -A`, `git commit -a`, `git commit -am`, or
 `git stash` in a shared checkout.
 
 Use the shell-native lock command for the agent. On Windows, use
-`commit-lock.ps1` through `pwsh` rather than a bash wrapper unless you know
+`git-commit-lock.ps1` through `pwsh` rather than a bash wrapper unless you know
 that bash resolves to the same Git and signing environment.
 
 Bash:
 
 ```sh
-bash ~/.local/bin/commit-lock.sh run -- bash -c '
+bash ~/.local/bin/git-commit-lock.sh run -- bash -c '
   git add -- path/you/changed another/path &&
   git commit -m "your message"'
 ```
@@ -125,7 +125,7 @@ bash ~/.local/bin/commit-lock.sh run -- bash -c '
 PowerShell:
 
 ```powershell
-pwsh -NoProfile -File "$HOME/.local/bin/commit-lock.ps1" run "git add -- path/a path/b; if (`$LASTEXITCODE -eq 0) { git commit -m 'your message' }"
+pwsh -NoProfile -File "$HOME/.local/bin/git-commit-lock.ps1" run "git add -- path/a path/b; if (`$LASTEXITCODE -eq 0) { git commit -m 'your message' }"
 ```
 
 If you want to run the git steps one at a time — for example to review the
@@ -133,7 +133,7 @@ staged diff before committing — source the library and drive the lock
 yourself, keeping the whole hold brief:
 
 ```sh
-source ~/.local/bin/commit-lock.sh
+source ~/.local/bin/git-commit-lock.sh
 lock_acquire || exit 1
 git add -- path/you/changed
 git diff --cached
@@ -157,7 +157,7 @@ outside the lock and apply it to the index under the lock:
 
 ```sh
 git diff HEAD -- path/to/file > /tmp/mine.patch
-bash ~/.local/bin/commit-lock.sh run -- bash -c '
+bash ~/.local/bin/git-commit-lock.sh run -- bash -c '
   git diff --cached --quiet || { echo "index not clean" >&2; exit 1; }
   git apply --cached /tmp/mine.patch &&
   git commit -m "your message"'
@@ -173,21 +173,21 @@ can pull in someone else's WIP.
 Bash — run a command under the lock:
 
 ```sh
-bash ~/.local/bin/commit-lock.sh run -- bash -c '
+bash ~/.local/bin/git-commit-lock.sh run -- bash -c '
   git add -- path/you/changed && git commit -m "your message"'
 ```
 
 PowerShell:
 
 ```powershell
-pwsh -NoProfile -File "$HOME/.local/bin/commit-lock.ps1" run "git add -- path/a path/b; if (`$LASTEXITCODE -eq 0) { git commit -m 'msg' }"
+pwsh -NoProfile -File "$HOME/.local/bin/git-commit-lock.ps1" run "git add -- path/a path/b; if (`$LASTEXITCODE -eq 0) { git commit -m 'msg' }"
 ```
 
 If a single wrapped command is awkward — say you want to review the staged
 diff before committing — source the library and drive the lock yourself:
 
 ```sh
-source ~/.local/bin/commit-lock.sh
+source ~/.local/bin/git-commit-lock.sh
 lock_acquire || exit 1
 git add -- path/you/changed
 git diff --cached        # check the staged commit is what you intend
@@ -195,7 +195,7 @@ git commit -m "your message"
 lock_release
 ```
 
-(In PowerShell, dot-source `commit-lock.ps1` and use `Lock-Acquire` /
+(In PowerShell, dot-source `git-commit-lock.ps1` and use `Lock-Acquire` /
 `Lock-Release` in a `try`/`finally`.) Keep the hold brief either way: the lock
 is a lease, and a hold longer than the staleness window (default 5 minutes)
 can be stolen by a waiter. Prepare everything you can outside the lock, and
@@ -207,7 +207,7 @@ lock-stolen warning, the lock was lost mid-hold and the commit was NOT
 serialised — verify with `git log` and redo. If the lock can't be acquired
 within `AGENT_LOCK_MAX_WAIT` (default 7 minutes), the command isn't run and
 the exit code is 1 with a timeout message on stderr. See
-[`docs/commit-lock.md`](docs/commit-lock.md) for the `AGENT_LOCK_*` config
+[`docs/git-commit-lock.md`](docs/git-commit-lock.md) for the `AGENT_LOCK_*` config
 knobs and how staleness and stealing work.
 
 ## Alternatives and related tools
@@ -238,8 +238,8 @@ lock:
 ## Running the tests
 
 ```sh
-bash commit-lock.test.sh           # bash implementation
-bash commit-lock.interop.test.sh   # bash + PowerShell interop (skips if pwsh is absent)
+bash git-commit-lock.test.sh           # bash implementation
+bash git-commit-lock.interop.test.sh   # bash + PowerShell interop (skips if pwsh is absent)
 ```
 
 Both suites print a summary line and exit 0 when everything passes.

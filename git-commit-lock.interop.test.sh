@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# commit-lock.interop.test.sh
+# git-commit-lock.interop.test.sh
 #
-# Cross-implementation test: proves commit-lock.ps1 (PowerShell) and
-# commit-lock.sh (bash) share ONE lock and serialise against EACH OTHER in the
+# Cross-implementation test: proves git-commit-lock.ps1 (PowerShell) and
+# git-commit-lock.sh (bash) share ONE lock and serialise against EACH OTHER in the
 # same working tree. On Windows, run from MINGW/Git-Bash — NOT from WSL —
 # because both sides must agree on the lock path in `C:/...` form. Spawns
 # pwsh + bash workers, so it needs both on PATH.
-#   bash ~/.local/bin/commit-lock.interop.test.sh
+#   bash ~/.local/bin/git-commit-lock.interop.test.sh
 # Exit 0 == all pass. Uses a throwaway temp dir; never touches your repo.
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SH="$DIR/commit-lock.sh"
-PS1WIN="$(cygpath -w "$DIR/commit-lock.ps1" 2>/dev/null || echo "$DIR/commit-lock.ps1")"
+SH="$DIR/git-commit-lock.sh"
+PS1WIN="$(cygpath -w "$DIR/git-commit-lock.ps1" 2>/dev/null || echo "$DIR/git-commit-lock.ps1")"
 PS1WIN="${PS1WIN//\\//}"   # forward slashes: both pwsh and mingw accept C:/...
 
 command -v pwsh >/dev/null 2>&1 || { echo "SKIP: pwsh not on PATH"; exit 0; }

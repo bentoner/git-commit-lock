@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — symlink commit-lock.{sh,ps1} into ~/.local/bin.
+# install.sh — symlink git-commit-lock.{sh,ps1} into ~/.local/bin.
 #
 # Idempotent: re-run any time (e.g. after moving the repo). Real Windows symlinks
 # need Developer Mode on, plus the MSYS flag below; on Linux plain `ln -s` makes
@@ -12,7 +12,7 @@ mkdir -p "$DEST"
 
 export MSYS=winsymlinks:nativestrict   # real symlinks on Windows Git-Bash
 
-for f in commit-lock.sh commit-lock.ps1; do
+for f in git-commit-lock.sh git-commit-lock.ps1; do
     src="$REPO/$f"
     dst="$DEST/$f"
     [ -f "$src" ] || { echo "install.sh: missing $src" >&2; exit 1; }
@@ -23,7 +23,7 @@ done
 
 case ":${PATH}:" in
     *":${DEST}:"*) : ;;
-    *) echo "install.sh: NOTE — $DEST is not on PATH; add it so 'commit-lock.sh' resolves." >&2 ;;
+    *) echo "install.sh: NOTE — $DEST is not on PATH; add it so 'git-commit-lock.sh' resolves." >&2 ;;
 esac
 
-echo "commit-lock installed to $DEST."
+echo "git-commit-lock installed to $DEST."

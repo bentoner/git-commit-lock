@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# commit-lock.sh — the commit-lock mutex (bash implementation).
-# Reachable at runtime as ~/.local/bin/commit-lock.sh
+# git-commit-lock.sh — the git-commit-lock mutex (bash implementation).
+# Reachable at runtime as ~/.local/bin/git-commit-lock.sh
 # (symlinked there by this repo's install.sh).
 #
 # Portable, flock-free mutex that serialises git's shared index/HEAD when
@@ -8,7 +8,7 @@
 # only the lock — the git steps themselves (what to stage, what to commit) are
 # done MANUALLY by the agent, under this lock. Suggested agent operating rules
 # live in README.md ("Suggested agent instructions"); the design rationale is
-# in docs/commit-lock.md.
+# in docs/git-commit-lock.md.
 #
 # WHY THIS EXISTS
 #   git has ONE index (.git/index, or .git/worktrees/<wt>/index) and ONE HEAD
@@ -66,15 +66,15 @@
 #   AGENT_LOCK_POLL_SECS   poll interval while waiting (default 2)
 #   AGENT_LOCK_MAX_WAIT    safety cap on total wait (default 420; > stale so a
 #                          steal always gets a chance before we give up)
-#   AGENT_LOCK_LOG         log file (default <gitdir>/commit-lock.log)
+#   AGENT_LOCK_LOG         log file (default <gitdir>/git-commit-lock.log)
 #
 # USAGE (two modes; pick one — both keep the critical section tiny)
 #   1. Wrap your git in `run` (auto-releases; exit code is your command's,
 #      OR 2 if the lock was lost mid-hold — treat 2 as "NOT exclusive, redo"):
-#        ~/.local/bin/commit-lock.sh run -- bash -c '
+#        ~/.local/bin/git-commit-lock.sh run -- bash -c '
 #          git add -- path/to/file && git commit -m "msg"'
 #   2. Source it and drive the lock yourself, in ONE shell invocation:
-#        source ~/.local/bin/commit-lock.sh
+#        source ~/.local/bin/git-commit-lock.sh
 #        lock_acquire || exit 1
 #        git add -- path/to/file && git commit -m "msg"
 #        lock_release || echo "WARNING: lock was lost; commit was not exclusive" >&2
@@ -93,7 +93,7 @@ AGENT_LOCK_DIR="${AGENT_LOCK_DIR:-$_LOCK_BASE/commit.lock}"
 AGENT_LOCK_STALE_SECS="${AGENT_LOCK_STALE_SECS:-300}"
 AGENT_LOCK_POLL_SECS="${AGENT_LOCK_POLL_SECS:-2}"
 AGENT_LOCK_MAX_WAIT="${AGENT_LOCK_MAX_WAIT:-420}"
-AGENT_LOCK_LOG="${AGENT_LOCK_LOG:-$_LOCK_BASE/commit-lock.log}"
+AGENT_LOCK_LOG="${AGENT_LOCK_LOG:-$_LOCK_BASE/git-commit-lock.log}"
 
 _LOCK_HELD=0
 _LOCK_ME="pid=$$ host=$(hostname 2>/dev/null || echo unknown)"
@@ -141,7 +141,7 @@ lock_acquire() {
     # BUT only on a PLAUSIBLE mtime (>= 2000-01-01): a freshly created dir can
     # transiently report the Windows FILETIME zero (1601) before its first
     # metadata write, which would look ~400 years old and spuriously steal a live,
-    # just-acquired lock (notably one created by commit-lock.ps1's atomic rename;
+    # just-acquired lock (notably one created by git-commit-lock.ps1's atomic rename;
     # cross-impl race the interop self-test caught 2026-06-03). A sub-floor read is
     # unsettled, not stale, so we wait instead.
     local mt age
@@ -167,7 +167,7 @@ lock_acquire() {
     # A live holder has it — wait, unless we have waited too long.
     if [ $(( $(_lock_now) - start )) -ge "$AGENT_LOCK_MAX_WAIT" ]; then
       _lock_log "TIMEOUT after ${AGENT_LOCK_MAX_WAIT}s waiting for lock"
-      echo "commit-lock: timed out after ${AGENT_LOCK_MAX_WAIT}s waiting for commit lock" >&2
+      echo "git-commit-lock: timed out after ${AGENT_LOCK_MAX_WAIT}s waiting for commit lock" >&2
       return 1
     fi
     sleep "$AGENT_LOCK_POLL_SECS"
@@ -188,7 +188,7 @@ lock_release() {
     # someone else). Do NOT delete the dir — it may be a successor's LIVE lock.
     # Loudly report that this hold was not exclusive.
     _lock_log "WARNING: lock LOST before release (held longer than ${AGENT_LOCK_STALE_SECS}s stale window; stolen). This commit was NOT exclusive — redo it. (ours=$_LOCK_TOKEN now=${cur:-<none>})"
-    echo "commit-lock: WARNING — lock was stolen mid-hold (held > ${AGENT_LOCK_STALE_SECS}s). Your commit was NOT serialised; verify with 'git log' and redo under the lock." >&2
+    echo "git-commit-lock: WARNING — lock was stolen mid-hold (held > ${AGENT_LOCK_STALE_SECS}s). Your commit was NOT serialised; verify with 'git log' and redo under the lock." >&2
     return 2
   fi
 
@@ -230,12 +230,12 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   case "$cmd" in
     run)
       [ "${1:-}" = "--" ] && shift
-      [ "$#" -gt 0 ] || { echo "usage: commit-lock.sh run -- <command...>" >&2; exit 2; }
+      [ "$#" -gt 0 ] || { echo "usage: git-commit-lock.sh run -- <command...>" >&2; exit 2; }
       lock_run "$@"
       ;;
     *)
-      echo "usage: commit-lock.sh run -- <command...>" >&2
-      echo "   or: source commit-lock.sh; lock_acquire; <git...>; lock_release" >&2
+      echo "usage: git-commit-lock.sh run -- <command...>" >&2
+      echo "   or: source git-commit-lock.sh; lock_acquire; <git...>; lock_release" >&2
       exit 2
       ;;
   esac
