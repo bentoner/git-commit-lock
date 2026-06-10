@@ -59,7 +59,8 @@ worktrees get independent locks, while all agents sharing one checkout contend
 on the same lock. A lock held longer than 5 minutes (configurable) is presumed
 crashed and is stolen, so a dead agent can't wedge the others; a holder that
 loses the lock mid-hold finds out at release (exit code 98) rather than
-silently claiming success. Full design and rationale:
+silently claiming success. Full design and rationale — including why `flock`
+and other OS lock primitives don't fit this cross-runtime setting:
 [`docs/git-commit-lock.md`](docs/git-commit-lock.md).
 
 Two wire-compatible implementations share one lock directory and protocol, so

@@ -39,8 +39,9 @@ have worktrees, so we need a lock inside the shared tree.
 
 ## How the lock works
 
-`flock` is unavailable in Git-Bash/Cygwin environments, so the lock is built
-from primitives that are atomic on NTFS:
+`flock` is unavailable in Git-Bash/Cygwin environments (see [Why not
+`flock`?](#why-not-flock-or-another-os-lock-primitive) for the full story), so
+the lock is built from primitives that are atomic on NTFS:
 
 - **acquire** = `mkdir <lock>` — atomic create-or-fail.
 - **steal** = `mv <lock> <grave>` — `rename(2)` is atomic, so exactly one
@@ -83,6 +84,63 @@ create. This race only became reachable once the PowerShell port (whose atomic
 create is a temp-dir + rename, which leaves a longer unsettled-mtime window than
 `mkdir`) began sharing the lock with the bash path; the interop self-test catches
 it (~1-in-4 runs before the fix, 0 after).
+
+## Why not `flock` (or another OS lock primitive)?
+
+Kernel locks look like the obvious tool here — so why a hand-rolled
+filesystem lease? Because the hard requirement is **one lock that both
+implementations can take natively**: bash running under Git for Windows'
+MINGW64 environment, and PowerShell/.NET, contending on the *same* lock in the
+same repo, with the bash side also portable to macOS and Linux. No OS lock
+primitive survives that intersection:
+
+- **Availability.** Git for Windows deliberately excludes util-linux from its
+  payload, so its bash has no `flock(1)` at all (MSYS2 proper offers one via
+  `pacman -S util-linux`, but Git for Windows users don't have pacman). macOS
+  has the `flock(2)` syscall but ships no `flock(1)` utility either — it's a
+  util-linux program.
+- **Interop.** Even where a Cygwin-family `flock` exists, Cygwin implements
+  POSIX advisory locks (`flock`/`fcntl`/`lockf`) in its own emulation layer —
+  not via `LockFileEx` — so by default they are visible only to other
+  Cygwin-runtime processes. .NET has no `flock` equivalent; on Windows its
+  locking is share modes fixed at open time (`FileShare.None` etc.) and
+  byte-range locks via `FileStream.Lock`, both kernel-enforced. The two worlds
+  never contend on one lock: a Cygwin `flock` holder is invisible to a
+  PowerShell opener, and a PowerShell share-mode lock isn't something bash can
+  *take*, only collide with. (Cygwin ≥ 1.7.19 has a per-descriptor opt-in,
+  `fcntl(F_LCK_MANDATORY)`, that does map to Windows locking — but nothing a
+  shell script holds uses it, and such locks don't survive fork/exec.) Git for
+  Windows does ship a perl whose `flock()` "works", but it is the same MSYS
+  emulation — invisible to .NET — so a perl helper buys no cross-runtime
+  exclusion.
+- **A compiled helper could do it** — a small binary holding a Windows named
+  mutex or `LockFileEx` lock on one side and `flock` on the other, with the
+  kernel releasing the lock automatically when the holder dies. We rejected
+  it deliberately: it turns two dependency-free scripts into an installed
+  binary with command-wrapping semantics, which is a different (and heavier)
+  project than "copy these scripts anywhere agents run".
+- **And kernel locks can't recover a wedged holder.** Automatic
+  release-on-death is the kernel lock's great virtue (with caveats: Windows
+  documents post-mortem unlocking as asynchronous, and an `flock` lives on
+  the open file description, so an inherited descriptor in a child keeps it
+  held). But there is no supported way to take a kernel lock away from a
+  process that is alive and *stuck* — an agent hung on a credential prompt, a
+  wedged hook, a dead network mount — short of killing it. For unattended
+  agent fleets, hung-but-alive is at least as common as crashed. The lease
+  design recovers from both within the stale window, at the documented cost
+  of being fail-open — a theft is detected (exit 98) rather than prevented.
+
+So the only locking primitive every runtime here observes identically is the
+**filesystem namespace** — atomic create and atomic rename — and that is what
+the lock is built from. The trade-off is owned in the sections above:
+staleness needs a clock heuristic, release needs theft detection, and two
+narrow check-then-act races remain (detected, not silent).
+
+The filesystem primitives carry their own assumption, stated here explicitly:
+the repo must live on a **local filesystem with atomic create/rename and sane
+mtimes** (NTFS, ext4, APFS, and kin). Repos on network or sync-backed storage
+— NFS, SMB shares, Dropbox/OneDrive-synced directories — are outside the
+design's guarantees.
 
 ## The PowerShell port (`git-commit-lock.ps1`)
 
@@ -133,7 +191,9 @@ Source it (`source ~/.local/bin/git-commit-lock.sh`) for:
   `AGENT_LOCK_MAX_WAIT` timeout (and 1 on API misuse, e.g. a reentrant
   acquire). Arms an EXIT/INT/TERM trap that releases.
 - `lock_release` — release if held (idempotent); returns 98, with a warning,
-  if the lock was stolen mid-hold.
+  if the lock was stolen mid-hold; 2 if the token was unreadable at release
+  with the lock dir still present (ownership unverifiable — `run` maps this
+  to 1); 1 if the dir could not be removed (the stale window recovers it).
 - `lock_run <cmd...>` — acquire, run the command, always release, propagate its
   exit code. The `run` CLI subcommand is this:
   `git-commit-lock.sh run -- <cmd...>`.
