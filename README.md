@@ -238,11 +238,12 @@ lock:
 ## Running the tests
 
 ```sh
-bash git-commit-lock.test.sh           # bash implementation
-bash git-commit-lock.interop.test.sh   # bash + PowerShell interop (skips if pwsh is absent)
+bash git-commit-lock.test.sh             # bash implementation
+bash git-commit-lock.interop.test.sh     # bash + PowerShell interop (skips if pwsh is absent)
+bash git-commit-lock.integration.test.sh # end-to-end: concurrent real commits into one repo (pwsh half skips if absent)
 ```
 
-Both suites print a summary line and exit 0 when everything passes.
+All three suites print a summary line and exit 0 when everything passes.
 They use throwaway temp dirs and never touch the repo you launch them from.
 On Windows, run them from Git Bash/MSYS2 bash, **not** WSL bash, so the bash
 and PowerShell sides resolve the same `C:/...` lock path.
