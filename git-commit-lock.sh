@@ -86,6 +86,9 @@
 #                          stale so a steal always gets a chance before we
 #                          give up — a warning is printed if it is not)
 #   AGENT_LOCK_LOG         log file (default <gitdir>/git-commit-lock.log)
+#   STALE_SECS and MAX_WAIT must be positive integers, POLL_SECS may be
+#   fractional; invalid values fall back to the default with a stderr note
+#   (same rules in the ps1 port).
 #
 # EXIT CODES (the published contract — do not repurpose)
 #   `run` exits with the wrapped command's own exit code, EXCEPT three
@@ -99,10 +102,13 @@
 #   these; avoid those codes in wrapped commands.)
 #   Sourced API: lock_acquire returns 97 on timeout and 1 on API misuse
 #   (reentrant acquire); lock_release returns 98 if the lease was stolen
-#   mid-hold, 2 if the token was unreadable at release with the dir still
-#   present (ownership unverifiable — treat the hold as suspect; `run` maps
-#   this to 1), and 1 if the lock dir could not be removed (stale-window
-#   backstop recovers it).
+#   mid-hold, 2 if the token was unreadable OR MISSING at release with the dir
+#   still present (ownership unverifiable — we cannot prove our own
+#   acquire-time token write ever landed, so a missing token is NOT proof of
+#   theft; `run` maps this to 1 only when the command itself succeeded, and
+#   keeps a failing command's own exit code), and 1 if the lock dir could not
+#   be removed (stale-window backstop recovers it). The ps1 port returns the
+#   same verdicts for the same on-disk states.
 #
 # USAGE (two modes; pick one — both keep the critical section tiny)
 #   1. Wrap your git in `run` (auto-releases; exit codes above):
@@ -201,26 +207,38 @@ if [ -z "$_LOCK_GITDIR" ] && [ "$_LOCK_DIR_EXPLICIT" = 0 ] && [ "${BASH_SOURCE[0
   _lock_log "WARNING: not inside a git repository; lock location falls back to CWD ($_LOCK_BASE) — set AGENT_LOCK_DIR explicitly if that is not intended"
 fi
 
-# mtime (epoch secs) of the lock dir itself, set atomically by mkdir; empty if
-# the dir vanished mid-check. Probe chain: GNU stat (-c %Y), then BSD/macOS
-# stat (-f %m), then GNU date (-r FILE +%s; BSD date -r takes seconds, so it
-# fails harmlessly there). The numeric guard rejects any probe that "succeeds"
-# with non-epoch output (e.g. GNU stat -f's mount point). If every probe fails
-# while the dir EXISTS, staleness detection is broken on this system — crashed
-# holders can then never be stolen — so say so loudly, once. The retry loop is
+# Best-effort single mtime probe (epoch secs) of an arbitrary path; prints
+# empty if unreadable. Probe chain: GNU stat (-c %Y), then BSD/macOS stat
+# (-f %m), then GNU date (-r FILE +%s; BSD date -r takes seconds, so it fails
+# harmlessly there). The numeric guard rejects any probe that "succeeds" with
+# non-epoch output (e.g. GNU stat -f's mount point).
+_lock_stat_mtime() {
+  local m
+  m="$(stat -c %Y "$1" 2>/dev/null)" \
+    || m="$(stat -f %m "$1" 2>/dev/null)" \
+    || m="$(date -r "$1" +%s 2>/dev/null)" \
+    || m=""
+  case "$m" in ''|*[!0-9]*) m="";; esac
+  printf '%s' "$m"
+}
+
+# mtime of the lock dir itself, set atomically by mkdir — the staleness clock.
+# Sets _LOCK_MTIME rather than printing: a command-substitution caller would
+# run this in a SUBSHELL, where the warn-once flag below can never persist, so
+# the broken-stat warning used to repeat on every poll. Empty if the dir
+# vanished mid-check. If every probe fails while the dir EXISTS, staleness
+# detection is broken on this system — crashed holders can then never be
+# stolen — so say so loudly, once per process. The retry loop is
 # anti-false-alarm: under contention the dir routinely vanishes (release/steal)
 # between our probes and is re-created by the next holder, which would
 # misdiagnose a healthy system, so only persistent failure on a present dir
 # counts.
 _LOCK_MTIME_WARNED=0
+_LOCK_MTIME=""
 _lock_dir_mtime() {
   local m="" present=0
   for _ in 1 2 3; do
-    m="$(stat -c %Y "$AGENT_LOCK_DIR" 2>/dev/null)" \
-      || m="$(stat -f %m "$AGENT_LOCK_DIR" 2>/dev/null)" \
-      || m="$(date -r "$AGENT_LOCK_DIR" +%s 2>/dev/null)" \
-      || m=""
-    case "$m" in ''|*[!0-9]*) m="";; esac
+    m="$(_lock_stat_mtime "$AGENT_LOCK_DIR")"
     [ -n "$m" ] && break
     # All probes failed: either the dir vanished mid-probe (normal contention;
     # the caller treats empty as "unsettled" and re-loops) or mtime is truly
@@ -232,14 +250,18 @@ _lock_dir_mtime() {
     echo "git-commit-lock: WARNING — cannot read the lock dir's mtime on this system (tried 'stat -c %Y', 'stat -f %m', 'date -r'). Staleness detection is BROKEN: stale locks will never be stolen, so a crashed holder wedges waiters until AGENT_LOCK_MAX_WAIT." >&2
     _lock_log "WARNING: lock-dir mtime unreadable (all probes failed); staleness detection disabled"
   fi
-  printf '%s' "$m"
+  _LOCK_MTIME="$m"
 }
 
 # token currently recorded in the lock dir (whoever holds it now), or empty.
 # Brief retry while the file reads empty but the dir still exists: on Windows
 # a concurrent directory scan can transiently fail the open (sharing
 # violation), and treating that one misread as "stolen" would be a false
-# alarm with a destructive remedy ("redo your commit").
+# alarm with a destructive remedy ("redo your commit"). NB `cat` cannot
+# distinguish a MISSING token file (ENOENT) from such a transient open
+# failure, and acquire's own token write is swallowed after retries — so an
+# empty result with the dir still present is classified at release as
+# UNVERIFIABLE ownership (rc 2), never as a proven theft.
 _lock_cur_token() {
   local t="" i=0
   while :; do
@@ -250,6 +272,28 @@ _lock_cur_token() {
     sleep 0.02
   done
   printf '%s' "$t"
+}
+
+# Opportunistic, age-gated sweep of litter beside the lock (mirrors the ps1
+# port's Lock-SweepLitter): failed-delete graves (.dead.* from steals, .rel.*
+# from releases — both impls) and orphaned acquire temps (.new.*, the ps1
+# port's pre-acquire staging dirs, e.g. left by a holder killed mid-create).
+# Only entries older than the stale window (with a plausible mtime) are swept,
+# so a LIVE acquirer's .new temp mid-rename is never touched — the age gate is
+# what makes sweeping .new.* safe at all. Pure best-effort: any failure just
+# leaves the entry for a later sweep.
+_lock_sweep_litter() {
+  local d mt now
+  now="$(_lock_now)"
+  for d in "$AGENT_LOCK_DIR".new.* "$AGENT_LOCK_DIR".dead.* "$AGENT_LOCK_DIR".rel.*; do
+    [ -e "$d" ] || continue                  # unmatched glob stays literal
+    mt="$(_lock_stat_mtime "$d")"
+    [ -n "$mt" ] || continue
+    [ "$mt" -gt 946684800 ] || continue      # sub-floor reading: unsettled, skip
+    [ $(( now - mt )) -ge "$AGENT_LOCK_STALE_SECS" ] || continue
+    rm -rf "$d" 2>/dev/null || continue
+    _lock_log "SWEPT stale litter ${d##*/}"
+  done
 }
 
 # Restore the caller's traps exactly as they were before lock_acquire: re-arm
@@ -289,6 +333,13 @@ _lock_on_exit() {
 # signal, so the re-raise lands on the caller's own handler (sourced mode) or
 # the default disposition (executed `run` mode — the wrapper dies with the
 # proper 128+N status, which is what a supervising watchdog needs to see).
+# CAVEAT (INT): a SIGINT delivered to the run WRAPPER alone while its
+# foreground child survives it is DISCARDED by bash before any trap runs
+# (wait-and-cooperate: if the child didn't die of the INT, bash assumes the
+# program handled it and carries on) — so this trap never fires on that
+# delivery. A real Ctrl+C is delivered to the whole process GROUP, kills the
+# child too, and DOES take this path; the TERM tests exercise the same
+# release+re-raise machinery directly.
 _lock_on_signal() {
   local sig="$1"
   lock_release || true
@@ -308,11 +359,7 @@ lock_acquire() {
     return 1
   fi
   mkdir -p "$(dirname "$AGENT_LOCK_DIR")" 2>/dev/null || true
-  # Opportunistically sweep grave litter from earlier failed deletes (a `mv`
-  # whose follow-up `rm -rf` failed leaves a `.dead.*`/`.rel.*` dir behind
-  # forever otherwise). Never touch `.new.*`: that is the ps1 port's LIVE
-  # pre-acquire staging dir.
-  rm -rf "$AGENT_LOCK_DIR".dead.* "$AGENT_LOCK_DIR".rel.* 2>/dev/null || true
+  _lock_sweep_litter
   local start; start="$(_lock_now)"
   _LOCK_TOKEN="tok.$$.${RANDOM}.$(_lock_now)"
 
@@ -356,7 +403,7 @@ lock_acquire() {
     # cross-impl race the interop self-test caught 2026-06-03). A sub-floor read is
     # unsettled, not stale, so we wait instead.
     local mt age
-    mt="$(_lock_dir_mtime)"
+    _lock_dir_mtime; mt="$_LOCK_MTIME"
     if [ -n "$mt" ] && [ "$mt" -gt 946684800 ] 2>/dev/null; then
       age=$(( $(_lock_now) - mt ))
       if [ "$age" -ge "$AGENT_LOCK_STALE_SECS" ]; then
@@ -368,7 +415,7 @@ lock_acquire() {
         # re-enters the loop. This SHRINKS the check-then-act window; it cannot
         # close it with these primitives — see KNOWN RESIDUAL RACES in the
         # header (the residual is detected at the victim's release, not silent).
-        local mt2; mt2="$(_lock_dir_mtime)"
+        local mt2; _lock_dir_mtime; mt2="$_LOCK_MTIME"
         if [ "$mt2" != "$mt" ]; then
           _lock_log "steal aborted: lock dir mtime changed underneath us (was $mt, now ${mt2:-<gone>})"
           continue
@@ -400,7 +447,9 @@ lock_acquire() {
 # Release. Returns 0 if we held the lock cleanly throughout; returns 98 (and
 # logs a loud WARNING) if our lease had been stolen before release — meaning
 # the work we just did was NOT under exclusive protection and should be
-# treated as failed; returns 1 if the lock dir could not be removed at all
+# treated as failed; returns 2 if the token was unreadable OR MISSING with the
+# dir still present (ownership unverifiable either way — see the lane comment
+# below); returns 1 if the lock dir could not be removed at all
 # (it is left behind; the stale-window mtime check is the recovery backstop).
 # Always restores the caller's pre-acquire traps. Idempotent: a second call
 # (or a call without a hold) is a successful no-op.
@@ -420,11 +469,14 @@ lock_release() {
   if [ "$cur" != "$_LOCK_TOKEN" ]; then
     _lock_restore_traps
     if [ -z "$cur" ] && [ -d "$AGENT_LOCK_DIR" ]; then
-      # Token unreadable (after retries) but the dir is still present: this is
-      # transient I/O, not a proven theft — a real steal renames the dir, so a
-      # successful read would return a DIFFERENT token. We cannot verify
-      # ownership either way: leave the dir (the mtime backstop recovers it)
-      # and fail distinctly. Mirrors the ps1's unreadable-token lane.
+      # Token unreadable OR MISSING (after retries) with the dir still
+      # present. `cat` cannot distinguish ENOENT from a transient sharing
+      # violation, and our own acquire-time token write is swallowed after
+      # retries — so neither outcome proves theft (a real steal renames the
+      # dir away; a successful read would then return a DIFFERENT token). We
+      # cannot verify ownership either way: leave the dir (the mtime backstop
+      # recovers it) and fail distinctly. The ps1 port's 'unreadable' lane
+      # gives the same verdict for the same states.
       _lock_log "WARNING: token unreadable at release while lock dir present; ownership unverifiable. Leaving dir. (ours=$_LOCK_TOKEN)"
       echo "git-commit-lock: WARNING — could not re-read the lock token at release (dir still present). Ownership unverifiable; lock dir left in place. Verify with 'git log'." >&2
       return 2
@@ -472,9 +524,10 @@ lock_release() {
 # code — UNLESS the lock was lost mid-hold, in which case return 98
 # (exclusivity failure overrides a "successful" command, because it wasn't
 # serialised). An acquire failure returns 97 (timeout) or 1 (misuse) with the
-# command NEVER run. A release that merely failed to delete the dir (rc 1)
-# does NOT override the command's code: the hold WAS exclusive, the warning
-# has been printed, and the stale window cleans up.
+# command NEVER run. An unverifiable release (rc 2) fails a SUCCESSFUL command
+# with 1 but keeps a failing command's own code. A release that merely failed
+# to delete the dir (rc 1) does NOT override the command's code: the hold WAS
+# exclusive, the warning has been printed, and the stale window cleans up.
 lock_run() {
   lock_acquire || return $?
   local rc=0
@@ -484,11 +537,12 @@ lock_run() {
   if [ "$rel" -eq 98 ]; then
     return 98
   fi
-  if [ "$rel" -eq 2 ]; then
-    # Ownership unverifiable at release (token unreadable, dir present):
-    # not a proven theft, but not a verified-exclusive hold either. Fail
-    # with 1 (parity with the ps1 run path) rather than report success.
-    return 1
+  if [ "$rel" -eq 2 ] && [ "$rc" -eq 0 ]; then
+    # Ownership unverifiable at release (token unreadable/missing, dir still
+    # present): not a proven theft, but not a verified-exclusive hold either —
+    # a "successful" command must not report success. A FAILING command keeps
+    # its own exit code (parity with the ps1 run path).
+    rc=1
   fi
   return "$rc"
 }

@@ -42,10 +42,13 @@
 #       contender waited). The command DID run but was NOT serialised - verify
 #       with `git log` and redo it under the lock.
 #   1   the command itself threw a terminating error; or (with its own distinct
-#       warning) the release-time token read kept failing while the lock dir
-#       still existed - the work may or may not have been exclusive, the lock
-#       dir is left in place for the stale window to reclaim, and success is
-#       NOT reported.
+#       warning) the release-time token read kept failing - or found the token
+#       file MISSING - while the lock dir still existed: the work may or may
+#       not have been exclusive (neither impl can prove its own acquire-time
+#       token write landed, so a missing token is NOT proof of theft), the
+#       lock dir is left in place for the stale window to reclaim, and success
+#       is NOT reported. A failing command keeps its own exit code. Same
+#       verdicts as git-commit-lock.sh for the same on-disk states.
 #   Avoid exit codes 96-98 as meaningful codes of your own command: they are
 #   reserved by this contract and a wrapped command exiting 98 is
 #   indistinguishable from a stolen lock.
@@ -80,12 +83,13 @@
 #     stale window and then stealing its own lock (mirrors git-commit-lock.sh).
 #   * Lock-Release returns $true on a clean release; $false otherwise, with
 #     $script:LockReleaseStatus set to 'stolen' (token mismatch / dir gone:
-#     your work was NOT exclusive - redo), 'unreadable' (token unreadable but
-#     the lock dir still exists: exclusivity unproven, dir left for the stale
-#     window; do not report success), or 'leftover' (token verified - the work
-#     WAS exclusive - but the dir could be neither deleted nor renamed aside;
-#     waiters stay blocked until the stale window reclaims it; `run` keeps the
-#     command's exit code and warns on stderr, mirroring git-commit-lock.sh).
+#     your work was NOT exclusive - redo), 'unreadable' (token unreadable or
+#     MISSING while the lock dir still exists: exclusivity unproven, dir left
+#     for the stale window; do not report success), or 'leftover' (token
+#     verified - the work WAS exclusive - but the dir could be neither deleted
+#     nor renamed aside; waiters stay blocked until the stale window reclaims
+#     it; `run` keeps the command's exit code and warns on stderr, mirroring
+#     git-commit-lock.sh).
 #
 # Hold the lock ONLY for the stage+commit (sub-second). Decide what to stage,
 # build any patch, resolve hook failures OUTSIDE the lock. See README.md
@@ -95,7 +99,8 @@
 #   AGENT_LOCK_DIR, AGENT_LOCK_STALE_SECS (default 300), AGENT_LOCK_POLL_SECS
 #   (default 2), AGENT_LOCK_MAX_WAIT (default 420), AGENT_LOCK_LOG.
 #   Invalid numeric values are reported on stderr and replaced by the default
-#   (never a load-time throw).
+#   (never a load-time throw). STALE_SECS and MAX_WAIT must be positive
+#   integers, POLL_SECS may be fractional - same rules as git-commit-lock.sh.
 
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingEmptyCatchBlock', '',
     Justification = 'Deliberate throughout: lock-path I/O must never abort the holder. Every swallow is conservative (retry, skip, or fall through to a guarded slow path) and the dir-mtime stale window is the recovery backstop. See docs/git-commit-lock.md.')]
@@ -139,14 +144,20 @@ function script:Get-LockGitDir {
 # load (this file is dot-sourced into agent sessions) - note it on stderr and
 # fall back to the default instead.
 function script:Get-LockNum {
-    param([string]$Name, [string]$Raw, [double]$Default)
+    param([string]$Name, [string]$Raw, [double]$Default, [switch]$IntegerOnly)
     Set-StrictMode -Off
     if ([string]::IsNullOrWhiteSpace($Raw)) { return $Default }
     $val = 0.0
     $ok = [double]::TryParse($Raw, [System.Globalization.NumberStyles]::Float,
         [System.Globalization.CultureInfo]::InvariantCulture, [ref]$val)
+    # Integer knobs (STALE_SECS / MAX_WAIT) take plain digit strings only,
+    # exactly like git-commit-lock.sh's validator: a fractional stale window
+    # would otherwise be silently rounded here but rejected there - same
+    # input, different steal threshold across the two impls.
+    if ($IntegerOnly -and $Raw -notmatch '^[0-9]+$') { $ok = $false }
     if (-not $ok -or $val -le 0) {
-        [Console]::Error.WriteLine("git-commit-lock: ignoring invalid $Name='$Raw' (want a positive number); using default $Default")
+        $want = 'positive number'; if ($IntegerOnly) { $want = 'positive integer' }
+        [Console]::Error.WriteLine("git-commit-lock: ignoring invalid $Name='$Raw' (want a $want); using default $Default")
         return $Default
     }
     return $val
@@ -164,9 +175,9 @@ if (-not $script:LockInRepo -and -not $env:AGENT_LOCK_DIR -and $MyInvocation.Inv
 
 if ($env:AGENT_LOCK_DIR) { $script:LockDir = $env:AGENT_LOCK_DIR } else { $script:LockDir = "$script:LockBase/commit.lock" }
 if ($env:AGENT_LOCK_LOG) { $script:LockLog = $env:AGENT_LOCK_LOG } else { $script:LockLog = "$script:LockBase/git-commit-lock.log" }
-$script:LockStale   = [int](script:Get-LockNum -Name 'AGENT_LOCK_STALE_SECS' -Raw $env:AGENT_LOCK_STALE_SECS -Default 300)
+$script:LockStale   = [int](script:Get-LockNum -Name 'AGENT_LOCK_STALE_SECS' -Raw $env:AGENT_LOCK_STALE_SECS -Default 300 -IntegerOnly)
 $script:LockPoll    = [double](script:Get-LockNum -Name 'AGENT_LOCK_POLL_SECS' -Raw $env:AGENT_LOCK_POLL_SECS -Default 2)
-$script:LockMaxWait = [int](script:Get-LockNum -Name 'AGENT_LOCK_MAX_WAIT' -Raw $env:AGENT_LOCK_MAX_WAIT -Default 420)
+$script:LockMaxWait = [int](script:Get-LockNum -Name 'AGENT_LOCK_MAX_WAIT' -Raw $env:AGENT_LOCK_MAX_WAIT -Default 420 -IntegerOnly)
 
 # A waiter gives up at MAX_WAIT, so STALE >= MAX_WAIT means waiters time out
 # before a crashed holder's lock could ever be stolen. Warn only in the
@@ -214,24 +225,50 @@ function script:Lock-Log([string]$msg) {
 }
 
 # mtime (epoch secs) of the lock dir itself - the staleness clock, same value the
-# .sh side reads via `stat -c %Y`. $null if the dir vanished mid-check.
+# .sh side reads via `stat -c %Y`. $null if the dir vanished mid-check. If the
+# read keeps failing while the dir EXISTS, staleness detection is broken on
+# this system - crashed holders can then never be stolen - so say so loudly,
+# once per process (parity with git-commit-lock.sh's warning). The retry loop
+# is anti-false-alarm: under contention the dir routinely vanishes
+# (release/steal) between probes, which must not be misdiagnosed as a broken
+# clock - only persistent failure on a present dir counts.
+$script:LockMtimeWarned = $false
 function script:Lock-DirMtime {
     Set-StrictMode -Off
-    try {
-        $item = Get-Item -LiteralPath $script:LockDir -Force -ErrorAction Stop
-        return ([DateTimeOffset]$item.LastWriteTimeUtc).ToUnixTimeSeconds()
-    } catch { return $null }
+    $m = $null; $present = $false
+    for ($i = 0; $i -lt 3; $i++) {
+        try {
+            $item = Get-Item -LiteralPath $script:LockDir -Force -ErrorAction Stop
+            $m = ([DateTimeOffset]$item.LastWriteTimeUtc).ToUnixTimeSeconds()
+            break
+        } catch {
+            $m = $null
+            if (Test-Path -LiteralPath $script:LockDir) { $present = $true } else { $present = $false; break }
+        }
+    }
+    if ($null -eq $m -and $present -and -not $script:LockMtimeWarned) {
+        $script:LockMtimeWarned = $true
+        [Console]::Error.WriteLine("git-commit-lock: WARNING - cannot read the lock dir's mtime on this system. Staleness detection is BROKEN: stale locks will never be stolen, so a crashed holder wedges waiters until AGENT_LOCK_MAX_WAIT.")
+        script:Lock-Log 'WARNING: lock-dir mtime unreadable (probes failed with the dir present); staleness detection disabled'
+    }
+    return $m
 }
 
 # Read the token currently recorded in the lock dir (whoever holds it now),
 # distinguishing three outcomes so Lock-Release can be honest about what it saw:
-#   Status='ok'         Token = the recorded token ('' if the token file is
-#                       missing while the dir exists - a definitive "not ours")
+#   Status='ok'         Token = the recorded token
 #   Status='gone'       the lock dir itself no longer exists (stolen + freed)
-#   Status='unreadable' the dir exists but the token file would not open after
-#                       escalating retries (a persistent Windows sharing
-#                       violation) - NOT proof of theft, and not proof of
-#                       ownership either.
+#   Status='unreadable' the dir exists but the token could not be read after
+#                       escalating retries - either the file would not open (a
+#                       persistent Windows sharing violation) or it is MISSING
+#                       while the dir is present. Neither is proof of theft (a
+#                       real steal renames the dir away, and our own
+#                       acquire-time token write is swallowed after retries,
+#                       so we cannot prove it ever landed) - and not proof of
+#                       ownership either. Mirrors git-commit-lock.sh, where
+#                       `cat` cannot distinguish ENOENT from a sharing
+#                       violation: BOTH impls route this state to the
+#                       conservative unverifiable lane, never to "stolen".
 # Retries with escalating backoff (20ms..320ms): under heavy contention a read
 # can transiently hit a sharing violation, and crying "stolen" on that would be
 # false. A REAL steal renames the dir away, so a successful read then returns a
@@ -245,10 +282,11 @@ function script:Lock-ReadCurToken {
             return @{ Status = 'ok'; Token = ([System.IO.File]::ReadAllText("$script:LockDir/token")).Trim() }
         } catch [System.IO.DirectoryNotFoundException] {
             return @{ Status = 'gone'; Token = '' }
-        } catch [System.IO.FileNotFoundException] {
-            if (Test-Path -LiteralPath $script:LockDir) { return @{ Status = 'ok'; Token = '' } }
-            return @{ Status = 'gone'; Token = '' }
         } catch {
+            # FileNotFoundException (dir present, token file absent) lands
+            # here too: retry like any other failed read, then fall through to
+            # 'unreadable' - NOT a definitive verdict (see the contract above).
+            if (-not (Test-Path -LiteralPath $script:LockDir)) { return @{ Status = 'gone'; Token = '' } }
             Start-Sleep -Milliseconds $delay
             if ($delay -lt 320) { $delay = $delay * 2 }
         }
@@ -445,12 +483,14 @@ function Lock-Acquire {
 # otherwise, with $script:LockReleaseStatus saying why:
 #   'stolen'      our lease was stolen before release - the work we just did was
 #                 NOT exclusive and should be treated as failed (run -> exit 98);
-#   'unreadable'  the lock dir still exists but its token would not open even
-#                 after escalating retries. That is NOT proof of theft - but we
-#                 cannot prove ownership either, so we do NOT delete the dir
-#                 (the stale window reclaims it; an opportunistic sweep cleans
-#                 any grave litter) and we do NOT report success (run -> exit 1
-#                 unless the command already failed with its own code);
+#   'unreadable'  the lock dir still exists but its token could not be read
+#                 even after escalating retries - the file would not open (a
+#                 persistent sharing violation) or it is MISSING. Neither is
+#                 proof of theft, and not proof of ownership either, so we do
+#                 NOT delete the dir (the stale window reclaims it; an
+#                 opportunistic sweep cleans any grave litter) and we do NOT
+#                 report success (run -> exit 1 unless the command already
+#                 failed with its own code);
 #   'leftover'    the token verified (the work WAS exclusive) but the dir could
 #                 be neither deleted nor renamed aside, so the lock is left in
 #                 place blocking waiters until the stale window. A cleanup
@@ -468,8 +508,8 @@ function Lock-Release {
     $read = script:Lock-ReadCurToken -MaxTries 8
     if ($read.Status -eq 'unreadable') {
         $script:LockReleaseStatus = 'unreadable'
-        script:Lock-Log "WARNING: token UNREADABLE at release (lock dir still present; exclusivity unproven, dir left for the stale window). NOT claiming success. (ours=$script:LockToken)"
-        [Console]::Error.WriteLine("git-commit-lock: WARNING - could not read the lock token at release (persistent sharing violation?). Exclusivity is unproven; the lock dir was left in place and will be reclaimed after the stale window. Verify with 'git log' before relying on this commit.")
+        script:Lock-Log "WARNING: token UNREADABLE or MISSING at release (lock dir still present; exclusivity unproven, dir left for the stale window). NOT claiming success. (ours=$script:LockToken)"
+        [Console]::Error.WriteLine("git-commit-lock: WARNING - could not read the lock token at release (missing token file or persistent sharing violation). Exclusivity is unproven; the lock dir was left in place and will be reclaimed after the stale window. Verify with 'git log' before relying on this commit.")
         return $false
     }
     if ($read.Status -eq 'gone' -or $read.Token -ne $script:LockToken) {
