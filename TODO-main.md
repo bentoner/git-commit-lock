@@ -36,3 +36,16 @@ commits 9b36f42..840a4fd.
     2-3s holds. Do NOT touch the slow-for-good-reason set: unit T1's
     8×25/poll-rate/gap, interop T1/T6 fan-out, stale-window waits, unit T9's
     remaining MAX_WAIT, the integration suite's real-commit costs.
+
+58. **[MINOR]** Heavy fan-out tests run at full strength by default, and
+    agents run the suites routinely during development on a live shared
+    machine — unit T1's ~200 bash spawns (8×25) alone can lag the whole box
+    (observed: a dev-loop run during another agent's session). The tests are
+    good; the default is the misuse vector. Make full concurrency opt-in:
+    default to reduced fan-out (e.g. unit T1 3×8, interop T1/T6 and the
+    integration swarms scaled similarly — still a real exclusion signal,
+    ~1/8 the spawn load) and run full strength only when `GCL_TEST_FULL=1`
+    is set. CI sets the flag (the CI plan's YAML carries it); pre-publish
+    local verification runs set it explicitly. Suites print which mode ran
+    so a reduced pass can't masquerade as the full canary. Reduced, not
+    skipped — skipping would lose the signal entirely from routine runs.

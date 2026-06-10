@@ -288,6 +288,8 @@ jobs:
     defaults:
       run:
         shell: bash                  # on windows-2025 this is Git Bash (MINGW) — what the interop suite requires
+    env:
+      GCL_TEST_FULL: 1               # full fan-out — CI runners are dedicated; the reduced default protects live dev boxes (TODO 58)
     steps:
       - uses: actions/checkout@v5
 
@@ -404,6 +406,17 @@ Design decisions and justifications:
   (verified above); the interop suite degrades to an explicit `SKIP` (exit 0)
   and the integration suite to bash-only if that ever changes — the versions
   step makes such a degradation visible in the log.
+- **`GCL_TEST_FULL: 1` (new, 2026-06-11 — TODO 58).** The heavy fan-out tests
+  (unit T1's 8×25 ≈ 200 bash spawns, the interop and integration swarms) are
+  CI-strength exclusion canaries, but agents run the suites routinely during
+  development on a live shared machine, and full fan-out there lags the whole
+  box. The suites are being changed (TODO 58, lands before or with this
+  workflow) to default to REDUCED fan-out (~1/8 the spawn load, still a real
+  exclusion signal) and run full strength only under `GCL_TEST_FULL=1`. CI is
+  the dedicated environment, so the job sets the flag; each suite prints which
+  mode ran, so a reduced local pass can never masquerade as the full canary.
+  The budgets and measured runtimes in this plan are full-strength numbers and
+  stay valid for CI.
 - **Per-suite preserve dirs** (`failed-work/unit|interop|integration`): the
   unit and integration suites copy their work dir's *contents* flat into the
   target while the interop suite copies the dir *itself* — distinct parents
@@ -479,7 +492,9 @@ The integration suite is the single most valuable CI signal of the three:
 No retry action and no `nick-fields/retry`-style wrappers. The 25-worker
 exclusion test exists precisely to catch a ~1-in-25-runs race (it found two
 real bugs that way); auto-retry would launder a genuine exclusion regression
-into "flaky, re-ran, green". On a CI failure:
+into "flaky, re-ran, green". (CI always runs it at full strength via
+`GCL_TEST_FULL=1`; the reduced default is purely a live-dev-box protection —
+TODO 58.) On a CI failure:
 
 1. Read the uploaded lock logs and classify: **race regression** (violations,
    wrongful STOLE, unbalanced acquire/release) → it's a bug, fix the lock; vs
