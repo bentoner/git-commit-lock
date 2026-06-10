@@ -16,6 +16,9 @@ the lockfile plan, and the actions/runner-images repo (re-fetched today).
    already marker-polled; only interop T8a/T8b remain (consistent with TODO 55).
    No effect on the YAML, budgets, or design — but the plan's own "every fact
    re-verified against the current tree" claim is what these contradict.
+   **ADDRESSED 2026-06-10 (final fix round):** all three spots fixed in the
+   plan body below; counts updated again for the same round's test additions
+   (unit 64 across 18, interop 35 across 12 — see Grounding).
 2. **NOTE — cross-plan sequencing (neither plan mentions the other).** The
    lockfile plan (.plans/2026-06-10-main-lockfile-plan.md) rewrites the on-disk
    protocol this plan's grounding prose describes (dir-mtime stat branch, T3
@@ -27,15 +30,23 @@ the lockfile plan, and the actions/runner-images repo (re-fetched today).
    were Windows-only, so CI is exactly the verification it lacks. Add one
    sequencing sentence here; if the lockfile plan proceeds, the budget-revisit
    trigger ("after TODO 53–56 lands") arrives via that port.
+   **ADDRESSED 2026-06-10 (final fix round):** sequencing sentence added to
+   the Sequencing note below.
 3. **NOTE — small double-claim on TODO 39.** This plan does the integration
    preserve-knob follow-up "before or with the workflow commit"; the lockfile
    plan's impact table lumps item 39 into its "mechanical port" row. Landing it
    here first is right; the lockfile row then goes moot (flagged there too).
+   **ADDRESSED 2026-06-10 (final fix round):** the integration suite now
+   honours `GCL_TEST_PRESERVE_DIR` and keeps its work dir on failure (unit
+   suite semantics); TODO 39 / the lockfile row are moot.
 4. **NOTE — the interop `touch -d` fix and the lockfile Phase 2 port touch the
    same lines.** The two GNU-only `touch -d "@epoch"` calls this plan flags
    (interop lines 160/184 — verified still present at HEAD) are the same
    fabrication sites the lockfile plan re-writes; whichever lands second must
    keep the portable `epoch_to_stamp`/`touch -t` pattern or macOS re-breaks.
+   **ADDRESSED 2026-06-10 (final fix round):** both calls replaced with the
+   unit suite's portable `epoch_to_stamp`/`backdate` helpers; the lockfile
+   port (if it proceeds) must preserve that pattern.
 5. **NOTE — Windows `GCL_TEST_PRESERVE_DIR` is a mixed-separator path**
    (`${{ github.workspace }}` renders `D:\a\…` and the YAML appends
    `/test-output/…`). MINGW coreutils accept Win32 paths in the suites'
@@ -93,14 +104,18 @@ ship both.
 - All three suites are self-contained bash scripts using throwaway temp dirs;
   exit 0 = pass. Current shape (assertion counts confirmed by running each
   suite against HEAD on 2026-06-10):
-  - **Unit** (`git-commit-lock.test.sh`) — 58 assertions across 17 tests.
-    Test 1 alone spawns ~200 short-lived `bash` lock invocations (8 rounds ×
-    25 workers), plus per-test holders/waiters with real sleeps.
-  - **Interop** (`git-commit-lock.interop.test.sh`) — 30 assertions across
-    10 tests: 8 bash + 8 pwsh workers sharing one lock, ordering/steal tests,
-    and the cross-impl exit-code contract. **Skips with exit 0 if `pwsh` is
-    not on PATH** (header check), so it is safe to invoke unconditionally on
-    every OS.
+  - **Unit** (`git-commit-lock.test.sh`) — 64 assertions across 18 tests
+    (59×17 after reconciliation commit 840a4fd; the 2026-06-10 final fix
+    round added the missing-token unverifiable-release test and an
+    age-gated-sweep assertion). Test 1 alone spawns ~200 short-lived `bash`
+    lock invocations (8 rounds × 25 workers), plus per-test holders/waiters
+    with real sleeps.
+  - **Interop** (`git-commit-lock.interop.test.sh`) — 35 assertions across
+    12 tests (30×10 at reconciliation; the final fix round added cross-impl
+    missing-token and fractional-knob parity tests): 8 bash + 8 pwsh workers
+    sharing one lock, ordering/steal tests, and the cross-impl exit-code
+    contract. **Skips with exit 0 if `pwsh` is not on PATH** (header check),
+    so it is safe to invoke unconditionally on every OS.
   - **Integration** (`git-commit-lock.integration.test.sh`) — 12 assertions
     (11 without pwsh); the end-to-end suite: 2 rounds × 12 concurrent bash
     workers plus one mixed round of 5 bash + 5 pwsh workers each make REAL
@@ -118,11 +133,14 @@ ship both.
   regression where a waiter never sees staleness) costs up to **7 minutes**
   before the suite itself fails. (The integration suite caps its own workers at
   `AGENT_LOCK_MAX_WAIT=240`.)
-- Measured 2026-06-10 against HEAD on Ben's Windows box under HEAVY load (a
-  second agent active; `sys` time ≈ 2× wall — treat as worst-case): unit
-  **20m10s** (56/58 — the two misses are one known load-margin item, classified
-  below), interop **3m01s** (28/30 — same item, interop flavour), integration
-  **2m52s** (12/12). Under normal load the same box recorded 67–85 s for the
+- Measured 2026-06-10 on Ben's Windows box under HEAVY load (a second agent
+  active; `sys` time ≈ 2× wall — treat as worst-case): unit **20m10s**,
+  interop **3m01s**, integration **2m52s**. That run PREDATES commit 840a4fd:
+  its unit 56/58 and interop 28/30 misses were the robbed-holder vacuous flake
+  whose unit-side fixed sleep 840a4fd's marker conversion removed — post-fix
+  runs record full unit passes (59/59 at 840a4fd/e67f788; 64/64 after the
+  final fix round), with only interop T8a/T8b still on fixed sleeps (flakiness
+  policy, item 2). Under normal load the same box recorded 67–85 s for the
   integration suite (its commit message) and 6m09s for the pre-expansion unit
   suite — so the 20 min is extreme load + suite growth, not the expected CI
   number. GitHub Linux runners spawn processes far faster; expect a few minutes
@@ -133,15 +151,12 @@ ship both.
   replacements; fixed-sleep→marker-polling conversions; a `WAITING` log line).
   It is planned, not landed: the budgets below are sized for TODAY's suites —
   tighten them after that pass lands, not before.
-- Failure diagnosability — **landed** (was Phase 1 item 4): the unit and
-  interop suites now preserve their work dir on any failure (path printed) and
-  copy all logs/outputs to `$GCL_TEST_PRESERVE_DIR` when it is set (the CI
-  knob). **Gap: the integration suite has neither** — its EXIT trap deletes
-  `$WORK` unconditionally, losing the per-worker stdout/stderr/rc captures and
-  the lock log on a CI failure (the tee'd suite stdout does include
-  `dump_worker` excerpts for failed workers, so a failure isn't blind — just
-  thinner). Small follow-up: give it the same preserve-on-fail +
-  `GCL_TEST_PRESERVE_DIR` handling before or with the workflow commit.
+- Failure diagnosability — **landed, all three suites** (was Phase 1 item 4):
+  every suite now preserves its work dir on any failure (path printed) and
+  copies all logs/outputs to `$GCL_TEST_PRESERVE_DIR` when it is set (the CI
+  knob). The integration suite gained both in the 2026-06-10 final fix round
+  (it previously deleted `$WORK` unconditionally), using the unit suite's
+  semantics (contents copied flat into the target).
 - Windows path assumptions are confined to the interop and integration suites
   and have POSIX fallbacks: `cygpath -w … || echo "$path"` in both, and the
   interop `$WORK` derived from pwsh's `[IO.Path]::GetTempPath()` (returns
@@ -196,25 +211,22 @@ reconciliation. Recorded as what actually shipped vs the original sketches.
    (instead of silently never stealing). **The BSD branch has NOT yet executed
    on real macOS** — the first CI run is that verification (see Sequencing
    note).
-2. **PARTIALLY DONE — portable backdating.** The unit suite's `backdate` is now
-   portable: it converts the target epoch to a `touch -t` stamp via
-   `epoch_to_stamp` (GNU `date -d @…` with BSD `date -r …` fallback). **But the
-   interop suite still has two inline GNU-only `touch -d "@epoch"` calls**
-   (currently lines 160 and 184, aging a lock to force a steal) — on macOS, BSD
-   touch rejects `-d @epoch`, the lock never looks stale, and interop Tests 4–5
-   will fail (bounded by their explicit MAX_WAIT caps, not a hang). This is a
-   known macOS blocker: **replace those two inlines with the unit suite's
-   portable pattern before (or with) the workflow commit** — don't let the
-   first macOS run rediscover what we already know.
+2. **DONE — portable backdating (completed in the 2026-06-10 final fix
+   round).** The unit suite's `backdate` converts the target epoch to a
+   `touch -t` stamp via `epoch_to_stamp` (GNU `date -d @…` with BSD
+   `date -r …` fallback). The interop suite's two inline GNU-only
+   `touch -d "@epoch"` calls (the known macOS blocker — BSD touch rejects
+   `-d @epoch`, so the lock never looked stale and interop Tests 4–5 would
+   fail) now use the same `epoch_to_stamp`/`backdate` helpers.
 3. **Other GNU-ism audit — clean** (unchanged): `mktemp -d` with no template,
    `seq`, `grep -c`, `tr`, `wc`, fractional `sleep` all present/portable; the
    `timeout` command is not used anywhere in the suites; `cygpath` has
    fallbacks everywhere it appears.
-4. **DONE (unit + interop) — preserve the lock logs.** Landed in a slightly
-   different shape than sketched: both suites copy the work dir/outputs to
+4. **DONE (all three suites) — preserve the lock logs.** Landed in a slightly
+   different shape than sketched: the suites copy the work dir/outputs to
    `$GCL_TEST_PRESERVE_DIR` whenever it is set (not only on failure) AND keep
-   the work dir on disk on any failure (path printed). Still missing from the
-   integration suite — see Grounding.
+   the work dir on disk on any failure (path printed). The integration suite
+   gained this in the 2026-06-10 final fix round — see Grounding.
 5. **Interop suite on Linux/macOS: still run-and-see.** Unchanged assessment;
    the first CI run is the test bed (expect possibly 1–2 follow-up commits
    after observing real runs — beyond item 2's known fix). The cosmetic
@@ -222,13 +234,15 @@ reconciliation. Recorded as what actually shipped vs the original sketches.
    not taken — logging-only, still optional (`[Environment]::MachineName` if it
    ever bothers anyone).
 6. **DONE — local Windows runs.** Run repeatedly through the fix wave (counts
-   recorded in commit messages) and re-run against HEAD at reconciliation:
-   unit 56/58, interop 28/30, integration 12/12. The four misses are two
-   instances of the SAME known load-margin item (the robbed-holder tests on a
-   pathologically loaded box), classified from the preserved lock logs as
+   recorded in commit messages). The reconciliation re-run (unit 56/58,
+   interop 28/30, integration 12/12) predates 840a4fd: its four misses were
+   two instances of the SAME known load-margin item (the robbed-holder tests
+   on a pathologically loaded box), classified from the preserved lock logs as
    vacuous misses — the thief acquired only after the victim's clean release,
-   so no steal ever happened and no lock regression is indicated. See the
-   flakiness policy, item 2.
+   so no steal ever happened and no lock regression is indicated. 840a4fd's
+   marker conversion fixed the unit-side instance (T4b); post-fix runs record
+   full unit passes (59/59, then 64/64 after the final fix round), with only
+   interop T8a/T8b still exposed. See the flakiness policy, item 2.
 
 ## Phase 2 — the workflow
 
@@ -307,7 +321,6 @@ jobs:
       - name: Integration suite (real concurrent commits)
         if: ${{ !cancelled() }}
         env:
-          # Honoured once the suite gains the preserve knob (follow-up; Phase 1 item 4).
           GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/integration
         run: |
           mkdir -p test-output
@@ -392,17 +405,15 @@ Design decisions and justifications:
   and the integration suite to bash-only if that ever changes — the versions
   step makes such a degradation visible in the log.
 - **Per-suite preserve dirs** (`failed-work/unit|interop|integration`): the
-  unit suite copies its work dir's *contents* flat into the target while the
-  interop suite copies the dir *itself* — distinct parents keep the artifact
-  layout unambiguous whichever suites fail.
+  unit and integration suites copy their work dir's *contents* flat into the
+  target while the interop suite copies the dir *itself* — distinct parents
+  keep the artifact layout unambiguous whichever suites fail.
 - **Logging/diagnosability**: full suite stdout tee'd to `test-output/*.log`;
   failed runs additionally preserve every per-test lock log via
-  `GCL_TEST_PRESERVE_DIR` (unit + interop today; integration after the
-  follow-up — until then its tee'd stdout with `dump_worker` excerpts is the
-  evidence); the versions step pins down the exact toolchain; artifacts named
-  per-OS, kept 14 days. Together that's enough to reconstruct a remote timing
-  flake: which worker held the lock when, who stole what, and on which
-  bash/pwsh/OS.
+  `GCL_TEST_PRESERVE_DIR` (all three suites); the versions step pins down the
+  exact toolchain; artifacts named per-OS, kept 14 days. Together that's
+  enough to reconstruct a remote timing flake: which worker held the lock
+  when, who stole what, and on which bash/pwsh/OS.
 
 ### Lint job (new — TODO items 48–49)
 
@@ -474,18 +485,20 @@ into "flaky, re-ran, green". On a CI failure:
    wrongful STOLE, unbalanced acquire/release) → it's a bug, fix the lock; vs
    **load-margin miss** (an expected interaction didn't happen because process
    start lost to load) → fix the margin *in the suite* as a correctness change.
-2. Known margin watch-item — updated at reconciliation. The original watch-item
-   (interop Tests 2–3 fixed head-start sleeps racing pwsh cold-start) was fixed
-   the way this plan prescribed: the holder now writes a ready-marker inside
-   its critical section and the waiter launches only after it. The live margin
-   item is now the **robbed-holder tests** (unit T4b, interop T8a/T8b): the
-   victim holds via a fixed `sleep` while a thief is expected to arrive and
-   steal mid-hold; under heavy load the thief can spawn so slowly that the
-   victim releases cleanly first — no steal happens and the "exits 98 + theft
-   WARNING" assertions miss vacuously. Observed exactly this during
-   reconciliation on a pathologically loaded box (unit T4b and interop T8a; the
-   preserved lock logs show the thief ACQUIRING seconds after the victim's
-   clean RELEASE). The proper fix is already queued as TODO items 55–56
+2. Known margin watch-item — updated at reconciliation and again in the final
+   fix round. The original watch-item (interop Tests 2–3 fixed head-start
+   sleeps racing pwsh cold-start) was fixed the way this plan prescribed: the
+   holder now writes a ready-marker inside its critical section and the waiter
+   launches only after it. Unit T4b was likewise converted to marker-polling
+   in 840a4fd after a load flake. The live margin item is now the
+   **interop robbed-holder tests (T8a/T8b) only**: the victim holds via a
+   fixed `sleep` while a thief is expected to arrive and steal mid-hold; under
+   heavy load the thief can spawn so slowly that the victim releases cleanly
+   first — no steal happens and the "exits 98 + theft WARNING" assertions miss
+   vacuously. Observed exactly this during reconciliation on a pathologically
+   loaded box (then-unconverted unit T4b and interop T8a; the preserved lock
+   logs show the thief ACQUIRING seconds after the victim's clean RELEASE).
+   The proper fix is already queued as TODO items 55–56
    (hold-until-WAITING-observed instead of fixed sleeps); if CI hits this
    first, pull that fix forward — not retries, not bigger sleeps.
 3. Manual re-run (`workflow_dispatch` / re-run button) is acceptable only for
@@ -502,8 +515,7 @@ into "flaky, re-ran, green". On a CI failure:
    three suites run in CI on Linux, macOS, and Windows (keep the note that
    Windows remains the richest-exercised environment if Ben wants the nuance).
 3. "Running the tests" section: mention CI runs the suites on all three OSes;
-   document `GCL_TEST_PRESERVE_DIR` in one line (noting which suites honour
-   it, until the integration follow-up lands).
+   document `GCL_TEST_PRESERVE_DIR` in one line (all three suites honour it).
 4. ~~`docs/git-commit-lock.md` staleness-clock sentence~~ — **done/moot**: the
    docs wave rewrote that paragraph and it no longer cites `stat -c %Y`; the
    GNU/BSD probe order lives in the implementation comment, and an unreadable
@@ -538,14 +550,17 @@ into "flaky, re-ran, green". On a CI failure:
 
 ## Sequencing note
 
-Phase 1 has landed (except item 2's interop `touch -d` residual — fix that
-first; it's a known macOS failure, not a discovery the first CI run should
-re-make). The original framing otherwise holds: macOS cannot be tested from
-this machine, so the first real verification of the landed-but-BSD-untested
-`stat -f %m` branch and of the bash-3.2 audit *is* the first CI run after
-publish. Expect possibly a short fix-iterate loop on macOS (that's the plan
-working, not failing). One ordering item remains for the workflow commit: the
-integration suite should gain the `GCL_TEST_PRESERVE_DIR` / preserve-on-fail
-handling before or with it (the ps1 `SuppressMessageAttribute` the lint gate
-needs has since landed, `840a4fd`). Phase 3 lands once the matrix is green,
-since the badge and the reworded portability claim depend on that.
+Phase 1 has fully landed (the interop `touch -d` residual and the integration
+preserve knob both closed in the 2026-06-10 final fix round; the ps1
+`SuppressMessageAttribute` the lint gate needs landed in `840a4fd`). The
+original framing otherwise holds: macOS cannot be tested from this machine, so
+the first real verification of the landed-but-BSD-untested `stat -f %m` branch
+and of the bash-3.2 audit *is* the first CI run after publish. Expect possibly
+a short fix-iterate loop on macOS (that's the plan working, not failing).
+Phase 3 lands once the matrix is green, since the badge and the reworded
+portability claim depend on that.
+
+Cross-plan sequencing: **CI lands first**; the lockfile plan
+(`.plans/2026-06-10-main-lockfile-plan.md`) then ports the on-disk protocol
+under the green matrix — its probes were Windows-only, so the matrix is
+exactly the verification that port lacks.
