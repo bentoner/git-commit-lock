@@ -88,21 +88,29 @@ ps_worker() {  # $1=lock $2=log $3=holder $4=violations $5=id
 
 echo "== Test 1: mixed pwsh+bash workers, mutual exclusion across implementations =="
 NSH=8; NPS=8; TOT=$((NSH+NPS))
-LOCK="$WORK/excl.lock"; LOG="$WORK/excl.log"; : > "$LOG"
+LOCK="$WORK/excl.lock"
 HOLDER="$WORK/holder"; : > "$HOLDER"; VIOL="$WORK/violations"; : > "$VIOL"
+# PER-WORKER lock logs: concurrent appends to ONE shared log are silently
+# swallowed by both impls' guarded log writes (a transient sharing violation
+# drops the line), which could false-fail the released==acquired gate or mask
+# a real imbalance. With a log per worker there are no concurrent appends; the
+# counts are summed over the concatenation.
 pids=()
-for i in $(seq 1 $NSH); do sh_worker "$LOCK" "$LOG" "$HOLDER" "$VIOL" "sh$i" & pids+=($!); done
-for i in $(seq 1 $NPS); do ps_worker "$LOCK" "$LOG" "$HOLDER" "$VIOL" "ps$i" & pids+=($!); done
+for i in $(seq 1 $NSH); do sh_worker "$LOCK" "$WORK/excl-sh$i.log" "$HOLDER" "$VIOL" "sh$i" & pids+=($!); done
+for i in $(seq 1 $NPS); do ps_worker "$LOCK" "$WORK/excl-ps$i.log" "$HOLDER" "$VIOL" "ps$i" & pids+=($!); done
 for p in "${pids[@]}"; do wait "$p"; done
-a="$(grep -c ACQUIRED "$LOG")"; rl="$(grep -c RELEASED "$LOG")"; st="$(grep -c STOLE "$LOG")"
+cat "$WORK"/excl-*.log > "$WORK/excl-all.log" 2>/dev/null || : > "$WORK/excl-all.log"
+a="$(grep -c ACQUIRED "$WORK/excl-all.log")"; rl="$(grep -c RELEASED "$WORK/excl-all.log")"; st="$(grep -c STOLE "$WORK/excl-all.log")"
 nv="$(wc -l < "$VIOL" 2>/dev/null | tr -d ' ')"; nv="${nv:-0}"
 # Real signals gate PASS: zero concurrent-holder violations, zero spurious steals
 # (none should occur at stale=300 in a seconds-long run), balanced acquire/release
 # (released<acquired would mean a false "stolen" or a leaked lock), and no leftover
 # lock. A worker that never launched (acquired<TOT) is Cygwin process-fan-out
-# flakiness, orthogonal to the lock — noted, not failed. (Test 6 below is the
-# deterministic counterpart with strict per-worker exit codes.)
-if [ "$nv" = 0 ] && [ "$st" = 0 ] && [ "$rl" = "$a" ] && [ ! -e "$LOCK" ]; then
+# flakiness, orthogonal to the lock — noted, not failed; but a MINIMUM-ACQUIRED
+# floor (half) stops the test passing vacuously when the fan-out collapses
+# entirely (mutation finding, item 50). Test 6 below is the deterministic
+# counterpart with strict per-worker exit codes.
+if [ "$nv" = 0 ] && [ "$st" = 0 ] && [ "$rl" = "$a" ] && [ "$a" -ge $((TOT/2)) ] && [ ! -e "$LOCK" ]; then
   if [ "$a" = "$TOT" ]; then
     ok "$NSH bash + $NPS pwsh workers: 0 violations, 0 spurious steals, all $TOT acquired+released, no leftover lock"
   else
@@ -110,8 +118,8 @@ if [ "$nv" = 0 ] && [ "$st" = 0 ] && [ "$rl" = "$a" ] && [ ! -e "$LOCK" ]; then
   fi
 else
   [ "$nv" != 0 ] && { echo "  VIOLATIONS:"; sed 's/^/    /' "$VIOL"; }
-  [ "$st" != 0 ] && { echo "  STALE/STEAL log lines:"; grep -E "STALE|STOLE" "$LOG" | sed 's/^/    /'; }
-  bad "cross-impl exclusion/balance: violations=$nv steals=$st acquired=$a released=$rl leftover=$([ -e "$LOCK" ] && echo yes || echo no)"
+  [ "$st" != 0 ] && { echo "  STALE/STEAL log lines:"; grep -E "STALE|STOLE" "$WORK/excl-all.log" | sed 's/^/    /'; }
+  bad "cross-impl exclusion/balance: violations=$nv steals=$st acquired=$a (floor $((TOT/2))) released=$rl leftover=$([ -e "$LOCK" ] && echo yes || echo no)"
 fi
 
 echo "== Test 2: a bash holder blocks a pwsh waiter (no concurrent hold, no wrongful steal) =="
@@ -190,13 +198,14 @@ echo "== Test 6: deterministic lost-update counter, mixed bash+pwsh increments =
 # checks) and the final counter MUST equal the total increments — any lost
 # update or failed worker fails the test.
 NCS=6; NCP=6; CTOT=$((NCS+NCP))
-LOCK="$WORK/cnt.lock"; LOG="$WORK/cnt.log"; : > "$LOG"
+LOCK="$WORK/cnt.lock"
 CNT="$WORK/counter"; printf '%s' 0 > "$CNT"
 # Read-gap-write under the lock; reads/writes retry on transient Windows
 # sharing violations (a previous holder's lingering handle), and a worker whose
 # retry budget is exhausted exits 9 so the failure is loud, not a silent miss.
+# Per-worker lock logs for the same reason as Test 1.
 count_sh() {  # $1=id
-  AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=300 AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=120 \
+  AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$WORK/cnt-$1.log" AGENT_LOCK_STALE_SECS=300 AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=120 \
     bash "$SH" run -- bash -c '
       c="$1"; n=""
       for i in $(seq 1 100); do n="$(cat "$c" 2>/dev/null)"; [ -n "$n" ] && break; sleep 0.015; done
@@ -209,7 +218,7 @@ count_sh() {  # $1=id
 }
 count_ps() {  # $1=id
   local body="\$c='$CNT'; \$n=\$null; for(\$i=0;\$i -lt 100;\$i++){try{\$n=[int]([IO.File]::ReadAllText(\$c).Trim());break}catch{Start-Sleep -Milliseconds 15}} if(\$null -eq \$n){exit 9}; Start-Sleep -Milliseconds 30; for(\$i=0;\$i -lt 100;\$i++){try{[IO.File]::WriteAllText(\$c,[string](\$n+1));exit 0}catch{Start-Sleep -Milliseconds 15}} exit 9"
-  AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=300 AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=120 \
+  AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$WORK/cnt-$1.log" AGENT_LOCK_STALE_SECS=300 AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=120 \
     pwsh -NoProfile -File "$PS1WIN" run "$body" > /dev/null 2>&1
   echo $? > "$WORK/cnt-$1.rc"
 }
@@ -225,8 +234,9 @@ done
 [ "$rc_fail" = 0 ] && ok "all $CTOT counter workers ran and exited 0" || bad "counter worker(s) failed (see above)"
 final="$(cat "$CNT" | tr -d '[:space:]')"
 [ "$final" = "$CTOT" ] && ok "counter = $final == $CTOT increments (no lost updates)" || bad "counter = $final, want $CTOT — lost update(s)"
-a="$(grep -c ACQUIRED "$LOG")"; rl="$(grep -c RELEASED "$LOG")"
-[ "$a" = "$CTOT" ] && [ "$rl" = "$CTOT" ] && ok "lock log balanced ($a acquired / $rl released)" || bad "lock log unbalanced: acquired=$a released=$rl want=$CTOT"
+cat "$WORK"/cnt-*.log > "$WORK/cnt-all.log" 2>/dev/null || : > "$WORK/cnt-all.log"
+a="$(grep -c ACQUIRED "$WORK/cnt-all.log")"; rl="$(grep -c RELEASED "$WORK/cnt-all.log")"
+[ "$a" = "$CTOT" ] && [ "$rl" = "$CTOT" ] && ok "lock logs balanced ($a acquired / $rl released)" || bad "lock logs unbalanced: acquired=$a released=$rl want=$CTOT"
 [ -e "$LOCK" ] && bad "leftover counter lock" || ok "no leftover lock"
 
 echo "== Test 7: pwsh run propagates the command's exit code =="
