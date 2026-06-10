@@ -8,8 +8,8 @@ protects them from corruption, but it does so by making the loser of a race
 *fail* ("Unable to create '.../index.lock'"), not wait — and it doesn't stop
 two agents' staging operations from interleaving, so one agent's commit can
 sweep up paths another agent had just staged. `git-commit-lock` adds the
-queueing Git doesn't provide: each agent wraps its stage+commit step in the lock, and
-concurrent committers take turns.
+queueing Git doesn't provide: each agent wraps its stage+commit step in the
+lock, and concurrent committers take turns.
 
 The tool automates only the lock. What to stage and commit stays in the
 caller's hands — each agent still names exactly the paths or hunks it owns.
@@ -76,8 +76,8 @@ mainly on Windows (Git Bash + PowerShell 7).
 
 Requirements:
 
-- Git, and bash for `git-commit-lock.sh`. On Windows use Git Bash/MSYS2 bash, not
-  WSL bash — an install done from WSL is only visible inside WSL.
+- Git, and bash for `git-commit-lock.sh`. On Windows use Git Bash/MSYS2 bash,
+  not WSL bash — an install done from WSL is only visible inside WSL.
 - PowerShell 7+ (`pwsh`), only for `git-commit-lock.ps1` and the interop tests.
 - `~/.local/bin` on `PATH` if you want the installed command names to resolve
   (the installer warns if it isn't).
@@ -89,12 +89,12 @@ cd git-commit-lock
 bash install.sh
 ```
 
-This symlinks `git-commit-lock.sh` and `git-commit-lock.ps1` into `~/.local/bin/` and
-is idempotent — re-run any time, e.g. after moving the repo. On Windows, real
-symlinks require Developer Mode; if symlinks are unavailable, skip the
-installer and invoke the scripts by path from the clone (e.g.
-`path/to/git-commit-lock/git-commit-lock.sh`). Installing is only a convenience so
-every checkout can use the same command names.
+This symlinks `git-commit-lock.sh` and `git-commit-lock.ps1` into
+`~/.local/bin/` and is idempotent — re-run any time, e.g. after moving the
+repo. On Windows, real symlinks require Developer Mode; if symlinks are
+unavailable, skip the installer and invoke the scripts by path from the clone
+(e.g. `path/to/git-commit-lock/git-commit-lock.sh`). Installing is only a
+convenience so every checkout can use the same command names.
 
 ## Suggested agent instructions
 
@@ -111,8 +111,8 @@ hunks you own. Never use `git add -A`, `git commit -a`, `git commit -am`, or
 `git stash` in a shared checkout.
 
 Use the shell-native lock command for the agent. On Windows, use
-`git-commit-lock.ps1` through `pwsh` rather than a bash wrapper unless you know
-that bash resolves to the same Git and signing environment.
+`git-commit-lock.ps1` through `pwsh` rather than a bash wrapper unless you
+know that bash resolves to the same Git and signing environment.
 
 Bash:
 
