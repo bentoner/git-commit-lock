@@ -62,6 +62,9 @@ Numbering is continuous and stable — do not renumber; delete items as fixed.
    breaking; decide now. Recommendation: reserve high codes (e.g. 96 usage /
    97 timeout / 98 stolen) and document them. (bash#6, docs#8.)
 
+agree on high codes. suggest document in repo documentation, not agent instructions, if that saves context. do agent instructions point to repo documentation? also consider whether other explicit items in agent instructions should point to docs instead.
+
+
 8. **[MAJOR] ps1: `exit` inside the wrapped command bypasses the stolen→2
    override** (demonstrated: stolen lock + `exit 0` → process exit 0, warning
    on stderr only). The header caveat (ps1:28-29) is wrong in both directions
@@ -203,3 +206,5 @@ Numbering is continuous and stable — do not renumber; delete items as fixed.
     the recovery there. Reword. (Codex#6.)
 47. **[NIT]** README's WSL warning covers all suites; the `C:/…` path rationale
     only applies to the interop suite. (docs#9.)
+
+also delete html comment at top of doc
