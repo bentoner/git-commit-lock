@@ -46,18 +46,17 @@ from primitives that are atomic on NTFS:
 - **steal** = `mv <lock> <grave>` — `rename(2)` is atomic, so exactly one
   concurrent stealer wins; the rest get `ENOENT` and re-race the `mkdir`.
 
-**Staleness is judged by the lock directory's own mtime** (stamped atomically by
-`mkdir`). A lock older than
-`AGENT_LOCK_STALE_SECS` (default **300s / 5 min**) is presumed crashed and may be
-stolen, so one dead agent can't wedge the others. We key on the *dir* mtime, not
-an `epoch` file inside it, on purpose: an acquirer that dies between `mkdir` and
-writing its metadata — or a release whose `rm -rf` only partly completes (a real
-intermittent on Windows when another process holds a handle in the dir) — leaves
-an orphan with no readable epoch. Keying on a file would make that orphan
-un-stealable and hang every waiter to the timeout (exactly the bug an early
-self-test run caught, with workers wedged to the wait cap; the suite now has a
-regression test for it). The
-`epoch`/`owner` files written inside the dir are for logging only.
+**Staleness is judged by the lock directory's own mtime** (stamped atomically
+by `mkdir`). A lock older than `AGENT_LOCK_STALE_SECS` (default **300s /
+5 min**) is presumed crashed and may be stolen, so one dead agent can't wedge
+the others. We key on the *dir* mtime, not an `epoch` file inside it, on
+purpose: an acquirer that dies between `mkdir` and writing its metadata — or a
+release whose `rm -rf` only partly completes (a real intermittent on Windows
+when another process holds a handle in the dir) — leaves an orphan with no
+readable epoch. Keying on a file would make that orphan un-stealable and hang
+every waiter to the timeout (exactly the bug an early self-test run caught,
+with workers wedged to the wait cap; the suite now has a regression test for
+it). The `epoch`/`owner` files written inside the dir are for logging only.
 
 **Release** deletes the dir; if `rm -rf` fails it renames the dir aside and
 deletes that. Recovery triggers **only** on a non-zero `rm` — while the dir
