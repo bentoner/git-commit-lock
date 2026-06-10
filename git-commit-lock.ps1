@@ -75,11 +75,17 @@
 #     hosts that raise that event (pwsh/powershell -Command and interactive
 #     sessions; verified NOT to fire under -File on either engine,
 #     2026-06-10), so do not rely on it.
+#   * Lock-Acquire is NOT reentrant: a second Lock-Acquire while holding is
+#     refused ($false, message on stderr) rather than self-deadlocking for the
+#     stale window and then stealing its own lock (mirrors git-commit-lock.sh).
 #   * Lock-Release returns $true on a clean release; $false otherwise, with
 #     $script:LockReleaseStatus set to 'stolen' (token mismatch / dir gone:
-#     your work was NOT exclusive - redo) or 'unreadable' (token unreadable
-#     but the lock dir still exists: exclusivity unproven, dir left for the
-#     stale window; do not report success).
+#     your work was NOT exclusive - redo), 'unreadable' (token unreadable but
+#     the lock dir still exists: exclusivity unproven, dir left for the stale
+#     window; do not report success), or 'leftover' (token verified - the work
+#     WAS exclusive - but the dir could be neither deleted nor renamed aside;
+#     waiters stay blocked until the stale window reclaims it; `run` keeps the
+#     command's exit code and warns on stderr, mirroring git-commit-lock.sh).
 #
 # Hold the lock ONLY for the stage+commit (sub-second). Decide what to stage,
 # build any patch, resolve hook failures OUTSIDE the lock. See README.md
@@ -177,8 +183,10 @@ $script:LockHeld = $false
 $script:LockToken = ''
 $script:LockMe = "pid=$PID host=$env:COMPUTERNAME"
 $script:LockRunRc = 0
-# Set by Lock-Release when it returns $false: 'stolen' or 'unreadable'.
+# Set by Lock-Release when it returns $false: 'stolen', 'unreadable' or 'leftover'.
 $script:LockReleaseStatus = 'ok'
+# Set by Lock-Acquire when it returns $false: 'timeout' or 'reentrant'.
+$script:LockAcquireFail = ''
 # PSEventJob for the best-effort PowerShell.Exiting release backstop.
 $script:LockExitJob = $null
 
@@ -337,6 +345,16 @@ function script:Lock-UnregisterExitBackstop {
 function Lock-Acquire {
     Set-StrictMode -Off
     $ErrorActionPreference = 'Stop'
+    # API misuse, not a timeout: the lock is NOT reentrant. Without this guard
+    # a re-acquire would self-deadlock for the stale window and then steal its
+    # own lock (mirrors git-commit-lock.sh).
+    if ($script:LockHeld) {
+        [Console]::Error.WriteLine('git-commit-lock: Lock-Acquire called while already holding the lock (not reentrant)')
+        script:Lock-Log 'ERROR: reentrant Lock-Acquire refused'
+        $script:LockAcquireFail = 'reentrant'
+        return $false
+    }
+    $script:LockAcquireFail = ''
     $start = script:Lock-Now
     $script:LockToken = "tok.ps.$PID.$(Get-Random).$(script:Lock-Now)"
     script:Lock-SweepLitter
@@ -403,6 +421,7 @@ function Lock-Acquire {
         if (((script:Lock-Now) - $start) -ge $script:LockMaxWait) {
             script:Lock-Log "TIMEOUT after $($script:LockMaxWait)s waiting for lock"
             [Console]::Error.WriteLine("git-commit-lock: timed out after $($script:LockMaxWait)s waiting for commit lock")
+            $script:LockAcquireFail = 'timeout'
             return $false
         }
         # -Milliseconds, not -Seconds: Windows PowerShell 5.1's -Seconds is an
@@ -421,7 +440,12 @@ function Lock-Acquire {
 #                 cannot prove ownership either, so we do NOT delete the dir
 #                 (the stale window reclaims it; an opportunistic sweep cleans
 #                 any grave litter) and we do NOT report success (run -> exit 1
-#                 unless the command already failed with its own code).
+#                 unless the command already failed with its own code);
+#   'leftover'    the token verified (the work WAS exclusive) but the dir could
+#                 be neither deleted nor renamed aside, so the lock is left in
+#                 place blocking waiters until the stale window. A cleanup
+#                 failure, not a serialisation failure: `run` keeps the
+#                 command's exit code and warns on stderr.
 function Lock-Release {
     Set-StrictMode -Off
     $ErrorActionPreference = 'Stop'
@@ -473,12 +497,29 @@ function Lock-Release {
     try { [System.IO.Directory]::Delete($script:LockDir, $true); $deleted = $true } catch { $deleted = $false }
     if (-not $deleted) {
         $grave = "$($script:LockDir).rel.$PID.$(script:Lock-Now)"
+        $renamed = $false
         try {
             [System.IO.Directory]::Move($script:LockDir, $grave)
+            $renamed = $true
+            # Renamed aside: the lock IS released (waiters can re-create the
+            # dir). The grave is best-effort litter; the sweep at the next
+            # acquire collects stragglers.
             try { [System.IO.Directory]::Delete($grave, $true) } catch { }
-        } catch {
-            # If even the rename failed, the dir-mtime stale check is the final backstop.
+        } catch { $renamed = $false }
+        if (-not $renamed -and (Test-Path -LiteralPath $script:LockDir)) {
+            # Both the delete and the rename failed and the dir is still in
+            # place: the lock is NOT released. The work itself WAS exclusive
+            # (token verified above), so this is a cleanup failure, not a
+            # serialisation failure - but do NOT log RELEASED or claim a clean
+            # release: waiters stay blocked until the stale-window mtime
+            # backstop reclaims the dir. (Mirrors git-commit-lock.sh.)
+            $script:LockReleaseStatus = 'leftover'
+            script:Lock-Log "WARNING: release FAILED - delete and rename-aside both failed; lock dir left in place (tok=$script:LockToken). Waiters are blocked until the $($script:LockStale)s stale window reclaims it."
+            [Console]::Error.WriteLine("git-commit-lock: WARNING - could not remove the lock dir ($script:LockDir); it is left behind and will block waiters until the $($script:LockStale)s stale window expires")
+            return $false
         }
+        # else: renamed aside, or the dir vanished between the failed delete
+        # and the rename - already gone, equally released.
     }
     script:Lock-Log "RELEASED ($script:LockMe tok=$script:LockToken)"
     return $true
@@ -530,7 +571,12 @@ function Invoke-WithLock {
     }
 
     try {
-        if (-not (Lock-Acquire)) { $script:LockRunRc = 97; return }
+        if (-not (Lock-Acquire)) {
+            # timeout -> 97 (the reserved code); reentrant misuse (dot-source
+            # callers only) -> 1, matching git-commit-lock.sh's lock_acquire.
+            if ($script:LockAcquireFail -eq 'reentrant') { $script:LockRunRc = 1 } else { $script:LockRunRc = 97 }
+            return
+        }
         try {
             try {
                 $global:LASTEXITCODE = 0
@@ -549,6 +595,10 @@ function Invoke-WithLock {
             if (-not (Lock-Release)) {
                 if ($script:LockReleaseStatus -eq 'unreadable') {
                     if ($script:LockRunRc -eq 0) { $script:LockRunRc = 1 }
+                } elseif ($script:LockReleaseStatus -eq 'leftover') {
+                    # Cleanup-only failure: the work WAS exclusive (token
+                    # verified), warnings already on stderr - keep the
+                    # command's exit code (matches git-commit-lock.sh).
                 } else {
                     $script:LockRunRc = 98
                 }
