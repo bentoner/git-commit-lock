@@ -1,3 +1,45 @@
+## Review findings 2026-06-11 (Codex lockfile follow-up)
+
+Reviewed against HEAD `cc86065`, with special attention to Codex's earlier
+objection that file locks can be worse on POSIX because unlinking an open file
+removes the path under the holder.
+
+1. **[MAJOR — fix before implementation] The acquire read-back rewrite can
+   corrupt a successor after a stale-window pause.** The proposed Acquire step
+   says that after winning O_EXCL/CreateNew, the holder should read line 1 and,
+   if it does not match, "rewrite (plain overwrite, we own the file)" (below,
+   Acquire bullet 3). That ownership claim is true only until the stale window.
+   If the acquirer is suspended after create/open but before verification for
+   longer than `AGENT_LOCK_STALE_SECS`, a waiter may legitimately rename the
+   stale file aside and create a successor lock at the same path. When the
+   original process resumes, a plain overwrite can replace the successor's
+   token, then let the original process enter the critical section with a
+   corrupted lock. Disposition: do not ever fix a failed read-back by blindly
+   overwriting the path. Write the token through the creation handle where the
+   runtime supports it; after the retry ladder, a missing/empty/foreign token at
+   acquire verification must be treated as an acquisition failure/unverifiable
+   lock-layer error and the wrapped command must not run. Cleanup, if any,
+   should only remove the same object via a guarded same-handle operation or
+   leave the file for stale recovery.
+2. **[MINOR] The leftover/recovery wording overstates what the stale window can
+   recover while a Windows no-delete-share handle is still open.** The plan
+   correctly specifies blocked-release and blocked-steal tests, but the Release
+   section and state table still say the stale window "reclaims" a leftover
+   file. Probe D1 says the handle that blocks unlink also blocks rename, so a
+   waiter can reclaim only after the stale window **and** after the blocking
+   handle closes; otherwise it should keep polling until `AGENT_LOCK_MAX_WAIT`.
+   Reword those lanes so the recovery condition is precise.
+3. **[NOTE] Codex's earlier POSIX unlink/open-file objection is not a blocker
+   for this plan.** The objection applies to fd-based locks (`flock`-style
+   ownership), where the holder owns an open descriptor and the pathname can be
+   removed underneath it. This plan's protocol is path+token ownership: both
+   implementations close the creation handle before the critical section, and a
+   displaced holder detects gone/foreign token at release and exits 98. POSIX
+   unlink/rename of the path is therefore the same displacement case the dir
+   protocol already handles, not a file-protocol differentiator.
+
+---
+
 ## Review findings 2026-06-10 (post-wave consistency pass)
 
 Fresh-context consistency check against HEAD (e67f788) — specifically the two
