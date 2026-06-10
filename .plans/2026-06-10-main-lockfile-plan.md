@@ -1,3 +1,20 @@
+## Review round 2 of the convergence loop, 2026-06-11 (fresh Claude + Codex)
+
+> **Status: all findings folded same day.** Both verdicts: concur with GO, no
+> blocking findings. Claude (6, all seam fixes): steal type guard now runs on
+> every blocked poll so an mtime-refreshing non-lock path (e.g. `$HOME`)
+> still gets its config warning instead of a silent 97; the release boundary
+> re-read is pinned to step-2 classification in both impls (empty-at-boundary
+> ⇒ unverifiable, never delete — today's ps1 would have deleted); Logging
+> gains the acquire-verification-failure and unreadable-steal-skip lines;
+> HELD-crash row corrected (token-bearing ⇒ stale, not EMPTY ORPHAN); Phase 2
+> test (a)'s rc-1 disambiguated (sourced return, not `run` exit); "58
+> landed" reworded (item added, knob ports with the suites). Codex (2 MINOR
+> + 1 NIT): the prefix-guard's converse residual is now documented (a stale
+> user file whose line 1 starts `tok.` is still stolen — accepted); ps1
+> acquire explicitly keeps parent-directory creation; same "58 landed"
+> rewording.
+
 ## Review round 1 of the convergence loop, 2026-06-11 (fresh Claude + Codex)
 
 > **Status: all findings folded same day (commit follows 39f71c2).** Claude:
@@ -347,7 +364,10 @@ they must tolerate a missing line 2 and an entirely empty file.
   itself, not printf (probe A finding). Non-zero rc ⇒ not acquired ⇒ loop (the
   rare created-but-write-failed case, e.g. ENOSPC, leaves an empty orphan that
   ages into the normal steal lane).
-- ps1: `[IO.File]::Open($path, CreateNew, Write, FileShare ReadWrite|Delete)`,
+- ps1: ensure the parent directory exists first (today's `Lock-TryCreateDir`
+  creates it before the atomic move; the port must keep that — bash keeps its
+  `mkdir -p` below), then `[IO.File]::Open($path, CreateNew, Write,
+  FileShare ReadWrite|Delete)`,
   then **write both lines, flush, and close through that creation handle** —
   the write is bound to the file object we created and cannot land on a
   successor's file, whatever happens to the path meanwhile. **Any exception on
@@ -397,7 +417,13 @@ FILETIME zero (−11644473600) to a `Get-Item` observer at ~0.04–0.5% of reads
 so claim (c) of the hypothesis is refuted: sub-floor still means "unsettled,
 wait", in both impls.
 
-**Steal** — rename-aside, as today, with one new guard:
+**Steal** — rename-aside, as today, with one new guard. Ordering note: the
+cheap **type guard (step 2) is evaluated on every blocked poll**, not only
+once the lock looks stale — an actively-written non-lock path (the canonical
+`AGENT_LOCK_DIR=$HOME` typo: writes inside keep refreshing the dir's mtime)
+never ages past the window, so an age-gated guard would never fire and
+waiters would hit 97 with no diagnosis. The content guard (step 3) stays
+age-gated (don't read content on every poll).
 
 1. mtime above floor and age ≥ stale window;
 2. **the lock path must be a regular file and not a symlink**
@@ -426,7 +452,12 @@ wait", in both impls.
    so it lands in the never-steal lane permanently: an accepted residual,
    loud (the config warning names the path) and fixed by one manual `rm`.
    The dir protocol would have recovered it by staleness; we trade that
-   vanishing-rare case for not deleting real user files;
+   vanishing-rare case for not deleting real user files. The guard's
+   converse residual is also accepted and documented: a stale *user* file
+   whose first line happens to start `tok.` IS still stolen — the prefix is
+   the whole wire test, deliberately (a fuller shape check would just bind
+   the format harder for near-zero added protection against an already
+   contrived collision);
 4. re-read mtime immediately before acting; any change ⇒ abort attempt (as
    today);
 5. read line 2 (best-effort) for the log; `mv "$LOCK" "$LOCK.dead.$$.<ts>"` /
@@ -449,7 +480,12 @@ wait", in both impls.
    write, since acquire's read-back positively verified our token at the
    path, which is also what grounds treating "gone" as theft) ⇒ the unverifiable lane
    (bash rc 2 / ps1 'unreadable'): don't delete, don't claim success;
-3. match ⇒ re-read once (boundary-shrink, unchanged), then delete:
+3. match ⇒ re-read once (boundary-shrink), **classified by the same step-2
+   rules in BOTH impls** — empty-at-boundary ⇒ the unverifiable lane, do NOT
+   delete (in the file era an empty boundary read is precisely the probe-F
+   window of a successor mid-create after a boundary steal; today's ps1 lets
+   an unreadable boundary read proceed to the delete, which must not port);
+   gone-at-boundary ⇒ 98; our token ⇒ delete:
    `rm -f -- "$LOCK" 2>/dev/null`; rc 0 ⇒ released (`-f` masks only ENOENT,
    which is the "vanished mid-race = already released" branch). On failure the
    file still exists and is therefore still ours ⇒ retry ~5×20ms ⇒ persistent
@@ -480,7 +516,7 @@ release cries 98 — see "races" below).
 | State | How reached | Exit |
 |---|---|---|
 | ABSENT | initial; clean release; steal-rename | one O_EXCL create wins ⇒ read-back verify ⇒ HELD (failed verify ⇒ not acquired, re-enter wait) |
-| HELD (token+owner content, mtime=now) | create won, content written, path read-back verified | release ⇒ ABSENT; crash ⇒ ORPHAN; overlong hold ⇒ stealable |
+| HELD (token+owner content, mtime=now) | create won, content written, path read-back verified | release ⇒ ABSENT; crash ⇒ token-bearing file, stale after the window; overlong hold ⇒ stealable |
 | EMPTY ORPHAN (file exists, no/partial content, valid mtime) | crash between create and write; dropped write | normal staleness steal (mtime ages past window) — the regression test for old T3 |
 | UNSETTLED (mtime < floor) | observer-side FILETIME-zero transient on a brand-new lock | waiters treat as live and wait; settles in ms |
 | STALE (age ≥ window) | crash, or contract-breach slow hold | exactly one stealer renames it aside; victim (if alive) gets 98 at release |
@@ -586,8 +622,10 @@ missing-token) fabricates by deleting the token file — re-split it into
 gone⇒theft agreement assertion). New interop tests (pwsh required,
 so they live here): (a) **blocked release** — a pwsh process holds the lock
 file with `FileShare.Read` while the bash holder releases ⇒ deterministic
-leftover path, rc 1, then recovery once the handle closes after the stale
-window (makes TODO #30 testable); (b)
+leftover path — rc 1 meaning the *sourced* `lock_release` return value /
+`LockReleaseStatus='leftover'`; the `run` wrapper keeps the wrapped command's
+own exit code on a leftover, per the unchanged contract — then recovery once
+the handle closes after the stale window (makes TODO #30 testable); (b)
 blocked *steal* — same holder pattern against a stale lock ⇒ stealer re-polls,
 acquires after the handle closes; (c) **ps1-side guard parity** — the dir /
 symlink (reparse-point) / non-lock-shaped-content guards exercised from the
@@ -619,7 +657,8 @@ changelog.
 
 Numbering refers to the original consolidated review list. After the
 2026-06-10 fix wave, only **11, 48, 53–56, 58** remain live in TODO-main.md
-(see its header; the rest were fixed and deleted; 58 landed 2026-06-11). The
+(see its header; the rest were fixed and deleted; the 58 TODO *item* was
+added 2026-06-11 — the knob itself is implemented during the suite ports). The
 full table is kept because it names dir-era behaviours and tests the port must
 preserve or may delete — but Phase 4's TODO edits touch only the live items.
 
@@ -684,7 +723,12 @@ The log design carries over unchanged: same `ACQUIRED`/`RELEASED`/`STALE
 tokens in the lines. Changes: message text says "lock file" not "lock dir";
 the `SWEPT stale litter` line survives only for `.dead.*` file graves; one new
 loud line for the non-lock-at-lock-path config warning (logged once per
-process, like the mtime-probe warning). The blocked-release retry logs its
-final leftover WARNING exactly as today. If TODO #56 lands with this change
-(recommended above), the contended path also gains its one-line `WAITING`
-entry on the first blocked poll.
+process, like the mtime-probe warning). Two further new lines: the
+**acquire-verification failure** ("create won but read-back found
+foreign/empty/gone — not acquired, re-entering wait") and the steal's
+**unreadable-content skip** (persistent read failure on a stale lock ⇒
+skipped attempt — logged like the existing steal-abort line, so a
+reconstruction can see why a stale lock wasn't taken). The blocked-release
+retry logs its final leftover WARNING exactly as today. If TODO #56 lands
+with this change (recommended above), the contended path also gains its
+one-line `WAITING` entry on the first blocked poll.
