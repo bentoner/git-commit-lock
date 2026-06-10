@@ -1,3 +1,19 @@
+## Review round 3 of the convergence loop, 2026-06-11 (fresh Claude + Codex)
+
+> **Status: all findings folded same day.** Claude: concur with GO; one MAJOR
+> survived five passes — the ps1 steal guard passes a Unix FIFO (neither
+> container nor reparse point) and the content read would block in open(2):
+> fixed by pinning ps1's "empty" test to stat (`Length -eq 0`, no open; read
+> only when size > 0), residual (FIFO renamed as empty orphan) documented,
+> .NET-on-Unix blocking claim flagged for one-line verification on CI's
+> ubuntu leg. Plus five pins, all taken: owner-read moved BEFORE the final
+> mtime re-read (matching today; the literal order widened the re-read's
+> window), acquire's ENOSPC lane cross-references the torn-write lane, EMPTY
+> ORPHAN vs NON-LOCK rows disjoint (`tok.`-prefixed partials steal; shorter
+> torn writes don't), per-poll guard warns on exists-but-wrong-type only,
+> release-retry rationale re-grounded on D1. Codex: clean except one MINOR,
+> taken — Phase 2 now names the `PowerShell.Exiting` backstop port.
+
 ## Review round 2 of the convergence loop, 2026-06-11 (fresh Claude + Codex)
 
 > **Status: all findings folded same day.** Both verdicts: concur with GO, no
@@ -362,8 +378,9 @@ they must tolerate a missing line 2 and an entirely empty file.
   one redirect = open(O_CREAT|O_EXCL)+write+close. Note the `2>/dev/null` goes
   on the *subshell*, because the noclobber failure message is emitted by bash
   itself, not printf (probe A finding). Non-zero rc ⇒ not acquired ⇒ loop (the
-  rare created-but-write-failed case, e.g. ENOSPC, leaves an empty orphan that
-  ages into the normal steal lane).
+  rare created-but-write-failed case, e.g. ENOSPC, leaves an empty — or,
+  rarely, torn; see steal guard 3(b) — orphan that ages into its
+  corresponding lane).
 - ps1: ensure the parent directory exists first (today's `Lock-TryCreateDir`
   creates it before the atomic move; the port must keep that — bash keeps its
   `mkdir -p` below), then `[IO.File]::Open($path, CreateNew, Write,
@@ -422,8 +439,11 @@ cheap **type guard (step 2) is evaluated on every blocked poll**, not only
 once the lock looks stale — an actively-written non-lock path (the canonical
 `AGENT_LOCK_DIR=$HOME` typo: writes inside keep refreshing the dir's mtime)
 never ages past the window, so an age-gated guard would never fire and
-waiters would hit 97 with no diagnosis. The content guard (step 3) stays
-age-gated (don't read content on every poll).
+waiters would hit 97 with no diagnosis. The per-poll guard warns only on
+**exists-but-wrong-type** — a path that vanished between the failed create
+and the check is normal contention (re-race the create), not a config
+warning, or the once-per-process warning would burn on a healthy system. The
+content guard (step 3) stays age-gated (don't read content on every poll).
 
 1. mtime above floor and age ≥ stale window;
 2. **the lock path must be a regular file and not a symlink**
@@ -440,7 +460,17 @@ age-gated (don't read content on every poll).
    implementations; pre-release this is free). Real user files are neither,
    so a typo'd `AGENT_LOCK_DIR` pointing at an existing regular file becomes
    non-stealable instead of renamed-and-deleted — closing most of what
-   remained of TODO #11. Two lanes pinned identically in both impls:
+   remained of TODO #11. **ps1 determines "empty" by stat (`Length -eq 0`)
+   WITHOUT opening the file, and opens for read only when size > 0** — on
+   Unix a FIFO at the lock path is neither a container nor a reparse point,
+   so it reaches this step, and a read-open on a writer-less FIFO blocks in
+   `open(2)` before any timeout logic runs (the same hazard class the bash
+   pre-create guard kills; bash's *steal* is already safe via `[ -f ]`).
+   Residual: a typo'd-path FIFO stats as size 0 and gets renamed aside as an
+   empty orphan — a harmless rename, same accepted class as the
+   empty-user-file residual. (The .NET-on-Unix blocking claim is
+   reasoned-not-probed — no pwsh-on-Unix on this box; one line on CI's
+   ubuntu leg settles it.) Two lanes pinned identically in both impls:
    (a) a **persistent read failure with the file still present** is neither
    "empty" nor the never-steal lane — skip this steal attempt and re-poll
    (bash tells genuinely-empty from read-failed via `[ -s ]` plus the read's
@@ -458,9 +488,12 @@ age-gated (don't read content on every poll).
    the whole wire test, deliberately (a fuller shape check would just bind
    the format harder for near-zero added protection against an already
    contrived collision);
-4. re-read mtime immediately before acting; any change ⇒ abort attempt (as
-   today);
-5. read line 2 (best-effort) for the log; `mv "$LOCK" "$LOCK.dead.$$.<ts>"` /
+4. read line 2 (best-effort) for the `STALE (holder=…)` log line — BEFORE the
+   final mtime re-read, as today (both impls): an open+read inserted between
+   the re-read and the rename would widen exactly the window the re-read
+   exists to shrink;
+5. re-read mtime immediately before acting; any change ⇒ abort attempt (as
+   today); then `mv "$LOCK" "$LOCK.dead.$$.<ts>"` /
    `[IO.File]::Move(...)` — atomic on NTFS for files, exactly one concurrent
    stealer wins (probe E4: 60/60), losers get ENOENT/`FileNotFoundException`
    and re-race the create; winner `rm -f`s the grave and logs `STOLE`.
@@ -487,8 +520,12 @@ age-gated (don't read content on every poll).
    an unreadable boundary read proceed to the delete, which must not port);
    gone-at-boundary ⇒ 98; our token ⇒ delete:
    `rm -f -- "$LOCK" 2>/dev/null`; rc 0 ⇒ released (`-f` masks only ENOENT,
-   which is the "vanished mid-race = already released" branch). On failure the
-   file still exists and is therefore still ours ⇒ retry ~5×20ms ⇒ persistent
+   which is the "vanished mid-race = already released" branch). On failure ⇒
+   retry ~5×20ms — grounded on D1, not on the failure itself: the handle
+   class that blocks our unlink also blocks any steal's rename, so the path
+   cannot be stolen-and-recreated while the delete keeps failing (the
+   read-only-attribute exception is documented below; its residual is the
+   same detected-98 class) ⇒ persistent
    failure ⇒ **leftover**: warn, return 1. Recovery needs BOTH conditions: the
    stale window elapsing AND the blocking handle closing — the no-delete-share
    handle that blocks our unlink blocks a stealer's rename identically (D1),
@@ -517,7 +554,7 @@ release cries 98 — see "races" below).
 |---|---|---|
 | ABSENT | initial; clean release; steal-rename | one O_EXCL create wins ⇒ read-back verify ⇒ HELD (failed verify ⇒ not acquired, re-enter wait) |
 | HELD (token+owner content, mtime=now) | create won, content written, path read-back verified | release ⇒ ABSENT; crash ⇒ token-bearing file, stale after the window; overlong hold ⇒ stealable |
-| EMPTY ORPHAN (file exists, no/partial content, valid mtime) | crash between create and write; dropped write | normal staleness steal (mtime ages past window) — the regression test for old T3 |
+| EMPTY ORPHAN (file exists, empty or `tok.`-prefixed partial content, valid mtime) | crash between create and write; dropped/truncated write | normal staleness steal (mtime ages past window) — the regression test for old T3. (A torn write SHORTER than `tok.` lands in NON-LOCK below, not here) |
 | UNSETTLED (mtime < floor) | observer-side FILETIME-zero transient on a brand-new lock | waiters treat as live and wait; settles in ms |
 | STALE (age ≥ window) | crash, or contract-breach slow hold | exactly one stealer renames it aside; victim (if alive) gets 98 at release |
 | LEFTOVER (release unlink blocked persistently) | foreign no-delete-share handle (AV, naive reader) | release returns 1 loudly; stealable only once stale AND the blocking handle closes (same handle blocks the steal rename, D1) — waiters re-poll, 97 if it never closes |
@@ -611,7 +648,10 @@ Replace `Lock-TryCreateDir` with the CreateNew open+write (delete-share);
 delete the mtime stamp and the `.new.*` sweep arm; `Lock-ReadCurToken` reads
 the lock file itself (`FileNotFoundException` ⇒ gone; delete-share
 `FileStream` reads); steal via `File.Move` with the non-file guard; release via
-`File.Delete` + retry + leftover. Port interop T4/T5 fabrication (file + first
+`File.Delete` + retry + leftover; port the **`PowerShell.Exiting` best-effort
+release backstop** too (today it reads `$lock/token` and calls
+`Directory.Delete` directly — it becomes: read line 1 of the lock file,
+compare the token, `File.Delete`). Port interop T4/T5 fabrication (file + first
 line) — the suite already uses the portable `epoch_to_stamp`/`backdate`
 helpers (landed 340a584); the port must preserve that pattern and not
 reintroduce GNU-only `touch -d` (CI's macOS leg will be live by then). Keep
