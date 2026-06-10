@@ -226,4 +226,29 @@ also delete html comment at top of doc
     Add both linters as a CI job (gate at warning severity, documented
     exclusions) — fold into the CI plan reconciliation.
 
-## Mutation-testing results (pending; will append as items 50+)
+## Mutation-testing results (run 2026-06-10; evidence in .agent-testing/mutation/)
+
+Mutation runs CONFIRMED zero/weak coverage already tracked as items 25 (bash
+mtime floor — survived in bash, only ~50%-probabilistic via ps1), 27
+(EXIT/INT/TERM trap — removing it entirely still passes 19/19), 31 (ps1
+stolen-lease detection AND ps1 exit-code propagation — both survived; a robbed
+ps1 holder even deleted a successor's live lock unnoticed), 33/34/36/37/38
+(static confirmations). Re-review acceptance criterion: the fix wave's new
+tests must KILL these specific mutations. Six other bash-targeted mutations
+were killed — the bash suite's core is genuinely strong, and the two-holders
+release regression is covered deterministically (better than its comment
+claims). Note: ps1 mutations were measured against the pre-b5bf803 file.
+
+New items:
+
+50. **[MINOR]** Interop T1 passes vacuously with ZERO workers launched (the
+    gate is all-counts-zero-clean; launch failures only NOTE). Add a
+    minimum-acquired floor (e.g. ≥ half) while keeping the flake allowance.
+51. **[MINOR]** Concurrent appends to the single shared lock log are silently
+    swallowed (`catch {}` / `|| true`), so the interop balance gate
+    (released==acquired by grep count) can false-fail AND could mask a real
+    imbalance. Use per-worker logs or count RELEASED of distinct tokens.
+52. **[NIT]** The ps1 post-create mtime stamp and the token write/read retry
+    loops have no individual coverage (fault injection would be needed);
+    keep them as defence-in-depth but reword comments that imply the
+    self-tests guard them.
