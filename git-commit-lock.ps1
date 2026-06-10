@@ -59,8 +59,15 @@ $ErrorActionPreference = 'Stop'
 function Get-LockBase {
     $gd = $null
     try {
-        $gd = (& git rev-parse --absolute-git-dir 2>$null | Select-Object -First 1)
-        if ($LASTEXITCODE -ne 0) { $gd = $null }
+        # Collect ALL output — do NOT pipe through `Select-Object -First 1`:
+        # -First stops the upstream native command early, and on pwsh 7.5 that
+        # reliably leaves $LASTEXITCODE unset, which read as "git failed" and
+        # silently fell back to CWD — putting the default lock at
+        # <cwd>/commit.lock instead of <gitdir>/commit.lock, so the .ps1 and
+        # .sh sides no longer contended on the same lock (caught by
+        # git-commit-lock.integration.test.sh, 2026-06-10).
+        $out = @(& git rev-parse --absolute-git-dir 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $out.Count -gt 0) { $gd = [string]$out[0] }
     } catch { $gd = $null }
     if ($gd) { return ([string]$gd).Trim() }
     # Not in a repo: fall back to CWD so dot-sourcing never explodes. In real use
