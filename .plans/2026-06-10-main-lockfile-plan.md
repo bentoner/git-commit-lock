@@ -1,5 +1,15 @@
 ## Review findings 2026-06-11 (Codex lockfile follow-up)
 
+> **Status: verified and folded into the plan body 2026-06-11.** Finding 1
+> confirmed real (and worse than stated: the resumed holder's release finds
+> its own rewritten token, so the double-hold is *silent*) — the Acquire spec
+> now writes through the ps1 creation handle, verifies via a path read-back
+> in both impls, and NEVER repairs by overwriting: a failed verification is
+> treated as not-acquired and re-enters the wait loop. Finding 2 confirmed
+> via probe D1 — the leftover lanes (Release step 3, state table, Phase 2
+> test a) now state recovery requires the stale window AND the blocking
+> handle closing. Finding 3: no action needed, as it says.
+
 Reviewed against HEAD `cc86065`, with special attention to Codex's earlier
 objection that file locks can be worse on POSIX because unlinking an open file
 removes the path under the holder.
@@ -41,6 +51,13 @@ removes the path under the holder.
 ---
 
 ## Review findings 2026-06-10 (post-wave consistency pass)
+
+> **Status: folded into the plan body 2026-06-11** — the STALE≥MAX_WAIT
+> advisory is now cited in its landed gated form (note 1); the TODO impact
+> table is prefaced with the live-item re-key and Phase 4 edits only live
+> items (note 2); the Implementation phases now open with the land-CI-first
+> sequencing rule and Phase 2 carries the portable-backdating hand-off
+> (note 3).
 
 Fresh-context consistency check against HEAD (e67f788) — specifically the two
 commits that landed AFTER this plan's review was folded in (840a4fd
@@ -297,14 +314,35 @@ they must tolerate a missing line 2 and an entirely empty file.
 **Acquire** (poll loop, unchanged shape):
 
 - bash: `( set -C; printf '%s\n%s\n' "$tok" "$me" > "$LOCK" ) 2>/dev/null` —
-  note the `2>/dev/null` goes on the *subshell*, because the noclobber failure
-  message is emitted by bash itself, not printf (probe A finding).
+  one redirect = open(O_CREAT|O_EXCL)+write+close. Note the `2>/dev/null` goes
+  on the *subshell*, because the noclobber failure message is emitted by bash
+  itself, not printf (probe A finding). Non-zero rc ⇒ not acquired ⇒ loop (the
+  rare created-but-write-failed case, e.g. ENOSPC, leaves an empty orphan that
+  ages into the normal steal lane).
 - ps1: `[IO.File]::Open($path, CreateNew, Write, FileShare ReadWrite|Delete)`,
-  write both lines, close. Any `IOException` ⇒ contended ⇒ `$false`.
-- After winning, **read back line 1; if it doesn't match the token, rewrite
-  (plain overwrite, we own the file) with the existing 5×20ms retry budget** —
-  this replaces today's load-bearing token-write retry (a create that won but
-  whose write was dropped would otherwise guarantee a false 98 at release).
+  then **write both lines, flush, and close through that creation handle** —
+  the write is bound to the file object we created and cannot land on a
+  successor's file, whatever happens to the path meanwhile. Any `IOException`
+  on the open ⇒ contended ⇒ `$false`.
+- After winning, **verify via a path read-back: read line 1 with the existing
+  5×20ms retry ladder; our token ⇒ HELD. Anything else after the ladder —
+  foreign, empty, or gone — means we cannot prove we hold the path: log
+  loudly, treat as NOT acquired, and re-enter the wait loop. NEVER repair a
+  failed read-back by writing to the path.** A plain overwrite would be safe
+  only while the file is provably still ours, and after a long suspension
+  (sleep/stop-the-world) it provably isn't: the stale window may have let a
+  waiter steal the path and a successor re-create it, so the "repair" would
+  clobber the successor's token and produce a silent, *undetected* double-hold
+  (the resumed holder's release would then find its own token and return 0).
+  Giving the lock up instead is always safe: a foreign token is a successor
+  who legitimately owns the path; our own orphan (empty or token-bearing,
+  reads failing) ages into the steal lane and is reclaimed. This replaces the
+  dir era's load-bearing token-write retry — and quietly fixes the same
+  overwrite-after-suspension hazard that retry carried.
+- The acquire-verification failure lane has no deterministic test (it needs
+  fault injection to make a winning create unreadable); like the read-retry
+  ladders it is defence in depth — document it in the header, don't claim
+  suite coverage.
 - The ps1 post-create `SetLastWriteTimeUtc` stamp is **deleted**: CreateNew +
   the content write stamp mtime; the floor (kept, below) is the backstop.
 - `mkdir -p "$(dirname "$LOCK")"` stays (explicit `AGENT_LOCK_DIR` parents).
@@ -361,8 +399,11 @@ wait", in both impls.
    `rm -f -- "$LOCK" 2>/dev/null`; rc 0 ⇒ released (`-f` masks only ENOENT,
    which is the "vanished mid-race = already released" branch). On failure the
    file still exists and is therefore still ours ⇒ retry ~5×20ms ⇒ persistent
-   failure ⇒ **leftover**: warn, return 1, stale window reclaims (unchanged
-   contract). ps1: `File.Delete` (silent on missing = same vanished branch),
+   failure ⇒ **leftover**: warn, return 1. Recovery needs BOTH conditions: the
+   stale window elapsing AND the blocking handle closing — the no-delete-share
+   handle that blocks our unlink blocks a stealer's rename identically (D1),
+   so until it closes waiters re-poll on failed steals and may reach 97 if it
+   never does. ps1: `File.Delete` (silent on missing = same vanished branch),
    `IOException` + still-exists ⇒ retry ⇒ leftover. **No rename-aside**: probe
    D1 shows a handle that blocks unlink blocks rename identically for files
    (a share-mode fact: both ops need DELETE access on the source), so the
@@ -375,7 +416,8 @@ wait", in both impls.
 
 **Unchanged:** exit-code contract (96/97/98 + command's own), all `AGENT_LOCK_*`
 knobs and validation, lock/log location in the git dir, trap/signal handling,
-reentrancy guard, STALE≥MAX_WAIT warning, log size cap, the KNOWN RESIDUAL
+reentrancy guard, the STALE≥MAX_WAIT advisory (in its landed *gated* form:
+fires only when MAX_WAIT was left at default), log size cap, the KNOWN RESIDUAL
 RACES (both windows persist with the same detection: the displaced party's
 release cries 98 — see "races" below).
 
@@ -384,11 +426,11 @@ release cries 98 — see "races" below).
 | State | How reached | Exit |
 |---|---|---|
 | ABSENT | initial; clean release; steal-rename | one O_EXCL create wins ⇒ HELD |
-| HELD (token+owner content, mtime=now) | create won, content written | release ⇒ ABSENT; crash ⇒ ORPHAN; overlong hold ⇒ stealable |
+| HELD (token+owner content, mtime=now) | create won, content written, path read-back verified | release ⇒ ABSENT; crash ⇒ ORPHAN; overlong hold ⇒ stealable |
 | EMPTY ORPHAN (file exists, no/partial content, valid mtime) | crash between create and write; dropped write | normal staleness steal (mtime ages past window) — the regression test for old T3 |
 | UNSETTLED (mtime < floor) | observer-side FILETIME-zero transient on a brand-new lock | waiters treat as live and wait; settles in ms |
 | STALE (age ≥ window) | crash, or contract-breach slow hold | exactly one stealer renames it aside; victim (if alive) gets 98 at release |
-| LEFTOVER (release unlink blocked persistently) | foreign no-delete-share handle (AV, naive reader) | release returns 1 loudly; stale window reclaims |
+| LEFTOVER (release unlink blocked persistently) | foreign no-delete-share handle (AV, naive reader) | release returns 1 loudly; stealable only once stale AND the blocking handle closes (same handle blocks the steal rename, D1) — waiters re-poll, 97 if it never closes |
 | NON-LOCK at lock path (dir, symlink, device, or non-lock-shaped content) | config typo; old-protocol dir lock; user file at a typo'd path | never stolen; loud config warning; waiters reach 97 |
 
 ### Residual races (unchanged, for the record)
@@ -447,6 +489,13 @@ release even transiently. bash/Cygwin readers already share delete (D3).
 
 ## Implementation phases (gate: all three suites green)
 
+**Sequencing vs the CI plan
+(.plans/2026-06-10-main-github-actions-ci-plan.md): land CI first.** This
+plan's probes are Windows-only and its POSIX/macOS claims are reasoned, not
+probed — running Phases 1–3 under CI's 3-OS matrix is exactly the missing
+verification; porting before CI would also silently invalidate the CI plan's
+dir-era measurements.
+
 **Phase 1 — bash implementation + unit suite.**
 Rewrite acquire (noclobber create, content = token+owner, read-back verify),
 `_lock_cur_token` (line 1 of the lock file, same retry), steal (non-file guard,
@@ -468,10 +517,14 @@ delete the mtime stamp and the `.new.*` sweep arm; `Lock-ReadCurToken` reads
 the lock file itself (`FileNotFoundException` ⇒ gone; delete-share
 `FileStream` reads); steal via `File.Move` with the non-file guard; release via
 `File.Delete` + retry + leftover. Port interop T4/T5 fabrication (file + first
-line) and keep every behavioural test as-is. New interop tests (pwsh required,
+line) — using the unit suite's portable `epoch_to_stamp`/`touch -t` backdating,
+NOT the GNU-only `touch -d "@epoch"` those lines carry today (CI's macOS leg
+will be live by then and `touch -d` re-breaks it) — and keep every behavioural
+test as-is. New interop tests (pwsh required,
 so they live here): (a) **blocked release** — a pwsh process holds the lock
 file with `FileShare.Read` while the bash holder releases ⇒ deterministic
-leftover path, rc 1, stale-window recovery (makes TODO #30 testable); (b)
+leftover path, rc 1, then recovery once the handle closes after the stale
+window (makes TODO #30 testable); (b)
 blocked *steal* — same holder pattern against a stale lock ⇒ stealer re-polls,
 acquires after the handle closes. Done = interop suite green.
 
@@ -484,11 +537,18 @@ machine (the historical flake-finder). Done = 3×3 green runs.
 README "How it works" + docs/git-commit-lock.md "How the lock works" / port
 sections rewritten (mkdir→O_EXCL file, token-as-content, floor rationale now
 file-based, release/steal text); delete the partial-rm/rename-aside/`.new.*`
-prose; update the TODO-main.md items per the table below; re-run shellcheck +
-PSScriptAnalyzer (items 48/49). Done = docs describe only the file protocol;
-no stale "lock dir(ectory)" wording outside the changelog.
+prose; update the live TODO-main.md items (11, 48, 53–56) per the table below;
+re-run shellcheck + PSScriptAnalyzer (item 48's residual). Done = docs describe
+only the file protocol; no stale "lock dir(ectory)" wording outside the
+changelog.
 
 ## TODO-main.md impact (by item number)
+
+Numbering refers to the original 57-item consolidated review list. After the
+2026-06-10 fix wave, only **11, 48, 53–56** remain live in TODO-main.md (see
+its header; the rest were fixed and deleted). The full table is kept because
+it names dir-era behaviours and tests the port must preserve or may delete —
+but Phase 4's TODO edits touch only the live items.
 
 - **Mooted / shrunk:** **20** (`.new.*` and `.rel.*` litter cannot exist;
   sweep shrinks to one `rm -f .dead.*` line), **23** (header rewritten
