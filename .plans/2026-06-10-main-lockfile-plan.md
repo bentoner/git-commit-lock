@@ -1,3 +1,46 @@
+## Review findings 2026-06-10 (post-wave consistency pass)
+
+Fresh-context consistency check against HEAD (e67f788) — specifically the two
+commits that landed AFTER this plan's review was folded in (840a4fd
+cross-impl reconciliation, e67f788 TODO trim) and against the CI plan. **No
+blocking findings; the GO recommendation and protocol are unaffected.**
+
+1. **NOTE — 840a4fd strengthens rather than contradicts this plan.** The bash
+   release now has the rc-2 unverifiable lane in the *dir* era ("token
+   unreadable, dir present" → 2, verified at git-commit-lock.sh:430), so this
+   plan's Release step 2 pinning ("bash rc 2 / ps1 'unreadable'") now mirrors
+   landed behaviour in both impls instead of introducing a new bash lane.
+   One adjacent fact drifted: the STALE≥MAX_WAIT advisory listed under
+   "Unchanged" is now *gated* (fires only when MAX_WAIT was left at default) —
+   carry the gated form over; no design impact. Problem statement re-verified
+   accurate at HEAD: mkdir+token-after, `Lock-TryCreateDir`/`.new.*`/
+   `SetLastWriteTimeUtc`, rename-aside release in both impls, litter sweep,
+   floor 946684800, read-retry ladders — all still present as described.
+2. **NOTE — the TODO impact table is keyed to item numbers e67f788 deleted.**
+   Only 11, 39, 48, 53–56 survive in TODO-main.md; the rest were fixed in the
+   wave and removed. The table's *substance* is still right (it names
+   behaviours/tests the port must preserve), but Phase 4's "update the
+   TODO-main.md items per the table" now mostly points at nonexistent entries.
+   Re-key to the live items: 11 (TODO already notes this plan subsumes it),
+   39 (claimed by the CI plan "before or with the workflow commit" — likely
+   already done before this plan starts; drop it from the mechanical-port
+   row), 48 (re-run linters — fine), 53–56 (fold-in row — fine).
+3. **NOTE — sequencing vs the CI plan
+   (.plans/2026-06-10-main-github-actions-ci-plan.md, implementing 2026-06-11);
+   neither plan references the other.** No contradiction — the workflow only
+   invokes the three suites + linters, so it needs no edits for this change —
+   but the recommended order is **CI first**: this plan's probes are
+   Windows-only and its POSIX/macOS claims are reasoned-not-probed, so running
+   Phases 1–3 under the 3-OS matrix is exactly the missing verification;
+   landing the port before CI would also silently invalidate the CI plan's
+   dir-era measurements. One concrete hand-off: Phase 2's re-fabrication of
+   interop T4/T5 must use the unit suite's portable `epoch_to_stamp`/`touch -t`
+   pattern, not the GNU-only `touch -d "@epoch"` those lines carry today
+   (interop 160/184) — by then CI's macOS leg will be live and `touch -d`
+   re-breaks it. Add one sequencing sentence to the plan.
+
+---
+
 ## Review findings (2026-06-10 fresh-context review)
 
 > **Status: all six findings folded into the plan body (same day), per their

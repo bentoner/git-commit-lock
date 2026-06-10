@@ -1,3 +1,70 @@
+## Review findings 2026-06-10 (post-wave consistency pass)
+
+Fresh-context review against HEAD (e67f788), both suites' sources, TODO-main.md,
+the lockfile plan, and the actions/runner-images repo (re-fetched today).
+
+1. **BLOCKING — the unit-suite facts are stale vs the HEAD this plan was
+   committed on.** Commit 840a4fd (2 minutes before this plan's reconciliation
+   commit 6126cf6) raised the unit suite to **59** assertions (T8 net +1: the
+   ungated STALE≥MAX_WAIT assertion became a gated negative+positive pair) and
+   converted unit T4b and T8 from fixed sleeps to marker-polling. Three spots to
+   fix: (a) "58 assertions across 17 tests" → 59 across 17; (b) the "fresh run
+   of all three suites against HEAD … unit 56/58" predates 840a4fd — its T4b
+   vacuous miss is the very flake 840a4fd fixed; post-fix runs recorded 59/59
+   (840a4fd and e67f788 commit messages); (c) flakiness-policy item 2 still
+   names **unit T4b** as a live "holds via a fixed sleep" margin item — it is
+   already marker-polled; only interop T8a/T8b remain (consistent with TODO 55).
+   No effect on the YAML, budgets, or design — but the plan's own "every fact
+   re-verified against the current tree" claim is what these contradict.
+2. **NOTE — cross-plan sequencing (neither plan mentions the other).** The
+   lockfile plan (.plans/2026-06-10-main-lockfile-plan.md) rewrites the on-disk
+   protocol this plan's grounding prose describes (dir-mtime stat branch, T3
+   orphan, dir-era runtimes) and folds in the TODO 53–56 perf pass this plan's
+   budgets defer to. No contradiction: the workflow YAML is protocol-agnostic
+   (it only invokes the three suites + linters) and survives the lockfile change
+   unedited. Recommended order: **this plan first** (matrix green on 3 OSes),
+   then the lockfile port runs its Phase 3 gate under the matrix — its probes
+   were Windows-only, so CI is exactly the verification it lacks. Add one
+   sequencing sentence here; if the lockfile plan proceeds, the budget-revisit
+   trigger ("after TODO 53–56 lands") arrives via that port.
+3. **NOTE — small double-claim on TODO 39.** This plan does the integration
+   preserve-knob follow-up "before or with the workflow commit"; the lockfile
+   plan's impact table lumps item 39 into its "mechanical port" row. Landing it
+   here first is right; the lockfile row then goes moot (flagged there too).
+4. **NOTE — the interop `touch -d` fix and the lockfile Phase 2 port touch the
+   same lines.** The two GNU-only `touch -d "@epoch"` calls this plan flags
+   (interop lines 160/184 — verified still present at HEAD) are the same
+   fabrication sites the lockfile plan re-writes; whichever lands second must
+   keep the portable `epoch_to_stamp`/`touch -t` pattern or macOS re-breaks.
+5. **NOTE — Windows `GCL_TEST_PRESERVE_DIR` is a mixed-separator path**
+   (`${{ github.workspace }}` renders `D:\a\…` and the YAML appends
+   `/test-output/…`). MINGW coreutils accept Win32 paths in the suites'
+   `mkdir -p`/`cp`, so expect-to-work — but the suites never `cd` in the main
+   shell, so a workspace-relative value (`test-output/failed-work/unit`) dodges
+   the seam entirely if it ever bites.
+6. **NOTE — concurrency group shares the cron with pushes**: scheduled runs
+   execute on `refs/heads/main`, so a weekly run colliding with an in-flight
+   push run cancels it (or vice versa). Rare and harmless; key the group on
+   `github.event_name` too if it ever annoys.
+
+Verified clean (no findings needed): all runner-image claims re-confirmed
+against actions/runner-images today — labels GA as stated; pwsh 7.4.16 on all
+three images; ubuntu-24.04 bash 5.2.21 / git 2.54.0 / shellcheck 0.9.0-1 /
+PSScriptAnalyzer 1.25.0 preinstalled; macos-15 bash 3.2.57; windows-2025 Git
+for Windows 2.54.0 with Git Bash at `C:\Program Files\Git\bin\bash.exe`. Repo
+facts re-confirmed: 96/97/98 contract, MAX_WAIT default 420, integration cap
+240, T1 = 8×25, integration 12/11 assertions and unconditional cleanup trap,
+unit/interop preserve semantics (contents-flat vs dir-itself), interop pwsh
+skip-with-exit-0, ps1 SuppressMessageAttribute present, README portability
+sentence and docs staleness paragraph as described, `.gitattributes` exists.
+YAML dry-read: job-level `timeout-minutes` expressions have matrix context
+(valid); `${{ !cancelled() }}` quoting fine; `bash -eo pipefail` propagates
+`tee` pipeline failures; artifact names unique per leg (v4 requirement);
+upload step's `cancelled()` runs on a timeout kill. Open-question
+recommendations 1–7 all look sound.
+
+---
+
 # Plan: GitHub Actions CI for git-commit-lock
 
 Date: 2026-06-10 · Branch: main · Status: **draft, awaiting Ben's review** (no
