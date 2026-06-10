@@ -1,7 +1,5 @@
 # commit-lock
 
-can you think about what the right name is? it's more of a staging lock that a commit lock and we should get git into the name, but idk if people will think to search for "git-staging-lock" 
-
 A small mutex that lets several agents **commit from one shared Git checkout
 without tripping over each other**.
 
@@ -24,21 +22,21 @@ similar tools they don't get a worktree of their own — so even a workflow that
 gives every top-level agent its own worktree ends up with each fan-out of
 subagents sharing one tree.
 
-Committing from that shared tree is often exactly what you want. When each
-subagent commits its own focused change as it finishes — every revision of a
-plan as review agents iterate on it, each fix from a review/fix cycle — the
-history records how the work evolved, instead of one squashed blob at the end.
-
-should make the examples more about workflows that do uncoupled things in parallel - e.g. generating plans for multiple features in at once - your examples are serial.
-
-`commit-lock` exists to make those concurrent commits safe.
+Committing from that shared tree is often exactly what you want. A session
+might fan out a dozen subagents doing uncoupled work in parallel — drafting
+plans for several features at once, fixing independent review findings,
+updating docs file-by-file — and when each one commits its own change as it
+finishes, the history records how the work evolved, instead of arriving as one
+squashed blob at the end. `commit-lock` exists to make those concurrent
+commits safe.
 
 Typical setups:
 
-- a Claude Code workflow fanning out subagents that each commit a plan
-  revision, a review fix, or a doc update as they finish;
-- one agent writing a plan while another implements;
-- several agents producing independent docs or changes in separate files;
+- a Claude Code workflow fanning out subagents that draft plans for several
+  features at once, each committing its own plan file as it lands;
+- parallel review/fix agents committing focused fixes to different files as
+  they finish;
+- one agent iterating on a plan while another implements;
 - any shared checkout where creating and bootstrapping a worktree for every
   small agent task is more machinery than the task needs.
 
@@ -81,7 +79,8 @@ Requirements:
 - Git, and bash for `commit-lock.sh`. On Windows use Git Bash/MSYS2 bash, not
   WSL bash — an install done from WSL is only visible inside WSL.
 - PowerShell 7+ (`pwsh`), only for `commit-lock.ps1` and the interop tests.
-- `~/.local/bin` on `PATH` if you want the installed command names to resolve.
+- `~/.local/bin` on `PATH` if you want the installed command names to resolve
+  (the installer warns if it isn't).
 
 After cloning this repository, run the installer:
 
@@ -97,42 +96,11 @@ installer and invoke the scripts by path from the clone (e.g.
 `path/to/commit-lock/commit-lock.sh`). Installing is only a convenience so
 every checkout can use the same command names.
 
-check that install.sh checks that .local/bin is on the path.
-
-
-## Usage
-
-Bash — run a command under the lock:
-
-```sh
-bash ~/.local/bin/commit-lock.sh run -- bash -c '
-  git add -- path/you/changed && git commit -m "your message"'
-```
-
-maybe another example of how to take the lock and then release it later if you want to complicated staging thing while holding the lock. or should this be discouraged. I worry about the ability for lower capability agents to chain multiple git commands successfully and even a more capable agent might want to review a staged commit before releasing the lock.
-
-PowerShell:
-
-```powershell
-pwsh -NoProfile -File "$HOME/.local/bin/commit-lock.ps1" run "git add -- path/a path/b; if (`$LASTEXITCODE -eq 0) { git commit -m 'msg' }"
-```
-
-The exit code is the wrapped command's. If it exits 2 with the lock-stolen
-warning, the lock was lost mid-hold and the commit was NOT serialised — verify
-with `git log` and redo. If the lock can't be acquired within
-`AGENT_LOCK_MAX_WAIT` (default 7 minutes), the command isn't run and the exit
-code is 1 with a timeout message on stderr. See
-[`docs/commit-lock.md`](docs/commit-lock.md) for
-the `run` vs source-the-library forms, the `AGENT_LOCK_*` config knobs, and
-how staleness and stealing work.
-
 ## Suggested agent instructions
 
 Agents only benefit from the lock if their instructions tell them to use it.
 Copy this into the instruction context (`AGENTS.md`, `CLAUDE.md`, Cursor
 rules, etc.) for agents that may share one checkout:
-
-this should def come before usage. this is more interesting for the human than usage which is only for the agent. maybe even earlier. should we also ship a skill?
 
 ````markdown
 ## Shared checkouts: commit lock
@@ -158,6 +126,19 @@ PowerShell:
 
 ```powershell
 pwsh -NoProfile -File "$HOME/.local/bin/commit-lock.ps1" run "git add -- path/a path/b; if (`$LASTEXITCODE -eq 0) { git commit -m 'your message' }"
+```
+
+If you want to run the git steps one at a time — for example to review the
+staged diff before committing — source the library and drive the lock
+yourself, keeping the whole hold brief:
+
+```sh
+source ~/.local/bin/commit-lock.sh
+lock_acquire || exit 1
+git add -- path/you/changed
+git diff --cached
+git commit -m "your message"
+lock_release
 ```
 
 Hold the lock only for stage+commit. Decide what to stage, build patches, run
@@ -186,6 +167,48 @@ Use a bare `git commit` for index-only commits. Do not use
 `git commit -- <file>` in this case because it re-reads the working tree and
 can pull in someone else's WIP.
 ````
+
+## Usage
+
+Bash — run a command under the lock:
+
+```sh
+bash ~/.local/bin/commit-lock.sh run -- bash -c '
+  git add -- path/you/changed && git commit -m "your message"'
+```
+
+PowerShell:
+
+```powershell
+pwsh -NoProfile -File "$HOME/.local/bin/commit-lock.ps1" run "git add -- path/a path/b; if (`$LASTEXITCODE -eq 0) { git commit -m 'msg' }"
+```
+
+If a single wrapped command is awkward — say you want to review the staged
+diff before committing — source the library and drive the lock yourself:
+
+```sh
+source ~/.local/bin/commit-lock.sh
+lock_acquire || exit 1
+git add -- path/you/changed
+git diff --cached        # check the staged commit is what you intend
+git commit -m "your message"
+lock_release
+```
+
+(In PowerShell, dot-source `commit-lock.ps1` and use `Lock-Acquire` /
+`Lock-Release` in a `try`/`finally`.) Keep the hold brief either way: the lock
+is a lease, and a hold longer than the staleness window (default 5 minutes)
+can be stolen by a waiter. Prepare everything you can outside the lock, and
+never wait on a human while holding it. `lock_acquire` arms an exit trap, so
+the lock is released even if the shell dies mid-hold.
+
+The exit code of `run` is the wrapped command's. If it exits 2 with the
+lock-stolen warning, the lock was lost mid-hold and the commit was NOT
+serialised — verify with `git log` and redo. If the lock can't be acquired
+within `AGENT_LOCK_MAX_WAIT` (default 7 minutes), the command isn't run and
+the exit code is 1 with a timeout message on stderr. See
+[`docs/commit-lock.md`](docs/commit-lock.md) for the `AGENT_LOCK_*` config
+knobs and how staleness and stealing work.
 
 ## Alternatives and related tools
 
