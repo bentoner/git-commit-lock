@@ -252,3 +252,26 @@ New items:
     loops have no individual coverage (fault injection would be needed);
     keep them as defence-in-depth but reword comments that imply the
     self-tests guard them.
+
+## Performance pass (analysis 2026-06-10; suite slowness = fork fan-out, not sleeps; full report in session log)
+
+53. **[MINOR]** Lazy gitdir resolution: both impls run `git rev-parse` at load
+    even when AGENT_LOCK_DIR is explicitly set (every non-default-path test).
+    Resolve lazily; the default path stays covered by the tests that test it.
+    Biggest single win (~2 forks × 200 invocations in unit T1 alone).
+54. **[MINOR]** Replace hot forks in the sh impl with builtins: `_lock_now` →
+    `printf '%(%s)T' -1` (with `date` fallback for macOS bash 3.2),
+    `hostname` → `$HOSTNAME`, `tr`-based digit check → `case`. ~30% of
+    per-invocation cost; speeds production use too.
+55. **[MINOR]** Convert remaining fixed sleep-holds to marker-polling (unit
+    T4b/T6/T8/T10/T11, interop T8a/T8b/T9, T4c 3s→2s, T9 MAX_WAIT 2→1,
+    parallelise interop T7's two CLI calls). ~12-14s unit + ~9-12s interop;
+    also removes vacuous-pass/spurious-fail load sensitivity.
+56. **[MINOR]** Add a one-line `WAITING` log entry on the first blocked poll
+    iteration (both impls, contended path only): lets unit T4 / interop T2/T3
+    positively assert the waiter actually contended (impossible today — they
+    pass vacuously if the holder finishes early) AND replaces their fixed 2-3s
+    holds with hold-until-WAITING-observed. Faster and stronger.
+    Do NOT touch the slow-for-good-reason set: unit T1's 8×25/poll-rate/gap,
+    interop T1/T6 fan-out, stale-window waits, unit T9's MAX_WAIT, the
+    integration suite's real-commit costs.
