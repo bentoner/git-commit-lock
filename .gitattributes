@@ -1,4 +1,4 @@
-# commit-lock.sh / the test suites have a `#!/usr/bin/env bash` shebang — a CRLF
+# git-commit-lock.sh / the test suites have a `#!/usr/bin/env bash` shebang — a CRLF
 # line ending breaks the shebang on a fresh clone. Force LF for everything text.
 * text=auto eol=lf
 *.ps1 text eol=lf

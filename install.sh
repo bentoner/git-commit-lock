@@ -8,6 +8,10 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEST="${HOME}/.local/bin"
+if [ -e "$DEST" ] && [ ! -d "$DEST" ]; then
+    echo "install.sh: $DEST exists but is not a directory - move it aside, then re-run." >&2
+    exit 1
+fi
 mkdir -p "$DEST"
 
 export MSYS=winsymlinks:nativestrict   # real symlinks on Windows Git-Bash
@@ -16,7 +20,16 @@ for f in git-commit-lock.sh git-commit-lock.ps1; do
     src="$REPO/$f"
     dst="$DEST/$f"
     [ -f "$src" ] || { echo "install.sh: missing $src" >&2; exit 1; }
-    prev="$(readlink "$dst" 2>/dev/null || echo '(none)')"
+    if [ -L "$dst" ]; then
+        prev="$(readlink "$dst" 2>/dev/null || echo '(unreadable symlink)')"
+    elif [ -d "$dst" ]; then
+        echo "install.sh: $dst exists and is a directory - remove it, then re-run." >&2
+        exit 1
+    elif [ -e "$dst" ]; then
+        prev='(regular file - replaced)'
+    else
+        prev='(none)'
+    fi
     ln -sf "$src" "$dst"
     printf 'linked %s\n   was: %s\n   now: %s\n' "$dst" "$prev" "$src"
 done
