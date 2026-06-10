@@ -14,10 +14,6 @@ commits 9b36f42..840a4fd.
     plan proceeds, it subsumes this item; otherwise implement standalone.
     (Codex#1.)
 
-39. **[NIT — residual]** The integration suite does not honour
-    `GCL_TEST_PRESERVE_DIR` (unit and interop suites do); add it so CI can
-    collect its artifacts on failure.
-
 48. **[MINOR — residual]** shellcheck info-level triage (SC2015 `A && B || C`,
     SC2310/SC2312 errexit-interaction notes) — one deliberate review pass,
     suppress-with-rationale where intentional. Warning level is clean.
