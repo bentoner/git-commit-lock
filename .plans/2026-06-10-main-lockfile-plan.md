@@ -1,3 +1,21 @@
+## Review round 1 of the convergence loop, 2026-06-11 (fresh Claude + Codex)
+
+> **Status: all findings folded same day (commit follows 39f71c2).** Claude:
+> 10 non-blocking spec amendments — ps1 catch-all open exception (dir throws
+> `UnauthorizedAccessException`, verified), unreadable-steal lane pinned
+> (skip + re-poll), torn-`tok.`-prefix residual accepted + documented, unit
+> T16 / interop T11 semantics flips named explicitly (+ cross-impl gone⇒98
+> assertion), dead "our own 10×-failed write" clause deleted (acquire
+> verification grounds gone⇒98), TODO 58 folded into phases/table (Phase 3's
+> 3×3 is the explicit `GCL_TEST_FULL=1` canary), touch-d claim updated to
+> landed reality, sweep keeps its age gate (pinned), ABSENT-row verify step,
+> per-impl ladder wording. Codex: 3 findings — its blocker (bash noclobber
+> doesn't gate non-regular paths; a FIFO at the lock path would block open(2)
+> before any timeout) is fixed by a mandatory bash pre-create type guard;
+> ps1-side guard tests added to Phase 2 (item c); TODO 58 as above. Verdicts:
+> Claude "concur with GO — no blocking findings"; Codex "with finding 1
+> fixed, GO is otherwise honestly stated".
+
 ## Review findings 2026-06-11 (Codex lockfile follow-up)
 
 > **Status: verified and folded into the plan body 2026-06-11.** Finding 1
@@ -313,6 +331,16 @@ they must tolerate a missing line 2 and an entirely empty file.
 
 **Acquire** (poll loop, unchanged shape):
 
+- **Pre-create type guard (bash: mandatory).** If something exists at the lock
+  path that is not a regular file, do NOT attempt the create — fall through to
+  the wait/steal loop, whose non-lock guard logs the one-time config warning
+  (waiters reach 97). Rationale: noclobber's exists⇒fail protection applies to
+  *regular files* only — `>` onto an existing FIFO **blocks in open(2)** before
+  any timeout logic runs, and onto a device node simply writes. (A symlink,
+  even dangling, is safely refused by O_CREAT|O_EXCL itself; the pre-check
+  just routes it to the same warn lane coherently.) The check-then-open gap is
+  acceptable: a non-lock object at the path is static misconfiguration, not a
+  racing peer.
 - bash: `( set -C; printf '%s\n%s\n' "$tok" "$me" > "$LOCK" ) 2>/dev/null` —
   one redirect = open(O_CREAT|O_EXCL)+write+close. Note the `2>/dev/null` goes
   on the *subshell*, because the noclobber failure message is emitted by bash
@@ -322,10 +350,17 @@ they must tolerate a missing line 2 and an entirely empty file.
 - ps1: `[IO.File]::Open($path, CreateNew, Write, FileShare ReadWrite|Delete)`,
   then **write both lines, flush, and close through that creation handle** —
   the write is bound to the file object we created and cannot land on a
-  successor's file, whatever happens to the path meanwhile. Any `IOException`
-  on the open ⇒ contended ⇒ `$false`.
-- After winning, **verify via a path read-back: read line 1 with the existing
-  5×20ms retry ladder; our token ⇒ HELD. Anything else after the ladder —
+  successor's file, whatever happens to the path meanwhile. **Any exception on
+  the open ⇒ contended ⇒ `$false`** — not just `IOException`: an existing
+  *directory* at the path throws `UnauthorizedAccessException` (verified,
+  pwsh 7.5), and a `catch [IO.IOException]` alone would throw out of
+  Lock-Acquire in exactly the lane that must degrade to the config warning.
+  (.NET's Unix open uses O_CREAT|O_EXCL, so FIFO/device paths fail with an
+  exception rather than blocking; the bash-style pre-check is optional
+  symmetry, not load-bearing, for ps1.)
+- After winning, **verify via a path read-back: read line 1 with each impl's
+  existing retry ladder (bash 5×20ms; ps1 8 tries, 20→320ms escalating
+  backoff); our token ⇒ HELD. Anything else after the ladder —
   foreign, empty, or gone — means we cannot prove we hold the path: log
   loudly, treat as NOT acquired, and re-enter the wait loop. NEVER repair a
   failed read-back by writing to the path.** A plain overwrite would be safe
@@ -347,7 +382,12 @@ they must tolerate a missing line 2 and an entirely empty file.
   the content write stamp mtime; the floor (kept, below) is the backstop.
 - `mkdir -p "$(dirname "$LOCK")"` stays (explicit `AGENT_LOCK_DIR` parents).
 - The grave sweep shrinks to `rm -f "$LOCK".dead.* ` (file graves only;
-  `.new.*` and `.rel.*` no longer exist).
+  `.new.*` and `.rel.*` no longer exist). It **keeps the existing age-gated
+  semantics** (mechanical port; unit T15's age-gate assertion ports
+  unchanged). Dropping the gate would also be safe — a `.dead.*` grave is
+  trash from the instant it exists, and a displaced ps1 victim's delete-share
+  handle means even its in-flight writes land in the grave harmlessly — but
+  keeping it minimises churn.
 
 **Staleness** — unchanged: keyed on the lock *file's* own mtime
 (`stat -c %Y` chain / `Get-Item ... LastWriteTimeUtc`), threshold
@@ -374,7 +414,19 @@ wait", in both impls.
    implementations; pre-release this is free). Real user files are neither,
    so a typo'd `AGENT_LOCK_DIR` pointing at an existing regular file becomes
    non-stealable instead of renamed-and-deleted — closing most of what
-   remained of TODO #11;
+   remained of TODO #11. Two lanes pinned identically in both impls:
+   (a) a **persistent read failure with the file still present** is neither
+   "empty" nor the never-steal lane — skip this steal attempt and re-poll
+   (bash tells genuinely-empty from read-failed via `[ -s ]` plus the read's
+   rc; ps1 catches the read exception rather than letting it escape or fire
+   the config warning). Self-correcting: a handle that blocks the read
+   usually blocks the rename too (D1), so refusing costs nothing.
+   (b) a **torn token write** (line 1 a strict prefix of `tok.`, e.g. `to` —
+   reachable only via ENOSPC/crash mid-write) is non-empty and non-prefixed,
+   so it lands in the never-steal lane permanently: an accepted residual,
+   loud (the config warning names the path) and fixed by one manual `rm`.
+   The dir protocol would have recovered it by staleness; we trade that
+   vanishing-rare case for not deleting real user files;
 4. re-read mtime immediately before acting; any change ⇒ abort attempt (as
    today);
 5. read line 2 (best-effort) for the log; `mv "$LOCK" "$LOCK.dead.$$.<ts>"` /
@@ -393,7 +445,9 @@ wait", in both impls.
    token, or a gone file** ⇒ restore traps, warn, **98** (theft); a file that
    still reads **empty after the retry ladder** is NOT definitive theft
    evidence (it is the probe-F create→write window of a successor after a
-   boundary steal, or our own 10×-failed write) ⇒ the unverifiable lane
+   boundary steal, or external truncation — it cannot be our own failed
+   write, since acquire's read-back positively verified our token at the
+   path, which is also what grounds treating "gone" as theft) ⇒ the unverifiable lane
    (bash rc 2 / ps1 'unreadable'): don't delete, don't claim success;
 3. match ⇒ re-read once (boundary-shrink, unchanged), then delete:
    `rm -f -- "$LOCK" 2>/dev/null`; rc 0 ⇒ released (`-f` masks only ENOENT,
@@ -425,13 +479,13 @@ release cries 98 — see "races" below).
 
 | State | How reached | Exit |
 |---|---|---|
-| ABSENT | initial; clean release; steal-rename | one O_EXCL create wins ⇒ HELD |
+| ABSENT | initial; clean release; steal-rename | one O_EXCL create wins ⇒ read-back verify ⇒ HELD (failed verify ⇒ not acquired, re-enter wait) |
 | HELD (token+owner content, mtime=now) | create won, content written, path read-back verified | release ⇒ ABSENT; crash ⇒ ORPHAN; overlong hold ⇒ stealable |
 | EMPTY ORPHAN (file exists, no/partial content, valid mtime) | crash between create and write; dropped write | normal staleness steal (mtime ages past window) — the regression test for old T3 |
 | UNSETTLED (mtime < floor) | observer-side FILETIME-zero transient on a brand-new lock | waiters treat as live and wait; settles in ms |
 | STALE (age ≥ window) | crash, or contract-breach slow hold | exactly one stealer renames it aside; victim (if alive) gets 98 at release |
 | LEFTOVER (release unlink blocked persistently) | foreign no-delete-share handle (AV, naive reader) | release returns 1 loudly; stealable only once stale AND the blocking handle closes (same handle blocks the steal rename, D1) — waiters re-poll, 97 if it never closes |
-| NON-LOCK at lock path (dir, symlink, device, or non-lock-shaped content) | config typo; old-protocol dir lock; user file at a typo'd path | never stolen; loud config warning; waiters reach 97 |
+| NON-LOCK at lock path (dir, symlink, device, non-lock-shaped content, or a torn `tok`-prefix write) | config typo; old-protocol dir lock; user file at a typo'd path; ENOSPC/crash mid-write | never stolen (bash also refuses the create via the pre-create type guard — noclobber alone would block on a FIFO); loud config warning; waiters reach 97; manual fix |
 
 ### Residual races (unchanged, for the record)
 
@@ -504,12 +558,17 @@ branch), sweep (one `rm -f` for `.dead.*`), and the header comment block
 (WHY/STALENESS/RESIDUAL sections rewritten for the file design — subsumes TODO
 #23/#24 wording). Port the suite: T2/T9 fabricate with `printf`+`backdate`
 (backdate works on files unchanged); T3 becomes the **empty-file orphan**
-regression; T6/T10 assert `-f` not `-d`; T15 fabricates file graves. New tests:
-sub-floor file (T9 port), non-file-at-lock-path refusal (dir AND symlink),
-non-lock-shaped-content steal refusal (a stale "user file" at the lock path
-survives), empty-but-exists release classification (unverifiable lane, not
-98), token-line-1 parsing with owner line present. Done =
-`git-commit-lock.test.sh` green.
+regression; T6/T10 assert `-f` not `-d`; T15 fabricates file graves. One semantics flip to port deliberately: unit T16 (missing-token unverifiable
+release) fabricates by deleting the token file inside the dir — under the file
+protocol that becomes **truncating the lock file** (the "empty-but-exists ⇒
+unverifiable" test below IS T16's replacement), while **deleting the lock file
+now asserts 98**, not the unverifiable lane. New tests:
+sub-floor file (T9 port), non-file-at-lock-path refusal (dir AND symlink, and
+the pre-create type guard on a FIFO where mkfifo exists), non-lock-shaped-
+content steal refusal (a stale "user file" at the lock path survives, incl.
+the torn `tok`-prefix lane), empty-but-exists release classification
+(unverifiable lane, not 98), gone-at-release ⇒ 98, token-line-1 parsing with
+owner line present. Done = `git-commit-lock.test.sh` green.
 
 **Phase 2 — ps1 implementation + interop suite.**
 Replace `Lock-TryCreateDir` with the CreateNew open+write (delete-share);
@@ -517,38 +576,52 @@ delete the mtime stamp and the `.new.*` sweep arm; `Lock-ReadCurToken` reads
 the lock file itself (`FileNotFoundException` ⇒ gone; delete-share
 `FileStream` reads); steal via `File.Move` with the non-file guard; release via
 `File.Delete` + retry + leftover. Port interop T4/T5 fabrication (file + first
-line) — using the unit suite's portable `epoch_to_stamp`/`touch -t` backdating,
-NOT the GNU-only `touch -d "@epoch"` those lines carry today (CI's macOS leg
-will be live by then and `touch -d` re-breaks it) — and keep every behavioural
-test as-is. New interop tests (pwsh required,
+line) — the suite already uses the portable `epoch_to_stamp`/`backdate`
+helpers (landed 340a584); the port must preserve that pattern and not
+reintroduce GNU-only `touch -d` (CI's macOS leg will be live by then). Keep
+the behavioural tests as-is with one exception: **interop T11** (cross-impl
+missing-token) fabricates by deleting the token file — re-split it into
+(i) truncate-the-lock-file ⇒ both impls report the unverifiable lane, and
+(ii) delete-the-lock-file ⇒ both impls report **98** (a new cross-impl
+gone⇒theft agreement assertion). New interop tests (pwsh required,
 so they live here): (a) **blocked release** — a pwsh process holds the lock
 file with `FileShare.Read` while the bash holder releases ⇒ deterministic
 leftover path, rc 1, then recovery once the handle closes after the stale
 window (makes TODO #30 testable); (b)
 blocked *steal* — same holder pattern against a stale lock ⇒ stealer re-polls,
-acquires after the handle closes. Done = interop suite green.
+acquires after the handle closes; (c) **ps1-side guard parity** — the dir /
+symlink (reparse-point) / non-lock-shaped-content guards exercised from the
+ps1 implementation, not only bash (they use different APIs — `PSIsContainer`,
+reparse attributes, the catch-all open exception — so bash coverage proves
+nothing about them); include dir-at-lock-path acquire degrading to `$false` +
+config warning rather than throwing. Done = interop suite green.
 
 **Phase 3 — integration suite + full matrix.**
 Expected to pass nearly unchanged (it uses defaults and `-e` assertions); run
-it, fix fallout, then run all three suites ×3 back-to-back on the loaded
-machine (the historical flake-finder). Done = 3×3 green runs.
+it, fix fallout, then run all three suites ×3 back-to-back **with
+`GCL_TEST_FULL=1`** — this is the deliberate full-strength pre-publish canary
+that TODO #58 designates as the explicit opt-in case (the same item that makes
+routine dev runs reduced by default), so coordinate the timing with Ben rather
+than running it while other agents are active. Done = 3×3 green runs, with the
+suites' mode lines confirming full strength ran (58's masquerade guard).
 
 **Phase 4 — docs, TODO, linters.**
 README "How it works" + docs/git-commit-lock.md "How the lock works" / port
 sections rewritten (mkdir→O_EXCL file, token-as-content, floor rationale now
 file-based, release/steal text); delete the partial-rm/rename-aside/`.new.*`
-prose; update the live TODO-main.md items (11, 48, 53–56) per the table below;
+prose; update the live TODO-main.md items (11, 48, 53–56, 58) per the table
+below;
 re-run shellcheck + PSScriptAnalyzer (item 48's residual). Done = docs describe
 only the file protocol; no stale "lock dir(ectory)" wording outside the
 changelog.
 
 ## TODO-main.md impact (by item number)
 
-Numbering refers to the original 57-item consolidated review list. After the
-2026-06-10 fix wave, only **11, 48, 53–56** remain live in TODO-main.md (see
-its header; the rest were fixed and deleted). The full table is kept because
-it names dir-era behaviours and tests the port must preserve or may delete —
-but Phase 4's TODO edits touch only the live items.
+Numbering refers to the original consolidated review list. After the
+2026-06-10 fix wave, only **11, 48, 53–56, 58** remain live in TODO-main.md
+(see its header; the rest were fixed and deleted; 58 landed 2026-06-11). The
+full table is kept because it names dir-era behaviours and tests the port must
+preserve or may delete — but Phase 4's TODO edits touch only the live items.
 
 - **Mooted / shrunk:** **20** (`.new.*` and `.rel.*` litter cannot exist;
   sweep shrinks to one `rm -f .dead.*` line), **23** (header rewritten
@@ -568,12 +641,16 @@ but Phase 4's TODO edits touch only the live items.
   file; same fix), **26–29, 31–39, 50, 51** (fabrication sites and `-d`/`-f`
   assertions move; behavioural content identical), **48/49** (re-run linters
   after the rewrite).
-- **Performance pass (53–56, landed after the plan's first draft): fold into
-  the rewrite.** 53 (lazy gitdir) and 54 (builtin hot-forks) touch exactly the
-  code Phases 1–2 rewrite — apply them as part of the port rather than twice;
-  55 (marker-polling) and 56 (`WAITING` log line) land with the suite ports in
+- **Performance pass (53–56) + fan-out opt-in (58): fold into the rewrite.**
+  53 (lazy gitdir) and 54 (builtin hot-forks) touch exactly the code Phases
+  1–2 rewrite — apply them as part of the port rather than twice; 55
+  (marker-polling) and 56 (`WAITING` log line) land with the suite ports in
   Phases 1–3. If 56 lands here, its log line is included in the Logging
-  section below.
+  section below. **58** (reduced default fan-out, full strength only under
+  `GCL_TEST_FULL=1`) rescopes the very fan-out tests Phases 1–3 rewrite (unit
+  T1's 8×25, interop T1/T6, the integration swarms) — implement the knob as
+  part of the suite ports rather than twice; it reduces fan-out *width* while
+  56 protects *timing*, so the two compose without conflict.
 - **Unaffected:** **3, 4, 5, 8, 9, 10, 12–15, 17–19, 21, 22, 40–47** (traps,
   exit-code plumbing, 5.1 encoding, CLI guards, docs errata — orthogonal to
   the lock's on-disk shape; the Phase-4 doc rewrite should land their fixes in

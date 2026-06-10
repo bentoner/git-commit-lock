@@ -3,8 +3,9 @@
 Numbering is continuous from the original 57-item consolidated review (see git
 history of this file for the full record); do not renumber; delete items as
 fixed. Everything not listed here was fixed in the 2026-06-10 fix wave and
-verified by the suites (unit 59/59, interop 30/30, integration 12/12) — see
-commits 9b36f42..840a4fd.
+verified by the suites (unit 59/59, interop 30/30, integration 12/12 — counts
+as of that wave; the suites have since grown, see the CI plan's Grounding) —
+see commits 9b36f42..840a4fd.
 
 11. **[MINOR]** `AGENT_LOCK_DIR` is `mv`'d and `rm -rf`'d unvalidated — a typo
     like `AGENT_LOCK_DIR=$HOME` becomes destructive once "stale". Validate

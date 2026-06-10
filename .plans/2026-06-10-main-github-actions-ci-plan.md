@@ -1,3 +1,20 @@
+## Review round 1 of the convergence loop, 2026-06-11 (fresh Claude + Codex)
+
+> **Status: all findings folded same day (commit follows 39f71c2).** Claude:
+> verdict clean — every load-bearing claim re-verified against the suites
+> (counts 64/35/12 statically recounted, preserve semantics, lint gates
+> actually run and clean, bash-3.2 grep audit, YAML dry-read); two
+> non-blocking wording notes, both taken (GCL_TEST_FULL landing-order
+> softened; TODO-main.md header counts annotated as of-that-wave). Codex: 4
+> findings, all verified and taken — `upload-artifact` hides dotfiles by
+> default, which would have dropped the integration suite's `.git/` lock-log
+> diagnostics (`include-hidden-files: true` added); job-level timeout cancels
+> rather than fails, so the upload guarantee moved to per-step
+> `timeout-minutes` (job level is now a backstop only); action majors were
+> stale (checkout v5→v6, upload-artifact v4→v7, verified against the releases
+> pages 2026-06-11); GCL_TEST_FULL documented as an inert no-op until TODO 58
+> lands.
+
 ## Review findings 2026-06-10 (post-wave consistency pass)
 
 Fresh-context review against HEAD (e67f788), both suites' sources, TODO-main.md,
@@ -191,8 +208,12 @@ software lists; the ubuntu list re-checked at reconciliation):
   that audit; a quick scan shows only bash-3.2-era constructs (indexed arrays,
   `+=()`, process substitution). Expect-to-pass; CI confirms.
 
-Assumed (to verify at implementation time): `actions/checkout@v5` and
-`actions/upload-artifact@v4` are the current majors; the bare `macos-15`
+Action majors verified 2026-06-11 against the releases pages:
+`actions/checkout@v6` (latest v6.0.3) and `actions/upload-artifact@v7`
+(latest v7.0.1) are current; `include-hidden-files` (default **false** since
+upload-artifact v4.4) is available and is required here, because the
+integration suite's primary diagnostics live under the scratch repo's
+`.git/`. Still assumed: the bare `macos-15`
 label's architecture (arm64 vs x64 — immaterial to this tool either way);
 fractional `sleep` (`sleep 0.05`) works on macOS (BSD sleep accepts decimals —
 high confidence, but exercised only via CI).
@@ -284,14 +305,14 @@ jobs:
       fail-fast: false               # an OS-specific failure is the signal we want; let the others finish
       matrix:
         os: [ubuntu-24.04, macos-15, windows-2025]
-    timeout-minutes: ${{ matrix.os == 'windows-2025' && 45 || 20 }}
+    timeout-minutes: ${{ matrix.os == 'windows-2025' && 65 || 40 }}   # backstop only: sum of step budgets + upload headroom
     defaults:
       run:
         shell: bash                  # on windows-2025 this is Git Bash (MINGW) — what the interop suite requires
     env:
       GCL_TEST_FULL: 1               # full fan-out — CI runners are dedicated; the reduced default protects live dev boxes (TODO 58)
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Toolchain versions (for reconstructing failures)
         run: |
@@ -306,6 +327,7 @@ jobs:
           stat --version 2>/dev/null | head -1 || echo "stat: BSD variant"
 
       - name: Unit suite
+        timeout-minutes: ${{ matrix.os == 'windows-2025' && 35 || 15 }}   # a step timeout FAILS the step, so the upload step reliably runs
         env:
           GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/unit
         run: |
@@ -314,6 +336,7 @@ jobs:
 
       - name: Interop suite (bash + pwsh)
         if: ${{ !cancelled() }}      # run even if an earlier suite failed — every signal is useful
+        timeout-minutes: ${{ matrix.os == 'windows-2025' && 12 || 10 }}
         env:
           GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/interop
         run: |
@@ -322,6 +345,7 @@ jobs:
 
       - name: Integration suite (real concurrent commits)
         if: ${{ !cancelled() }}
+        timeout-minutes: ${{ matrix.os == 'windows-2025' && 12 || 10 }}
         env:
           GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/integration
         run: |
@@ -329,11 +353,12 @@ jobs:
           bash git-commit-lock.integration.test.sh 2>&1 | tee test-output/integration-suite.log
 
       - name: Upload failure diagnostics
-        if: ${{ failure() || cancelled() }}   # cancelled() covers a timeout-minutes kill
-        uses: actions/upload-artifact@v4
+        if: ${{ failure() || cancelled() }}   # failure() covers step timeouts (they fail the step); cancelled() is best-effort cover for manual cancels / the job-level backstop
+        uses: actions/upload-artifact@v7
         with:
           name: test-logs-${{ matrix.os }}
           path: test-output/
+          include-hidden-files: true   # the integration suite's key diagnostics (lock log, repo state) live under the scratch repo's .git/ — excluded by default since upload-artifact v4.4; contents are suite-generated, no secrets
           if-no-files-found: warn
           retention-days: 14
 
@@ -341,7 +366,7 @@ jobs:
     runs-on: ubuntu-24.04            # static analysis is OS-independent; one fast leg (see Lint job below)
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: shellcheck (gate at warning severity)
         run: |
@@ -383,21 +408,26 @@ Design decisions and justifications:
   *required* status checks is ever enabled, path-filtered workflows leave the
   check pending and block merges — no branch protection exists on this repo
   today, so this is a note, not a problem.
-- **`timeout-minutes` 20 (Linux/macOS) / 45 (Windows)** — raised from the
-  original 15/30 because the matrix now runs THREE suites and the unit suite
-  has tripled in assertions since the original measurement. Budget = expected
-  runtime + one full internal hang + margin. Expected: a few minutes total on
-  Linux/macOS; Windows worst-case measured 20m10s + 3m01s + 2m52s ≈ 26 min on a
-  pathologically loaded box (an idle windows-2025 runner should beat that
-  comfortably — the same box did the integration suite in 67–85 s under normal
-  load — but Windows process spawn is the slow axis and the three suites
-  together spawn ~300+ processes). The suites' own `AGENT_LOCK_MAX_WAIT` caps
-  bound a single pathological hang at 7 min (4 min in integration) before the
-  suite fails itself — so 20/45 covers normal runtime plus one such hang, while
-  still killing a doubly-wedged job. On a timeout-kill, the `cancelled()`
-  condition still uploads the partial `tee` logs. **Revisit downward after the
-  performance pass (TODO 53–56) lands and after observing real runner times** —
-  don't tighten on predictions.
+- **Timeouts are per-STEP, with the job level as backstop only.** A job-level
+  `timeout-minutes` *cancels* the job when it fires, and a cancelled job does
+  not reliably run later steps — so hanging a "upload the partial logs"
+  guarantee off a job timeout is wrong. Instead each suite step carries its
+  own `timeout-minutes`; a step timeout FAILS the step (it does not cancel the
+  job), so `failure()` reliably triggers the diagnostics upload with the
+  partial `tee` logs. The job-level value (40 Linux/macOS / 65 Windows = sum
+  of step budgets + upload headroom) remains only as a backstop against a
+  wedged runner; if IT fires, the upload is best-effort (`cancelled()`).
+  Step sizing: budget = expected runtime + one full internal hang + margin.
+  Expected: a few minutes per suite on Linux/macOS; Windows worst-case
+  measured 20m10s + 3m01s + 2m52s ≈ 26 min total on a pathologically loaded
+  box (an idle windows-2025 runner should beat that comfortably — the same box
+  did the integration suite in 67–85 s under normal load — but Windows process
+  spawn is the slow axis and the three suites together spawn ~300+ processes).
+  The suites' own `AGENT_LOCK_MAX_WAIT` caps bound a single pathological hang
+  at 7 min (4 min in integration) before the suite fails itself — hence unit
+  15/35, interop and integration 10/12 (Linux+macOS/Windows). **Revisit
+  downward after the performance pass (TODO 53–56) lands and after observing
+  real runner times** — don't tighten on predictions.
 - **`shell: bash` everywhere**: GitHub's bash steps run `bash -eo pipefail`, so
   the `… | tee …` pipelines propagate suite failure correctly; on Windows this
   is Git Bash/MINGW — the exact environment the interop suite's header
@@ -410,13 +440,15 @@ Design decisions and justifications:
   (unit T1's 8×25 ≈ 200 bash spawns, the interop and integration swarms) are
   CI-strength exclusion canaries, but agents run the suites routinely during
   development on a live shared machine, and full fan-out there lags the whole
-  box. The suites are being changed (TODO 58, lands before or with this
-  workflow) to default to REDUCED fan-out (~1/8 the spawn load, still a real
-  exclusion signal) and run full strength only under `GCL_TEST_FULL=1`. CI is
-  the dedicated environment, so the job sets the flag; each suite prints which
-  mode ran, so a reduced local pass can never masquerade as the full canary.
-  The budgets and measured runtimes in this plan are full-strength numbers and
-  stay valid for CI.
+  box. The suites are being changed (TODO 58) to default to REDUCED fan-out
+  (~1/8 the spawn load, still a real exclusion signal) and run full strength
+  only under `GCL_TEST_FULL=1`. CI is the dedicated environment, so the job
+  sets the flag from day one — and the landing order doesn't matter: today
+  full strength IS the default, so the env var is an inert no-op until TODO 58
+  lands, and carrying it now means a later landing can't silently weaken CI.
+  Each suite prints which mode ran, so a reduced local pass can never
+  masquerade as the full canary. The budgets and measured runtimes in this
+  plan are full-strength numbers and stay valid for CI.
 - **Per-suite preserve dirs** (`failed-work/unit|interop|integration`): the
   unit and integration suites copy their work dir's *contents* flat into the
   target while the interop suite copies the dir *itself* — distinct parents
@@ -424,7 +456,9 @@ Design decisions and justifications:
 - **Logging/diagnosability**: full suite stdout tee'd to `test-output/*.log`;
   failed runs additionally preserve every per-test lock log via
   `GCL_TEST_PRESERVE_DIR` (all three suites); the versions step pins down the
-  exact toolchain; artifacts named per-OS, kept 14 days. Together that's
+  exact toolchain; artifacts named per-OS, kept 14 days, **hidden paths
+  included** (`include-hidden-files: true` — the integration scratch repo's
+  `.git/` holds the lock log and history that ARE the diagnosis). Together that's
   enough to reconstruct a remote timing flake: which worker held the lock
   when, who stole what, and on which bash/pwsh/OS.
 
