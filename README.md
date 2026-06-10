@@ -6,8 +6,19 @@ once, their `git add` / `git commit` commands can race on `.git/index.lock` or
 interleave staging operations. `commit-lock` serialises only the stage+commit
 step; the caller still decides exactly which paths or hunks to stage.
 
+buries the lede. serialize the state+commit step, like the name "commit lock" is misleading. sounds like git already has a lock here index.lock. `flock`-free doesn't seem important enough to be in the first sentence
+
+
+
+
 It is the only automated piece of the shared-checkout commit story — *what* to
 stage and commit is still done manually by the caller, under the lock.
+
+that's not true is it. we don't know what else the user has automated.
+
+
+
+
 
 ## When this makes sense
 
@@ -46,6 +57,9 @@ avoid `git add -A`, `git commit -a`, and `git stash` in shared checkouts.
 
 Coordination boundaries:
 
+it's not coordination boundaries it's alternative approaches. this seems too high. we should put this more towards the end
+
+
 - [Git worktrees][git-worktree] give each agent its own working directory,
   `HEAD`, and index. Claude Code, Codex, and Cursor all document worktree-based
   agent flows: [Claude Code worktrees][claude-worktrees],
@@ -74,6 +88,8 @@ other**:
 If you want agents to use the lock consistently, add the suggested wording below
 to your user or project instructions (`AGENTS.md`, `CLAUDE.md`, Cursor rules,
 etc.). Full design/rationale: [`docs/commit-lock.md`](docs/commit-lock.md).
+
+
 
 ## Install
 
@@ -191,6 +207,10 @@ Run both from Windows Git Bash/MSYS2 bash, **not** WSL — both sides must agree
 on the `C:/...` lock path. The interop suite needs `pwsh` and `git-bash` on
 `PATH`. The suites use throwaway temp dirs and never touch the repo you launch
 them from.
+
+
+this is very confusing, why have you assumed windows
+
 
 [git-worktree]: https://git-scm.com/docs/git-worktree
 [claude-worktrees]: https://code.claude.com/docs/en/worktrees
