@@ -208,3 +208,22 @@ agree on high codes. suggest document in repo documentation, not agent instructi
     only applies to the interop suite. (docs#9.)
 
 also delete html comment at top of doc
+
+## Linting (baselines run 2026-06-10 on pre-fix-wave files; final pass after the wave)
+
+48. **[MINOR]** shellcheck (0.11.0): 3 warnings across the five shell scripts —
+    2× SC2155 (declare-and-assign masks the command's exit status) and 1×
+    SC2034 (unused variable); ~40 info/style notes (SC2015 `A && B || C`,
+    SC2310/SC2312 errexit-interaction notes) deserve one review pass given the
+    tool's errexit-sensitive nature. Fix warnings; triage info-level
+    deliberately (suppress with directives + rationale where the pattern is
+    intentional).
+49. **[MINOR]** PSScriptAnalyzer (1.25.0): 10× PSAvoidUsingEmptyCatchBlock —
+    all deliberate swallow-and-continue sites; add SuppressMessage
+    attributes/justifications rather than changing behaviour. 1×
+    PSUseBOMForUnicodeEncodedFile — same encoding issue as item 10; whichever
+    of em-dash-removal/BOM the fix wave lands, make the analyzer clean.
+    Add both linters as a CI job (gate at warning severity, documented
+    exclusions) — fold into the CI plan reconciliation.
+
+## Mutation-testing results (pending; will append as items 50+)
