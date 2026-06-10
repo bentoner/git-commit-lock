@@ -356,6 +356,17 @@ AGENT_LOCK_DIR="$WORK/src5.lock" AGENT_LOCK_LOG="$LOG" bash -c '
 p12=$!
 wait_for_file "$READY" || bad "T12e shell never signalled ready"
 kill -TERM "$p12" 2>/dev/null
+# Cygwin/MSYS can drop a signal that lands in a fork window (here: bash forking
+# `sleep` right after the marker touch — observed once under heavy load, with
+# the lock release demonstrably complete), so retry while the process survives.
+# Retries cannot mask the regression this test guards: a shell whose lock trap
+# was left armed survives EVERY TERM (the old handler released-and-continued)
+# and still exits 0 after its sleep.
+for _ in 1 2 3; do
+  sleep 0.4
+  kill -0 "$p12" 2>/dev/null || break
+  kill -TERM "$p12" 2>/dev/null
+done
 wait "$p12"; rc=$?
 [ "$rc" = 143 ] && ok "post-release shell dies on TERM (143) — signal disposition restored" \
                 || bad "post-release shell rc=$rc on TERM (want 143; signal-immune shell?)"
