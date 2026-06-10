@@ -192,12 +192,14 @@ high codes that report the lock's own outcomes:
 
 | Exit code | Meaning |
 |-----------|---------|
-| 96 | usage error — bad arguments to the CLI |
+| 96 | usage error — bad arguments, or `run` outside a git repo with `AGENT_LOCK_DIR` unset; the command was never run |
 | 97 | lock acquisition timed out (`AGENT_LOCK_MAX_WAIT`, default 7 minutes) — the command was never run |
 | 98 | lock stolen mid-hold — the command ran but was NOT serialised; verify with `git log` and redo it under the lock |
 
 Anything else is the wrapped command's own exit code; the lock's own failures
-also print a message on stderr. See
+also print a message on stderr. Avoid exiting 96–98 from your own wrapped
+command — those codes are reserved by this contract, and a command exiting 98
+is indistinguishable from a stolen lock. See
 [`docs/git-commit-lock.md`](docs/git-commit-lock.md) for the `AGENT_LOCK_*` config
 knobs and how staleness and stealing work.
 

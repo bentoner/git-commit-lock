@@ -129,10 +129,11 @@ code 98 = lock lost mid-hold, redo.
 
 Source it (`source ~/.local/bin/git-commit-lock.sh`) for:
 
-- `lock_acquire` — block until held (steal-if-stale); fails only on the
-  `AGENT_LOCK_MAX_WAIT` timeout. Arms an EXIT/INT/TERM trap that releases.
-- `lock_release` — release if held (idempotent); fails with a warning if the
-  lock was stolen mid-hold.
+- `lock_acquire` — block until held (steal-if-stale); returns 97 on the
+  `AGENT_LOCK_MAX_WAIT` timeout (and 1 on API misuse, e.g. a reentrant
+  acquire). Arms an EXIT/INT/TERM trap that releases.
+- `lock_release` — release if held (idempotent); returns 98, with a warning,
+  if the lock was stolen mid-hold.
 - `lock_run <cmd...>` — acquire, run the command, always release, propagate its
   exit code. The `run` CLI subcommand is this:
   `git-commit-lock.sh run -- <cmd...>`.
@@ -236,7 +237,8 @@ under many concurrent workers (clean acquire/release path), stale-lock theft,
 the epoch-less-orphan regression, refusal to steal a *live* lock, a robbed
 slow holder detecting the theft and failing on release (plus the thief
 succeeding on its own fresh hold), an uncontended slow holder *not* failing,
-exit-code propagation, and the default git-dir location of the lock and log.
+exit-code propagation, the default git-dir location of the lock and log, and
+per-worktree lock scoping.
 
 `git-commit-lock.interop.test.sh` proves `.ps1` and `.sh` interlock: bash and
 pwsh workers serialise on one lock with zero concurrent-holder violations and
