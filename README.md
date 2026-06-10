@@ -1,5 +1,7 @@
 # commit-lock
 
+can you think about what the right name is? it's more of a staging lock that a commit lock and we should get git into the name, but idk if people will think to search for "git-staging-lock" 
+
 A small mutex that lets several agents **commit from one shared Git checkout
 without tripping over each other**.
 
@@ -26,6 +28,9 @@ Committing from that shared tree is often exactly what you want. When each
 subagent commits its own focused change as it finishes — every revision of a
 plan as review agents iterate on it, each fix from a review/fix cycle — the
 history records how the work evolved, instead of one squashed blob at the end.
+
+should make the examples more about workflows that do uncoupled things in parallel - e.g. generating plans for multiple features in at once - your examples are serial.
+
 `commit-lock` exists to make those concurrent commits safe.
 
 Typical setups:
@@ -92,6 +97,9 @@ installer and invoke the scripts by path from the clone (e.g.
 `path/to/commit-lock/commit-lock.sh`). Installing is only a convenience so
 every checkout can use the same command names.
 
+check that install.sh checks that .local/bin is on the path.
+
+
 ## Usage
 
 Bash — run a command under the lock:
@@ -100,6 +108,8 @@ Bash — run a command under the lock:
 bash ~/.local/bin/commit-lock.sh run -- bash -c '
   git add -- path/you/changed && git commit -m "your message"'
 ```
+
+maybe another example of how to take the lock and then release it later if you want to complicated staging thing while holding the lock. or should this be discouraged. I worry about the ability for lower capability agents to chain multiple git commands successfully and even a more capable agent might want to review a staged commit before releasing the lock.
 
 PowerShell:
 
@@ -121,6 +131,8 @@ how staleness and stealing work.
 Agents only benefit from the lock if their instructions tell them to use it.
 Copy this into the instruction context (`AGENTS.md`, `CLAUDE.md`, Cursor
 rules, etc.) for agents that may share one checkout:
+
+this should def come before usage. this is more interesting for the human than usage which is only for the agent. maybe even earlier. should we also ship a skill?
 
 ````markdown
 ## Shared checkouts: commit lock
