@@ -242,6 +242,12 @@ They use throwaway temp dirs and never touch the repo you launch them from.
 On Windows, run the interop suite from Git Bash/MSYS2 bash, **not** WSL bash,
 so the bash and PowerShell sides resolve the same `C:/...` lock path.
 
+The same three suites run in CI on Linux, macOS, and Windows
+(`.github/workflows/tests.yml`), alongside a shellcheck + PSScriptAnalyzer
+lint job. All three suites copy their logs and work dirs to
+`$GCL_TEST_PRESERVE_DIR` when it is set, and keep the work dir on disk on any
+failure.
+
 ## Licence
 
 [MIT](LICENSE).

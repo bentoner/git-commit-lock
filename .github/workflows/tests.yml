@@ -1,0 +1,119 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitattributes'
+      - '.plans/**'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitattributes'
+      - '.plans/**'
+  schedule:
+    - cron: '17 3 * * 1'   # weekly Monday run: catches runner-image/tool drift
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false               # an OS-specific failure is the signal we want; let the others finish
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    timeout-minutes: ${{ matrix.os == 'windows-2025' && 65 || 40 }}   # backstop only: sum of step budgets + upload headroom
+    defaults:
+      run:
+        shell: bash                  # on windows-2025 this is Git Bash (MINGW) — what the interop suite requires
+    env:
+      GCL_TEST_FULL: 1               # full fan-out — CI runners are dedicated; the reduced default protects live dev boxes (TODO 58)
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Toolchain versions (for reconstructing failures)
+        run: |
+          uname -a
+          bash --version | head -1
+          git --version
+          if command -v pwsh >/dev/null; then
+            pwsh -NoProfile -Command '"pwsh " + $PSVersionTable.PSVersion.ToString()'
+          else
+            echo "pwsh: NOT FOUND (interop suite will skip; integration runs bash-only)"
+          fi
+          stat --version 2>/dev/null | head -1 || echo "stat: BSD variant"
+
+      - name: Unit suite
+        timeout-minutes: ${{ matrix.os == 'windows-2025' && 35 || 15 }}   # a step timeout FAILS the step (not the job), so the upload step reliably runs
+        env:
+          GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/unit
+        run: |
+          mkdir -p test-output
+          bash git-commit-lock.test.sh 2>&1 | tee test-output/unit-suite.log
+
+      - name: Interop suite (bash + pwsh)
+        if: ${{ !cancelled() }}      # run even if an earlier suite failed — every signal is useful
+        timeout-minutes: ${{ matrix.os == 'windows-2025' && 12 || 10 }}
+        env:
+          GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/interop
+        run: |
+          mkdir -p test-output
+          bash git-commit-lock.interop.test.sh 2>&1 | tee test-output/interop-suite.log
+
+      - name: Integration suite (real concurrent commits)
+        if: ${{ !cancelled() }}
+        timeout-minutes: ${{ matrix.os == 'windows-2025' && 12 || 10 }}
+        env:
+          GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/integration
+        run: |
+          mkdir -p test-output
+          bash git-commit-lock.integration.test.sh 2>&1 | tee test-output/integration-suite.log
+
+      - name: Upload failure diagnostics
+        if: ${{ failure() || cancelled() }}   # failure() covers step timeouts (they fail the step); cancelled() is best-effort cover for manual cancels / the job-level backstop
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-logs-${{ matrix.os }}
+          path: test-output/
+          include-hidden-files: true   # the integration suite's key diagnostics (lock log, repo state) live under the scratch repo's .git/ — hidden paths are excluded by default since upload-artifact v4.4; contents are suite-generated, no secrets
+          if-no-files-found: warn
+          retention-days: 14
+
+  lint:
+    runs-on: ubuntu-24.04            # static analysis is OS-independent; one fast leg
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: shellcheck (gate at warning severity)
+        run: |
+          shellcheck --version
+          shellcheck -S warning \
+            git-commit-lock.sh \
+            git-commit-lock.test.sh \
+            git-commit-lock.interop.test.sh \
+            git-commit-lock.integration.test.sh \
+            install.sh
+
+      - name: PSScriptAnalyzer (gate at warning severity)
+        shell: pwsh
+        run: |
+          if (-not (Get-Module -ListAvailable PSScriptAnalyzer)) {
+            # ubuntu-24.04 preinstalls 1.25.0; this fallback fires only if an image bump drops it.
+            Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          }
+          Get-Module -ListAvailable PSScriptAnalyzer | ForEach-Object { "PSScriptAnalyzer $($_.Version)" }
+          $r = Invoke-ScriptAnalyzer -Path ./git-commit-lock.ps1 -Severity Warning,Error
+          if ($r) { $r | Format-Table -AutoSize | Out-String | Write-Host; exit 1 }
+          'PSScriptAnalyzer: clean'
