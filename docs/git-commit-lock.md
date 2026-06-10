@@ -192,9 +192,14 @@ Source it (`source ~/.local/bin/git-commit-lock.sh`) for:
   `AGENT_LOCK_MAX_WAIT` timeout (and 1 on API misuse, e.g. a reentrant
   acquire). Arms an EXIT/INT/TERM trap that releases.
 - `lock_release` — release if held (idempotent); returns 98, with a warning,
-  if the lock was stolen mid-hold; 2 if the token was unreadable at release
-  with the lock dir still present (ownership unverifiable — `run` maps this
-  to 1); 1 if the dir could not be removed (the stale window recovers it).
+  if the lock was stolen mid-hold; 2 if the token was unreadable **or
+  missing** at release with the lock dir still present (ownership
+  unverifiable — neither implementation can prove its own acquire-time token
+  write landed, so a missing token is *not* treated as proof of theft; `run`
+  maps this to 1 only when the command itself succeeded, keeping a failing
+  command's own code; the PowerShell port returns the same verdicts for the
+  same on-disk states); 1 if the dir could not be removed (the stale window
+  recovers it).
 - `lock_run <cmd...>` — acquire, run the command, always release, propagate its
   exit code. The `run` CLI subcommand is this:
   `git-commit-lock.sh run -- <cmd...>`.
@@ -295,11 +300,16 @@ Each suite prints a result summary line and exits 0 when everything passes.
 
 `git-commit-lock.test.sh` covers the bash implementation: mutual exclusion
 under many concurrent workers (clean acquire/release path), stale-lock theft,
-the epoch-less-orphan regression, refusal to steal a *live* lock, a robbed
-slow holder detecting the theft and failing on release (plus the thief
-succeeding on its own fresh hold), an uncontended slow holder *not* failing,
-exit-code propagation, the default git-dir location of the lock and log, and
-per-worktree lock scoping.
+the epoch-less-orphan regression, refusal to steal a *live* lock, the
+sub-floor (FILETIME-zero) mtime floor guard, a robbed slow holder detecting
+the theft and failing on release (plus the thief succeeding on its own fresh
+hold), an uncontended slow holder *not* failing, exit-code propagation,
+release on TERM and on exit-while-holding (signal re-raised, caller's traps
+and exit code preserved), sourced-API hygiene (no strict-mode leak,
+reentrancy refusal, idempotent release), numeric-knob validation, refusal to
+run outside a git repo without `AGENT_LOCK_DIR`, the age-gated litter sweep,
+the missing-token unverifiable-release lane, the default git-dir location of
+the lock and log, and per-worktree lock scoping.
 
 `git-commit-lock.interop.test.sh` proves `.ps1` and `.sh` interlock: bash and
 pwsh workers serialise on one lock with zero concurrent-holder violations and
@@ -317,5 +327,8 @@ history stays linear, no commit sweeps up another worker's file, no
 The suites spawn many short-lived processes (and pwsh startup is slow), so on
 a loaded machine they can take several minutes — allow a generous timeout
 rather than assuming a hang. A worker occasionally failing to *launch* under
-heavy process fan-out is environmental, not a lock failure; the suites score
-exclusion by violations/steals, not by launch counts.
+heavy process fan-out is environmental, not a lock failure — but only the
+interop suite's exclusion test tolerates it (scoring by violations/steals,
+with a minimum-acquired floor so a collapsed fan-out cannot pass vacuously);
+the integration suite is deliberately strict per worker (every worker must
+launch and commit), and the unit suite's counts are exact.
