@@ -58,7 +58,7 @@ dependency on `flock`. Every worktree has its own git dir, so independent
 worktrees get independent locks, while all agents sharing one checkout contend
 on the same lock. A lock held longer than 5 minutes (configurable) is presumed
 crashed and is stolen, so a dead agent can't wedge the others; a holder that
-loses the lock mid-hold finds out at release (exit code 2) rather than
+loses the lock mid-hold finds out at release (exit code 98) rather than
 silently claiming success. Full design and rationale:
 [`docs/git-commit-lock.md`](docs/git-commit-lock.md).
 
@@ -110,10 +110,6 @@ commit lock for the brief moment you stage and commit. Stage only the paths or
 hunks you own. Never use `git add -A`, `git commit -a`, `git commit -am`, or
 `git stash` in a shared checkout.
 
-Use the shell-native lock command for the agent. On Windows, use
-`git-commit-lock.ps1` through `pwsh` rather than a bash wrapper unless you
-know that bash resolves to the same Git and signing environment.
-
 Bash:
 
 ```sh
@@ -122,50 +118,37 @@ bash ~/.local/bin/git-commit-lock.sh run -- bash -c '
   git commit -m "your message"'
 ```
 
-PowerShell:
+PowerShell (on Windows, prefer this over a bash wrapper unless you know bash
+resolves to the same Git and signing environment):
 
 ```powershell
 pwsh -NoProfile -File "$HOME/.local/bin/git-commit-lock.ps1" run "git add -- path/a path/b; if (`$LASTEXITCODE -eq 0) { git commit -m 'your message' }"
 ```
 
-If you want to run the git steps one at a time — for example to review the
-staged diff before committing — source the library and drive the lock
-yourself, keeping the whole hold brief:
-
-```sh
-source ~/.local/bin/git-commit-lock.sh
-lock_acquire || exit 1
-git add -- path/you/changed
-git diff --cached
-git commit -m "your message"
-lock_release
-```
-
-Hold the lock only for stage+commit. Decide what to stage, build patches, run
-tests, and fix hook failures outside the lock. If a commit fails under the
-lock, unstage your paths with `git reset -- <paths>`, release the lock, fix
-the problem, then retry.
-
-If the command exits 2 with the lock-stolen warning, the lock was lost
-mid-hold and the commit was not serialised; check `git log` and redo the
-commit under the lock. Otherwise, inspect stderr and the wrapped command's
-exit code.
+Hold the lock only for the stage+commit: decide what to stage, build patches,
+run tests, and fix hook failures outside it. If a commit fails under the lock,
+unstage with `git reset -- <paths>`, release, fix the problem, then retry.
+Exit code 98 means the lock was lost mid-hold and the commit was NOT
+serialised — check `git log` and redo the commit under the lock.
 
 If a file contains both your changes and someone else's WIP, do not `git add`
-the whole file. Stage only your hunk with `git add -p`, or prepare a patch
-outside the lock and apply it to the index under the lock:
+the whole file. Stage only your hunks (`git add -p`, or prepare a patch
+outside the lock and apply it to the index under the lock):
 
 ```sh
-git diff HEAD -- path/to/file > /tmp/mine.patch
+git diff HEAD -- path/to/file > /tmp/mine.patch   # outside the lock; trim to your hunks
 bash ~/.local/bin/git-commit-lock.sh run -- bash -c '
   git diff --cached --quiet || { echo "index not clean" >&2; exit 1; }
   git apply --cached /tmp/mine.patch &&
   git commit -m "your message"'
 ```
 
-Use a bare `git commit` for index-only commits. Do not use
-`git commit -- <file>` in this case because it re-reads the working tree and
-can pull in someone else's WIP.
+The `git commit` there is deliberately bare (it commits the index). Do not use
+`git commit -- <file>` here: it re-reads the working tree and can pull in
+someone else's WIP.
+
+Details, the sourced API, and the full exit-code table: see the
+git-commit-lock README and `docs/git-commit-lock.md` in its repository.
 ````
 
 ## Usage
@@ -200,13 +183,21 @@ lock_release
 is a lease, and a hold longer than the staleness window (default 5 minutes)
 can be stolen by a waiter. Prepare everything you can outside the lock, and
 never wait on a human while holding it. `lock_acquire` arms an exit trap, so
-the lock is released even if the shell dies mid-hold.
+the lock is released on normal exit and on a handled INT/TERM; if the process
+is killed outright (SIGKILL, a crash, power loss), the trap can't run and the
+stale timeout recovers the lock instead.
 
-The exit code of `run` is the wrapped command's. If it exits 2 with the
-lock-stolen warning, the lock was lost mid-hold and the commit was NOT
-serialised — verify with `git log` and redo. If the lock can't be acquired
-within `AGENT_LOCK_MAX_WAIT` (default 7 minutes), the command isn't run and
-the exit code is 1 with a timeout message on stderr. See
+The exit code of `run` is the wrapped command's, except for three reserved
+high codes that report the lock's own outcomes:
+
+| Exit code | Meaning |
+|-----------|---------|
+| 96 | usage error — bad arguments to the CLI |
+| 97 | lock acquisition timed out (`AGENT_LOCK_MAX_WAIT`, default 7 minutes) — the command was never run |
+| 98 | lock stolen mid-hold — the command ran but was NOT serialised; verify with `git log` and redo it under the lock |
+
+Anything else is the wrapped command's own exit code; the lock's own failures
+also print a message on stderr. See
 [`docs/git-commit-lock.md`](docs/git-commit-lock.md) for the `AGENT_LOCK_*` config
 knobs and how staleness and stealing work.
 
@@ -245,8 +236,8 @@ bash git-commit-lock.integration.test.sh # end-to-end: concurrent real commits i
 
 All three suites print a summary line and exit 0 when everything passes.
 They use throwaway temp dirs and never touch the repo you launch them from.
-On Windows, run them from Git Bash/MSYS2 bash, **not** WSL bash, so the bash
-and PowerShell sides resolve the same `C:/...` lock path.
+On Windows, run the interop suite from Git Bash/MSYS2 bash, **not** WSL bash,
+so the bash and PowerShell sides resolve the same `C:/...` lock path.
 
 ## Licence
 
