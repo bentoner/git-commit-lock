@@ -97,6 +97,8 @@
 #   Invalid numeric values are reported on stderr and replaced by the default
 #   (never a load-time throw).
 
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingEmptyCatchBlock', '',
+    Justification = 'Deliberate throughout: lock-path I/O must never abort the holder. Every swallow is conservative (retry, skip, or fall through to a guarded slow path) and the dir-mtime stale window is the recovery backstop. See docs/git-commit-lock.md.')]
 param(
     [Parameter(Position = 0)]
     [string]$Action,
@@ -165,6 +167,14 @@ if ($env:AGENT_LOCK_LOG) { $script:LockLog = $env:AGENT_LOCK_LOG } else { $scrip
 $script:LockStale   = [int](script:Get-LockNum -Name 'AGENT_LOCK_STALE_SECS' -Raw $env:AGENT_LOCK_STALE_SECS -Default 300)
 $script:LockPoll    = [double](script:Get-LockNum -Name 'AGENT_LOCK_POLL_SECS' -Raw $env:AGENT_LOCK_POLL_SECS -Default 2)
 $script:LockMaxWait = [int](script:Get-LockNum -Name 'AGENT_LOCK_MAX_WAIT' -Raw $env:AGENT_LOCK_MAX_WAIT -Default 420)
+
+# A waiter gives up at MAX_WAIT, so STALE >= MAX_WAIT means waiters time out
+# before a crashed holder's lock could ever be stolen. Warn only in the
+# documented footgun case - STALE raised while MAX_WAIT was left at default;
+# a caller who set BOTH knobs chose the relationship deliberately.
+if (-not $env:AGENT_LOCK_MAX_WAIT -and $script:LockStale -ge $script:LockMaxWait) {
+    [Console]::Error.WriteLine("git-commit-lock: warning - AGENT_LOCK_STALE_SECS ($($script:LockStale)) >= AGENT_LOCK_MAX_WAIT ($($script:LockMaxWait), default): waiters will time out before a stale lock can be stolen; raise AGENT_LOCK_MAX_WAIT too")
+}
 
 # Floor for a PLAUSIBLE lock mtime (epoch secs; 2000-01-01). A freshly created
 # dir can transiently report the Windows FILETIME zero (1601-01-01 -> a NEGATIVE

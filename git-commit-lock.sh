@@ -99,8 +99,10 @@
 #   these; avoid those codes in wrapped commands.)
 #   Sourced API: lock_acquire returns 97 on timeout and 1 on API misuse
 #   (reentrant acquire); lock_release returns 98 if the lease was stolen
-#   mid-hold and 1 if the lock dir could not be removed (stale-window backstop
-#   recovers it).
+#   mid-hold, 2 if the token was unreadable at release with the dir still
+#   present (ownership unverifiable — treat the hold as suspect; `run` maps
+#   this to 1), and 1 if the lock dir could not be removed (stale-window
+#   backstop recovers it).
 #
 # USAGE (two modes; pick one — both keep the critical section tiny)
 #   1. Wrap your git in `run` (auto-releases; exit codes above):
@@ -130,6 +132,7 @@ if [ -n "${AGENT_LOCK_DIR:-}" ]; then _LOCK_DIR_EXPLICIT=1; else _LOCK_DIR_EXPLI
 _LOCK_BASE="${_LOCK_GITDIR:-$(pwd)}"
 
 AGENT_LOCK_DIR="${AGENT_LOCK_DIR:-$_LOCK_BASE/commit.lock}"
+if [ -n "${AGENT_LOCK_MAX_WAIT:-}" ]; then _LOCK_MAXWAIT_EXPLICIT=1; else _LOCK_MAXWAIT_EXPLICIT=0; fi
 AGENT_LOCK_STALE_SECS="${AGENT_LOCK_STALE_SECS:-300}"
 AGENT_LOCK_POLL_SECS="${AGENT_LOCK_POLL_SECS:-2}"
 AGENT_LOCK_MAX_WAIT="${AGENT_LOCK_MAX_WAIT:-420}"
@@ -159,10 +162,12 @@ AGENT_LOCK_POLL_SECS="$(_lock_check_num AGENT_LOCK_POLL_SECS "$AGENT_LOCK_POLL_S
 AGENT_LOCK_MAX_WAIT="$(_lock_check_num AGENT_LOCK_MAX_WAIT "$AGENT_LOCK_MAX_WAIT" 420 int)"
 
 # A waiter gives up at MAX_WAIT, so if STALE >= MAX_WAIT every waiter times
-# out before a crashed holder's lock could ever be stolen. Warn — this is
-# almost always a misconfiguration (tests excepted).
-if [ "$AGENT_LOCK_STALE_SECS" -ge "$AGENT_LOCK_MAX_WAIT" ]; then
-  echo "git-commit-lock: warning — AGENT_LOCK_STALE_SECS ($AGENT_LOCK_STALE_SECS) >= AGENT_LOCK_MAX_WAIT ($AGENT_LOCK_MAX_WAIT): waiters will time out before a stale lock can be stolen" >&2
+# out before a crashed holder's lock could ever be stolen. Warn only in the
+# documented footgun case — STALE raised for a slow hold while MAX_WAIT was
+# left at its default. A caller who set BOTH knobs chose the relationship
+# deliberately (test suites do this constantly).
+if [ "$_LOCK_MAXWAIT_EXPLICIT" = 0 ] && [ "$AGENT_LOCK_STALE_SECS" -ge "$AGENT_LOCK_MAX_WAIT" ]; then
+  echo "git-commit-lock: warning — AGENT_LOCK_STALE_SECS ($AGENT_LOCK_STALE_SECS) >= AGENT_LOCK_MAX_WAIT ($AGENT_LOCK_MAX_WAIT, default): waiters will time out before a stale lock can be stolen; raise AGENT_LOCK_MAX_WAIT too" >&2
 fi
 
 _LOCK_HELD=0
@@ -413,10 +418,20 @@ lock_release() {
     cur="$(_lock_cur_token)"
   fi
   if [ "$cur" != "$_LOCK_TOKEN" ]; then
+    _lock_restore_traps
+    if [ -z "$cur" ] && [ -d "$AGENT_LOCK_DIR" ]; then
+      # Token unreadable (after retries) but the dir is still present: this is
+      # transient I/O, not a proven theft — a real steal renames the dir, so a
+      # successful read would return a DIFFERENT token. We cannot verify
+      # ownership either way: leave the dir (the mtime backstop recovers it)
+      # and fail distinctly. Mirrors the ps1's unreadable-token lane.
+      _lock_log "WARNING: token unreadable at release while lock dir present; ownership unverifiable. Leaving dir. (ours=$_LOCK_TOKEN)"
+      echo "git-commit-lock: WARNING — could not re-read the lock token at release (dir still present). Ownership unverifiable; lock dir left in place. Verify with 'git log'." >&2
+      return 2
+    fi
     # Our lease expired and the lock was stolen (and possibly re-acquired by
     # someone else). Do NOT delete the dir — it may be a successor's LIVE lock.
     # Loudly report that this hold was not exclusive.
-    _lock_restore_traps
     _lock_log "WARNING: lock LOST before release (held longer than ${AGENT_LOCK_STALE_SECS}s stale window; stolen). This commit was NOT exclusive — redo it. (ours=$_LOCK_TOKEN now=${cur:-<none>})"
     echo "git-commit-lock: WARNING — lock was stolen mid-hold (held > ${AGENT_LOCK_STALE_SECS}s). Your commit was NOT serialised; verify with 'git log' and redo under the lock." >&2
     return 98
@@ -468,6 +483,12 @@ lock_run() {
   lock_release || rel=$?
   if [ "$rel" -eq 98 ]; then
     return 98
+  fi
+  if [ "$rel" -eq 2 ]; then
+    # Ownership unverifiable at release (token unreadable, dir present):
+    # not a proven theft, but not a verified-exclusive hold either. Fail
+    # with 1 (parity with the ps1 run path) rather than report success.
+    return 1
   fi
   return "$rc"
 }

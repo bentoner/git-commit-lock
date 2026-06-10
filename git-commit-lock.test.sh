@@ -138,10 +138,14 @@ echo "== Test 4b: a ROBBED slow holder detects the theft and FAILS with 98 on re
 # its lock (Test 4c). Regression guard for the lease bug found in review
 # 2026-05-31; would fail if lock_release skipped the token check.
 LOCK="$WORK/robbed.lock"; LOG="$WORK/robbed.log"; : > "$LOG"; OUT="$WORK/robbed-out"; : > "$OUT"
-READY="$WORK/t4b.ready"
-# Victim: stale=1s but holds ~4s, so its lease expires while it works.
+READY="$WORK/t4b.ready"; TDONE="$WORK/t4b.thief-done"
+# Victim: stale=1s; holds until the test says the thief is done (marker, not a
+# fixed sleep — under heavy load a slow-starting thief once arrived AFTER a 4s
+# victim had already released, vacuously failing the theft assertions). The
+# lease still goes stale 1s in while the victim waits, enabling the steal.
 AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 \
-  bash "$LIB" run -- bash -c 'echo victim-work >> "$1"; touch "$2"; sleep 4' _ "$OUT" "$READY" &
+  bash "$LIB" run -- bash -c 'echo victim-work >> "$1"; touch "$2"; until [ -e "$3" ]; do sleep 0.1; done' \
+  _ "$OUT" "$READY" "$TDONE" &
 vpid=$!
 wait_for_file "$READY" || bad "T4b victim never signalled ready"
 # Thief: polls until the victim's lease goes stale (>=1s), then steals.
@@ -149,6 +153,7 @@ AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
   AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=30 \
   bash "$LIB" run -- bash -c 'echo thief-work >> "$1"' _ "$OUT"
 thief_rc=$?
+touch "$TDONE"
 wait "$vpid"; victim_rc=$?
 [ "$victim_rc" = 98 ] && ok "robbed holder exits exactly 98 (stolen mid-hold)" \
                       || bad "robbed holder rc=$victim_rc (contract says exactly 98)"
@@ -200,22 +205,33 @@ bash "$LIB" run >/dev/null 2>&1;        [ "$?" = 96 ] && ok "run with no command
 bash "$LIB" run -- >/dev/null 2>&1;     [ "$?" = 96 ] && ok "run -- with no command -> 96" || bad "run -- rc=$? (want 96)"
 
 echo "== Test 8: acquire timeout exits 97 and the command NEVER runs =="
-LOCK="$WORK/tmo.lock"; LOG="$WORK/tmo.log"; : > "$LOG"; READY="$WORK/t8.ready"
+LOCK="$WORK/tmo.lock"; LOG="$WORK/tmo.log"; : > "$LOG"; READY="$WORK/t8.ready"; DONE8="$WORK/t8.done"
+# Holder keeps the lock until the test says so (marker, not a fixed sleep —
+# under heavy load a slow-starting waiter once arrived AFTER a 4s holder had
+# released and acquired cleanly, vacuously failing every timeout assertion).
 AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=300 \
   AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=60 \
-  bash "$LIB" run -- bash -c 'touch "$1"; sleep 4' _ "$READY" &
+  bash "$LIB" run -- bash -c 'touch "$1"; until [ -e "$2" ]; do sleep 0.1; done' _ "$READY" "$DONE8" &
 h8=$!
 wait_for_file "$READY" || bad "T8 holder never signalled ready"
-# Waiter gives up after 1s against the live 4s holder. STALE(300) >= MAX_WAIT(1)
-# here also exercises the misconfiguration warning (asserted below).
+# Waiter gives up after 1s against the live held lock.
 AGENT_LOCK_DIR="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=300 \
   AGENT_LOCK_POLL_SECS=0.2 AGENT_LOCK_MAX_WAIT=1 \
   bash "$LIB" run -- bash -c 'echo ran > "$1"' _ "$WORK/t8.ran" 2> "$WORK/t8.err"; rc=$?
+touch "$DONE8"
 [ "$rc" = 97 ] && ok "timed-out waiter exits exactly 97" || bad "timed-out waiter rc=$rc (want 97)"
 [ -e "$WORK/t8.ran" ] && bad "command ran despite acquire timeout" || ok "command never ran on timeout"
 grep -q "timed out" "$WORK/t8.err" && ok "timeout reported on stderr" || bad "no timeout message on stderr"
-grep -q "AGENT_LOCK_MAX_WAIT" "$WORK/t8.err" && ok "STALE >= MAX_WAIT misconfiguration warned on stderr" \
-                                             || bad "no STALE >= MAX_WAIT warning on stderr"
+# The STALE >= MAX_WAIT advisory is GATED: it fires only when STALE was raised
+# while MAX_WAIT was left at its default (the documented footgun). The waiter
+# above set BOTH knobs deliberately, so it must NOT have warned; an uncontended
+# run with only STALE raised (500 >= default 420) must warn.
+grep -q "raise AGENT_LOCK_MAX_WAIT" "$WORK/t8.err" && bad "warning fired though both knobs were explicit" \
+                                                   || ok "no misconfiguration warning when both knobs explicit"
+AGENT_LOCK_DIR="$WORK/warn.lock" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=500 \
+  bash "$LIB" run -- true 2> "$WORK/t8.warn.err"
+grep -q "raise AGENT_LOCK_MAX_WAIT" "$WORK/t8.warn.err" && ok "STALE raised over default MAX_WAIT warns on stderr" \
+                                                        || bad "no warning when STALE >= default MAX_WAIT"
 wait "$h8"; [ "$?" = 0 ] && ok "holder unaffected by the timed-out waiter" || bad "holder rc=$? (want 0)"
 
 echo "== Test 9: sub-floor (pre-2000) dir mtime is NOT treated as stale =="
