@@ -448,7 +448,15 @@ n_ps="$(grep -c 'ignoring invalid' "$WORK/frac-ps.err")"
 # gate the same env var would configure DIFFERENT poll intervals across the
 # two impls (e.g. POLL_SECS=1e3: bash rejects -> default 2s; an ungated parse
 # accepts -> one poll every 1000s). Both impls must reject these identically.
-for v in 1e3 +2; do
+# Also pinned (round-2 review findings 2/3): a TRAILING-NEWLINE value ($'5\n'
+# — .NET's $ matches before a final newline and TryParse tolerates trailing
+# whitespace, so an unanchored ps1 gate accepted what bash rejects) and a
+# WHITESPACE-ONLY value ('   ' — non-empty, so bash notes it; ps1's old
+# IsNullOrWhiteSpace early-return silently defaulted instead). Contract:
+# EMPTY => silent default in both; whitespace-only / any other non-empty
+# invalid => note + default in both.
+for v in 1e3 +2 '   ' $'5\n'; do
+  vl="$(printf '%q' "$v")"   # display label: keeps newline/space values on one line
   AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_POLL_SECS="$v" \
     bash "$SH" run -- bash -c 'true' 2> "$WORK/poll-sh.err"; rc_sh=$?
   n_sh="$(grep -c 'ignoring invalid AGENT_LOCK_POLL_SECS' "$WORK/poll-sh.err")"
@@ -456,11 +464,23 @@ for v in 1e3 +2; do
     pwsh -NoProfile -File "$PS1WIN" run "exit 0" 2> "$WORK/poll-ps.err"; rc_ps=$?
   n_ps="$(grep -c 'ignoring invalid AGENT_LOCK_POLL_SECS' "$WORK/poll-ps.err")"
   if [ "$rc_sh" = 0 ] && [ "$n_sh" = 1 ] && [ "$rc_ps" = 0 ] && [ "$n_ps" = 1 ]; then
-    ok "POLL_SECS='$v' rejected with a note + default by BOTH impls"
+    ok "POLL_SECS=$vl rejected with a note + default by BOTH impls"
   else
-    bad "POLL_SECS='$v': sh rc=$rc_sh notes=$n_sh; pwsh rc=$rc_ps notes=$n_ps (want rc 0 + 1 note each)"
+    bad "POLL_SECS=$vl: sh rc=$rc_sh notes=$n_sh; pwsh rc=$rc_ps notes=$n_ps (want rc 0 + 1 note each)"
   fi
 done
+# The EMPTY boundary of that contract: set-but-empty means "use the default"
+# SILENTLY in both impls (bash's ${VAR:-} fills it before the validator ever
+# runs; ps1's IsNullOrEmpty early-return mirrors that) - no note, rc 0.
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_POLL_SECS= \
+  bash "$SH" run -- bash -c 'true' 2> "$WORK/poll-sh.err"; rc_sh=$?
+n_sh="$(grep -c 'ignoring invalid' "$WORK/poll-sh.err")"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_POLL_SECS= \
+  pwsh -NoProfile -File "$PS1WIN" run "exit 0" 2> "$WORK/poll-ps.err"; rc_ps=$?
+n_ps="$(grep -c 'ignoring invalid' "$WORK/poll-ps.err")"
+[ "$rc_sh" = 0 ] && [ "$n_sh" = 0 ] && [ "$rc_ps" = 0 ] && [ "$n_ps" = 0 ] \
+  && ok "POLL_SECS='' (empty): silent default in BOTH impls (no note)" \
+  || bad "POLL_SECS='' parity: sh rc=$rc_sh notes=$n_sh; pwsh rc=$rc_ps notes=$n_ps (want rc 0 + 0 notes each)"
 
 if [ "$GCL_WINDOWS" = 1 ]; then
 

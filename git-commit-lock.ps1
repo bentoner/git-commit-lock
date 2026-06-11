@@ -209,22 +209,29 @@ function script:Get-LockGitDir {
 function script:Get-LockNum {
     param([string]$Name, [string]$Raw, [double]$Default, [switch]$IntegerOnly)
     Set-StrictMode -Off
-    if ([string]::IsNullOrWhiteSpace($Raw)) { return $Default }
+    # EMPTY (or unset) means "use the default", silently - exactly like
+    # git-commit-lock.sh's ${VAR:-default}. Whitespace-only is NOT empty
+    # there (it reaches the validator and earns the stderr note), so it must
+    # fall through to the shape gates below, not early-return here.
+    if ([string]::IsNullOrEmpty($Raw)) { return $Default }
     $val = 0.0
     $ok = [double]::TryParse($Raw, [System.Globalization.NumberStyles]::Float,
         [System.Globalization.CultureInfo]::InvariantCulture, [ref]$val)
     # Integer knobs (STALE_SECS / MAX_WAIT) take plain digit strings only,
     # exactly like git-commit-lock.sh's validator: a fractional stale window
     # would otherwise be silently rounded here but rejected there - same
-    # input, different steal threshold across the two impls.
-    if ($IntegerOnly -and $Raw -notmatch '^[0-9]+$') { $ok = $false }
+    # input, different steal threshold across the two impls. Anchors are
+    # \A..\z, not ^..$: .NET's $ also matches BEFORE a trailing newline (and
+    # TryParse tolerates trailing whitespace), so "5\n" would configure this
+    # side while bash rejects it - same env var, different knob values.
+    if ($IntegerOnly -and $Raw -notmatch '\A[0-9]+\z') { $ok = $false }
     # The fractional knob (POLL_SECS) takes the same raw shape as
     # git-commit-lock.sh's grammar: digits with at most one dot and at least
     # one digit (e.g. "2", "0.5", ".5"). TryParse(Float) alone is WIDER - it
     # accepts exponents ("1e3" = 1000s between polls!), signs ("+2") and
-    # leading whitespace, all of which bash rejects, so the same env var
-    # would configure different poll intervals across the two impls.
-    if (-not $IntegerOnly -and $Raw -notmatch '^(?=.*[0-9])[0-9]*\.?[0-9]*$') { $ok = $false }
+    # leading/trailing whitespace, all of which bash rejects, so the same
+    # env var would configure different poll intervals across the two impls.
+    if (-not $IntegerOnly -and $Raw -notmatch '\A(?=.*[0-9])[0-9]*\.?[0-9]*\z') { $ok = $false }
     if (-not $ok -or $val -le 0) {
         $want = 'positive number'; if ($IntegerOnly) { $want = 'positive integer' }
         [Console]::Error.WriteLine("git-commit-lock: ignoring invalid $Name='$Raw' (want a $want); using default $Default")
