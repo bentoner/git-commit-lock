@@ -1,6 +1,6 @@
 # Plan: claim-serialized stealing (claim-is-the-next-lock + atomic rename-over)
 
-Status: DRAFT v6 — round-5 findings folded; awaiting confirmation review.
+Status: DRAFT v7 — round-6 findings folded; final confirmation.
 
 ## Goal
 
@@ -10,7 +10,8 @@ stale lock you must first win an O_EXCL claim file; the claim file carries your
 own token and *becomes* the new lock via one atomic rename-over. This
 **prevents** the displaced-live race (a straggler stealing the recovery
 winner's fresh lock) that wave 1 (`2843d4e`, `4e3f890`) could only detect and
-repair. (Prevention is scoped, not absolute: live processes are fully covered,
+repair. (Prevention is scoped, not absolute: processes actively inside an
+acquire/hold/release arc are fully covered,
 trappable exits clean up after themselves best-effort — a trap-time blocked
 unlink joins the same bounded residual class — and one untrappable-death
 residual is deliberately accepted — see residual 5 in the residual
@@ -206,26 +207,36 @@ orphan walk through 4(a)). The per-position mentions throughout this plan
 therefore remain only as *illustration* of where hits occur; the rule itself
 is position-blind. Cost: one extra read per abort path, all of which already
 read files. This rule plus the leaked-token memory is what makes "no unowned
-orphan **from a live process**" structural rather than per-lane: whichever
-claim file gets installed at the lock path, its token's live owner takes SOME
-exit path, and the final discovery read on that path, the memory's per-poll
-check, or — for a leaker whose acquire has since succeeded on another token —
-the memory's release-path cleanup finds ownership; every other party reads a
-foreign token and backs off. Trappable exits clean up via the trap-time rule
+orphan from a process **actively inside an acquire/hold/release arc**"
+structural rather than per-lane: whichever claim file gets installed at the
+lock path, its token's owner — while inside the arc — takes SOME exit path,
+and the final discovery read on that path, the memory's per-poll check, or —
+for a leaker whose acquire has since succeeded on another token — the
+memory's release-path branch finds ownership; every other party reads a
+foreign token and backs off. The arc scoping is load-bearing: all three
+mechanisms run only between the start of an acquire and the end of its
+release — a leaker whose arc has ENDED (97, clean release, or death) with
+entries pending has no mechanism left running (round-6 walk: B leaks L,
+releases cleanly, lives on between acquires; a suspended rival installs L
+afterwards — none of the three can fire) — those pending entries are
+residual 5's extended class, recovered by the owner's next acquire adopting
+the token or by staleness. Trappable exits clean up via the trap-time rule
 (best-effort — its blocked-unlink case joins residual 5's bounded class);
 untrappable death leaves the inventoried bounded residual (residual 5).
 
-**Leaked-token memory (global rule; closes every live-process lane the
-one-shot read cannot).** Each acquire keeps an in-process list of **leaked
+**Leaked-token memory (global rule; closes every in-arc live-process lane
+the one-shot read cannot).** Each acquire keeps an in-process list of **leaked
 attempt tokens**: tokens whose claim file was left in place without a
 verifiable unlink. Exactly three exits append to it — the step-3.1
 recheck-unreadable outcome, and the token-checked deletion's
 read-unreadable and unlink-blocked-while-present outcomes. While the list
 is non-empty, **every poll that observes a lock at the lock path also reads
 its line 1**; a LISTED token there ⇒ that leaked claim of ours was installed
-by a rival's rename ⇒ adopt that token as the hold token and proceed to the
-acquire read-back verification (HOLD). An entry is removed only when the
-leak resolves verifiably: a verified unlink of the claim, or an observation
+by a rival's rename ⇒ adopt that token as the hold token — adoption DROPS
+the entry (the leaked claim became our lock; the leak is resolved) — and
+proceed to the acquire read-back verification (HOLD). An entry is removed
+only when the leak resolves verifiably: adoption as above, a verified
+unlink of the claim, or an observation
 that the claim path is gone or foreign-tokened — that observation followed
 by one lock-path line-1 read (the one-shot discovery pattern: gone-from-
 `.next` may mean installed-at-lock) before the entry is dropped. Soundness:
@@ -248,16 +259,38 @@ claim. Wiring: **during the hold** there is no new polling (the holder is
 not in a loop); the set just rides along. **At release**, the existing
 token verification gains one branch: if the lock's line 1 is not our hold
 token but IS a member of our leaked set, the installed file is — by
-per-attempt token uniqueness — OUR leaked claim: unlink it (we own it;
-this cleans the orphan immediately, no STALE stall), classify the release
-as the existing stolen-mid-hold verdict (**98** — our actual hold WAS
-displaced; the caller's command must be redone), and log the leaked-claim
-cleanup. A leaked-set member found at the lock during a LATER acquire
-attempt by the same process keeps the adoption semantics above (HOLD).
-Entry lifetime: entries drop on verifiable resolution (as above);
-otherwise they live until process exit. A process that exits (97) or dies
-with entries pending leaves those claims to the staleness backstops — the
-same bounded class as residual 5. (Rejected alternative, from round 5:
+per-attempt token uniqueness — OUR leaked claim. The cleanup unlink
+inherits the ours-path release mitigations (round-6 fold; Codex's walk: an
+installed L can be instantly stale — residual 3 — so a successor can steal
+L and install its own lock between our leaked-token read and our unlink,
+which a naive unlink would delete): perform the same immediately-before-
+unlink re-read the ours-path does (the sh:909-911 class); if the re-read
+no longer shows the leaked token (a successor stole or replaced it — under
+this protocol the successor's rename destroys L, resolving the leak) → do
+NOT unlink, drop the entry, classification unchanged; if it still shows
+the leaked token → unlink it (we own it; best-effort cleanup — usually the
+orphan is gone immediately, but not guaranteed), with the ours-path's
+bounded-retry + LEFTOVER-warning behavior on a blocked unlink. Either way
+classify the release as the existing stolen-mid-hold verdict (**98** — our
+actual hold WAS displaced; the caller's command must be redone) and log
+the leaked-claim cleanup. The remaining read→unlink boundary gap (a
+successor's steal landing inside it) is inventoried as the SAME residual
+class as the existing release boundary gap (see the implementation
+headers' probe-D1 / boundary-gap discussion), detected at the successor's
+read-back. A leaked-set member found at the lock during a LATER acquire
+attempt by the same process keeps the adoption semantics above (HOLD,
+entry dropped). **Arc-end resolution pass** (round-6 narrowing): at
+release — and at the 97 exit — perform one best-effort token-checked
+resolution pass over each still-pending entry's CLAIM file (the blocking
+handle may have closed by then): a verified unlink or a gone/foreign
+observation (plus the one-shot lock read) resolves the entry; any failure
+leaves it pending — no waiting, no retry loop. Entry lifetime: entries
+drop on verifiable resolution (as above); otherwise they live until
+process exit, and a leaked token left installed at the lock path can still
+be adopted by this process's NEXT acquire. Entries still pending when the
+arc ends — 97, clean release, or death — leave those claims to the
+next-acquire adoption and the staleness backstops, the same bounded class
+as residual 5. (Rejected alternative, from round 5:
 blocking a successful acquire's return until every leaked entry resolves
 would close the same hole, but it stalls a healthy acquire unboundedly
 behind e.g. an AV-held no-delete-share handle — rejected.)
@@ -318,12 +351,13 @@ lock aliasing a later create attempt's read-back).
   lock path, its token's owner runs the final discovery read on whatever
   exit path it happens to take — the rule is position-blind, so no
   enumeration of positions is load-bearing — and everyone else reads a
-  foreign token and backs off — **no unowned orphan is possible from a live
-  process** (the leaked-token memory — riding into the hold and the release
-  path — covers the exits whose one-shot read is inconclusive; trappable
-  exits clean up best-effort via the trap-time rule; untrappable death and
-  the trap's blocked-unlink case are residual 5). That answers round 1's
-  wedge scenario structurally, not probabilistically.
+  foreign token and backs off — **no unowned orphan is possible from a
+  process actively inside an acquire/hold/release arc** (the leaked-token
+  memory — riding into the hold and the release path — covers the exits
+  whose one-shot read is inconclusive; trappable exits clean up best-effort
+  via the trap-time rule; untrappable death, the trap's blocked-unlink
+  case, and entries still pending after the arc ends are residual 5). That
+  answers round 1's wedge scenario structurally, not probabilistically.
 - **Destination wrong-type** (rename onto a directory fails) →
   `CLAIM-ABORT (rename-refused)`, token-checked claim deletion, damped
   warning, re-poll; the next poll's wrong-type guard classifies the object.
@@ -388,7 +422,8 @@ lock aliasing a later create attempt's read-back).
    exactly one claim file ends up installed, its token's live owner
    discovers ownership on whatever exit path it takes (discovery read or
    leaked-token memory), everyone else detects a foreign token — no unowned
-   orphan is possible from a live process (untrappable death is residual 5);
+   orphan is possible from a process inside its acquire/hold/release arc
+   (untrappable death and post-arc pending entries are residual 5);
    any displacement degrades into the detected-98 lane. No infinite regress.
    (Decision: no recheck margin — the discovery rule makes the gap-frequency
    question moot.)
@@ -411,8 +446,13 @@ lock aliasing a later create attempt's read-back).
    installs → an unowned fresh lock stalling waiters ≤ STALE, recovered by
    normal staleness; **no false success anywhere** — nobody believes they
    hold, nothing corrupts, the stall is the only cost. The same outcome
-   class covers leaked-token-memory entries still pending when their process
-   dies (or exits at 97), and a trap-time claim deletion left blocked-while-
+   class covers leaked-token-memory entries still pending after the arc
+   ends — 97, clean release, or death — until the owner's next acquire
+   adopts the token or staleness recovers (round-6 walk: B leaks L,
+   releases cleanly or at 97, lives on between acquires; a suspended rival
+   installs L afterwards — no discovery mechanism runs outside the arc; the
+   arc-end resolution pass narrows this window but cannot close it), and a
+   trap-time claim deletion left blocked-while-
    present after its one bounded retry (the exiting trap cannot wait out the
    blockage — see the trap-time rule). Why accepted: this is the same magnitude as the
    tool's FUNDAMENTAL accepted cost — a crashed holder already stalls a full
@@ -510,8 +550,10 @@ test-inventory and golden-rule passages.)
 - **Leaked-token memory**: an in-process structure (bash array / ps1 list),
   empty in the common case. NOT cleared when the acquire returns
   successfully — it rides into the hold and is consulted by the release
-  path's leaked-claim branch (see the memory rule); entries drop only on
-  verifiable resolution or at process exit.
+  path's leaked-claim branch (see the memory rule); entries drop on
+  verifiable resolution (including adoption) or at process exit; release
+  and the 97 exit run the one best-effort arc-end resolution pass over
+  pending entries' claim files (no waiting — see the memory rule).
 
 ### Probes (phase 1)
 
@@ -557,7 +599,9 @@ To the existing lock log (same damping conventions):
 - `RELEASE-CLEANED-LEAKED-CLAIM <lockpath> tok=<leaked token>` when the
   release path's leaked-claim branch unlinks our installed leaked claim
   (alongside the existing stolen-mid-hold 98 classification — plan test 25
-  asserts the line fires).
+  asserts the line fires). The branch's pre-unlink re-read finding the
+  token already replaced drops the entry WITHOUT this line (still 98); a
+  blocked unlink takes the ours-path LEFTOVER warning.
 - Damping: the `rename-refused` and blocked-steal lanes use the existing
   once-per-stale-window damper; existing damping on the other contended lanes
   unchanged.
@@ -650,10 +694,13 @@ which keeps 17–20 — to avoid a second renumbering.)
     unreadable/undeletable-claim lane, via the suites' existing
     no-delete-share handle helper pattern — then steer a rival install of
     the leaked claim; assert the leaver discovers via the leaked-token
-    memory (HOLD, and `lock_release` returns 0). **Steering variant**: the
+    memory (HOLD, and `lock_release` returns 0). Harness note (tests 21
+    and 25): the leak-manufacturing no-delete-share handle ALSO blocks the
+    rival's rename of that claim (probe D1) — the harness must close the
+    handle before steering the install. **Steering variant**: the
     rival install lands between the leaver's poll-read and its NEXT claim
     create, so the leaver runs one full aborting claim attempt before
-    discovery — assert HOLD on the following poll and release rc 0
+    discovery — assert HOLD by the following poll and release rc 0
     (mutation check: an implementation that drops memory entries on a
     claim-attempt abort must fail this). **Crashed-leaver variant**:
     kill the leaver untrappably after the leak → assert the bounded-orphan
@@ -684,8 +731,14 @@ which keeps 17–20 — to avoid a second renumbering.)
     (no-delete-share lane), then acquires a fresh token N normally; a
     steered rival installs L over the lock, displacing B's held N; B's
     release → returns 98 AND B unlinks L — assert the lock path is clean
-    immediately after B's release (no STALE stall) and the
-    `RELEASE-CLEANED-LEAKED-CLAIM` log line fired.
+    immediately after B's release (no STALE stall in the unblocked case)
+    and the `RELEASE-CLEANED-LEAKED-CLAIM` log line fired. (Same
+    handle-close steering note as test 21.) **Boundary variant** (round
+    6): the leaked L is installed with an instantly-stale mtime; a
+    successor steal is steered between B's leaked-token verification and
+    its cleanup unlink — assert B does NOT delete the successor's lock
+    (the pre-unlink re-read backs off, entry dropped) and B's release
+    still classifies 98.
 
 Interop (`git-commit-lock.interop.test.sh`):
 17. bash claimant vs ps1 claimant racing one ghost → one winner, both sides
@@ -914,3 +967,37 @@ implementation.
   lock-path line-1 read" — the lock-read applies to both gone and foreign
   observations); crash-lane empty/torn row gains the trappable mid-create
   case.
+- **Round 6 (2026-06-11, confirmation)**: fresh Claude judged the design
+  **CONVERGED** (no mechanism defects; 2 scope/spec folds + 3 polish
+  items); Codex found 1 blocking — the SAME item as Claude's second fold,
+  independently converging. All folded into v7; prose/spec edits only, no
+  mechanism change. (1) The structural no-unowned-orphan claim re-scoped
+  from "live process" to "a process actively inside an acquire/hold/release
+  arc": the round-6 walk (B leaks L, releases cleanly or at 97, lives on
+  between acquires; a suspended rival installs L afterwards) shows none of
+  the three discovery mechanisms runs outside the arc — residual 5's
+  pending-entries clause extended to "after the arc ends (97, clean
+  release, or death), until the owner's next acquire adopts the token or
+  staleness recovers"; adopted narrowing: a one-shot best-effort
+  token-checked resolution pass over pending entries' claim files at
+  release and at the 97 exit (the blocking handle may have closed by then;
+  failures leave the entry pending — no waiting). (2) (Claude + Codex
+  converging; Codex's walk: an instantly-stale installed L lets a
+  successor steal L and install its own lock between B's leaked-token read
+  and B's unlink — a naive unlink deletes the successor's live lock) the
+  release-path leaked-cleanup unlink inherits the ours-path mitigations:
+  the immediately-before-unlink re-read (sh:909-911 class; re-read no
+  longer leaked ⇒ no unlink, entry dropped — the successor's rename
+  destroyed L — classification still 98), bounded retry + LEFTOVER warning
+  on a blocked unlink, "cleans immediately — no STALE stall" softened to
+  best-effort; the remaining read→unlink boundary gap inventoried as the
+  same residual class as the existing release boundary gap (the headers'
+  probe-D1/boundary discussion), detected at the successor's read-back.
+  Polish (Claude): adoption of a listed token DROPS its entry; test-21/25
+  harness note (the leak-manufacturing no-delete-share handle also blocks
+  the rival's rename — probe D1 — close it before steering the install);
+  test-21 steering variant asserts HOLD "by" (not "on exactly") the
+  following poll. Test fold (Codex): test-25 boundary variant
+  (instantly-stale L; successor steal steered between B's leaked-token
+  verification and its cleanup unlink; B must not delete the successor's
+  lock, release still 98).
