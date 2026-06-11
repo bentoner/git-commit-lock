@@ -31,8 +31,13 @@
 #                  noclobber redirect — one open+write+close), whose CONTENT
 #                  is the ownership token. Atomic create-or-fail on POSIX and
 #                  NTFS; exactly one creator wins.
-#     * steal   -> `mv LOCK grave` (rename(2) is atomic; exactly one stealer
-#                  wins, the rest get ENOENT)
+#     * steal   -> CLAIM-SERIALIZED (2026-06-11, replaces mv-to-grave): to
+#                  steal a stale lock you must first win an O_EXCL CLAIM file
+#                  (`${LOCK}.next`) carrying your own token; the claim IS the
+#                  next lock — it is touched fresh and renamed OVER the stale
+#                  lock in one atomic rename(2) replace (ghost destroyed +
+#                  live lock installed in one op; no path-absent window —
+#                  probe R1). See THE STEAL PROTOCOL below.
 #
 # LOCK FILE FORMAT (UTF-8, no BOM, LF; shared wire format with the ps1 port)
 #     line 1: <token>            load-bearing: how lock_release detects theft.
@@ -48,6 +53,19 @@
 #   valid mtime, which ages into the normal staleness lane), and there is no
 #   partially-failed recursive delete at release (release is one unlink).
 #
+# CLAIM FILE (`${AGENT_LOCK_PATH}.next`)
+#   Identical wire format, the CLAIMANT'S OWN token, written through the
+#   creating O_EXCL redirect exactly like the lock — so the empty-file
+#   crash-orphan lane and the mtime floor apply to it identically (a
+#   sub-floor claim mtime means "unsettled, treat as just-created", never
+#   "ancient, clear"). The claim path also gets the lock path's PRE-CREATE
+#   TYPE GUARD: a noclobber `>` onto an existing FIFO blocks in open(2), so
+#   omitting the guard on the claim path would be a HANG, not a warning.
+#   Because rename preserves the source's mtime (probe R2), the installed
+#   lock's staleness clock after a steal IS the claim's mtime — which is why
+#   the protocol touches the claim immediately before the rename (the new
+#   holder's lease starts ~now, not at claim-create time).
+#
 # STALENESS
 #   Judged by the lock FILE's own mtime, stamped by the creating write. A lock
 #   older than AGENT_LOCK_STALE_SECS (default 300s) is assumed crashed and may
@@ -62,24 +80,131 @@
 #       before classifying (the shared schedule lives at _lock_cur_token and
 #       the ps1 port's Lock-ReadCurToken — keep them in lock-step).
 #
+# THE STEAL PROTOCOL (claim-serialized; 2026-06-11, replaces mv-to-grave)
+#   A poll that judges the lock stale (regular file, lock-shaped content,
+#   plausible mtime >= floor, age >= AGENT_LOCK_STALE_SECS) runs:
+#     1. CLAIM: O_EXCL-create `${LOCK}.next` with a FRESH PER-ATTEMPT token.
+#        Create fails => someone else is stealing: check the CLAIM's own
+#        staleness (below), keep waiting.
+#     2. RE-VERIFY the lock still stale under the claim (content + mtime +
+#        floor + shape, judged fresh).
+#     3. Ordered install sequence:
+#        3.1 CLAIM RECHECK: re-read `${LOCK}.next` — must carry OUR token and
+#            be younger than AGENT_LOCK_CLAIM_STALE_SECS (a long-suspended
+#            claimant must not act on a claim a waiter may already have
+#            judged stale). Gone/foreign -> discovery + re-poll; ours but
+#            overaged -> token-checked deletion + CLAIM-ABORT (contested) +
+#            discovery; unreadable -> leave it (ages out) + leaked-token
+#            memory (below).
+#        3.2 TOUCH the claim — NON-creating: `touch -c --` followed by an
+#            explicit [ -e ] existence check. `touch -c missing` exits 0
+#            (POSIX, probe R3) so the exit code carries NO gone signal; only
+#            the explicit check does. A creating touch would resurrect a
+#            vanished claim as a fresh empty `${LOCK}.next` blocking every
+#            rival claim until it aged out, and mask the gone signal the
+#            discovery rule keys on. The touch makes the installed lock's
+#            lease start ~now (probe R2: rename preserves the source mtime).
+#        3.3 RE-VERIFY the lock still stale (as step 2).
+#        3.4 RENAME-OVER: the claim is renamed over the lock (atomic replace;
+#            `mv -T` where supported, see _lock_rename_over) and the normal
+#            acquire read-back verification runs (must find our own token).
+#     4. Not confirmed at step 2/3.3 -> token-checked deletion of our claim,
+#        the final discovery read, then the lane outcome: lock GONE ->
+#        CLAIM-ABORT (gone), do NOT rename onto the absent path (that lane
+#        belongs to the normal create race); lock FRESH -> CLAIM-ABORT
+#        (fresh), keep waiting. Either way the "fresh" lock may be OUR OWN
+#        claim installed by a rival's rename — the discovery read decides.
+#
+#   TOKEN-CHECKED CLAIM DELETION (global rule): every "delete our claim"
+#   path reads the claim first and unlinks ONLY if line 1 is our token.
+#   Gone/foreign at the read -> leave it (a rival's live claim is never
+#   touched); unlink hitting ENOENT after a passing read is NOT an error
+#   (routes into the discovery read); unreadable after the ladder, or an
+#   unlink that FAILS with the file still present (a no-delete-share
+#   handle) -> the claim is LEAKED: its token joins the leaked-token
+#   memory. Never blind-unlink the claim path.
+#
+#   OWNERSHIP DISCOVERY (global rule): a rival's rename can install OUR
+#   claim file as the lock while we are anywhere past the claim create. So
+#   after a claim attempt, EVERY exit that does not end in a successful
+#   rename performs, as its final act — after any claim-deletion attempt,
+#   regardless of which anomaly was observed — one read of the lock path's
+#   line 1. Our claim token there => we HOLD the lock (per-attempt token
+#   uniqueness makes this conclusive); otherwise the lane's outcome stands.
+#   A miss is a true miss only on exits that installed the claim or
+#   verifiably unlinked it — the three leave-it-unverified exits above feed
+#   the leaked-token memory instead, which turns the one-shot read into
+#   continuous discovery for exactly those lanes.
+#
+#   LEAKED-TOKEN MEMORY (global rule): an in-process list of attempt tokens
+#   whose claim file was left in place without a verifiable unlink (exactly
+#   three feeders: recheck-unreadable, deletion-read-unreadable,
+#   deletion-unlink-blocked-while-present). While non-empty, every poll that
+#   observes a lock at the lock path also reads its line 1; a LISTED token
+#   there means a rival installed our leaked claim -> adopt it as the hold
+#   token (the entry drops; the leak is resolved) and HOLD. The set persists
+#   for the LIFETIME of the acquire — through a successful hold and into
+#   release: at release, a lock token that is not our hold token but IS in
+#   the set is OUR installed leaked claim — it is unlinked (with the
+#   ours-path boundary re-read + bounded-retry + LEFTOVER behaviour) and the
+#   release classifies as the stolen-mid-hold 98 (our actual hold WAS
+#   displaced). Entries drop only on verifiable resolution (adoption, a
+#   verified unlink, or a gone/foreign claim observation followed by one
+#   lock read); release and the 97 exit run one best-effort resolution pass
+#   over pending entries; entries still pending when the arc ends are
+#   residual-5 class (see KNOWN RESIDUAL RACES).
+#
+#   TRAP-TIME CLAIM CLEANUP (global rule; best-effort): the EXIT/INT/TERM
+#   handlers are installed at acquire START (not at hold) and carry a
+#   claim-window mode: a trappable exit while a claim attempt is in flight
+#   performs the token-checked claim deletion (ONE bounded retry if the
+#   unlink fails with the file still present — an exiting trap cannot wait
+#   out a blockage) and then the final discovery read; a discovery-HOLD
+#   inside the trap is released per normal trap semantics. If the claim
+#   stays present-and-ours-but-undeletable, the process exits leaving it
+#   (residual-5 class, bounded <= CLAIM_STALE after ageing). NO trap path
+#   runs lock-release semantics (98) on a mere claim — a claim is not a
+#   hold. A signal landing mid-claim-create can leave an empty/torn claim
+#   the token-checked deletion correctly refuses: it ages out <=
+#   CLAIM_STALE (a steals-only delay).
+#
+#   PER-ATTEMPT TOKENS (global rule): a fresh token is generated for EVERY
+#   create and claim attempt — never once per acquire. The winning attempt's
+#   token becomes the hold token; release verifies against it. This makes
+#   own-token-at-lock a true equivalence ("THIS attempt's file was
+#   installed"): an own-token lock abandoned by a failed read-back can never
+#   satisfy a later discovery read or alias a later attempt.
+#
+#   CLAIM STALENESS: a claim older than AGENT_LOCK_CLAIM_STALE_SECS (default
+#   60 — claims are held for milliseconds; 60s says "claimant crashed"),
+#   judged by the same mtime+floor rules, and claim-shaped (empty, or a
+#   "tok."-prefixed line 1) is unlinked by any waiter, which then re-races
+#   the claim create. The never-steal wrong-type guards (with the
+#   two-consecutive-poll confirmation) apply to the claim path exactly as to
+#   the lock path, with PER-PATH classifier and warn-once state. A crashed
+#   claimant therefore delays only STEALS by <= the claim window; normal
+#   acquisition on a free lock path is never blocked by a claim.
+#
 # ACQUIRE VERIFICATION (never repair by overwriting)
-#   After winning the create, the acquirer re-reads line 1 from the path and
-#   claims the hold only if it finds its own token. A gone/empty read-back
-#   gets a brief RESTORE GRACE first (re-reads over ~0.4s): a straggler's
-#   steal that displaced this just-created lock is usually REPAIRED by its
-#   grave-token restore within milliseconds (see the steal lane), and the
-#   token reappearing at the path is full proof of ownership — abandoning
-#   without the grace would leave the restored lock an unowned orphan for a
-#   stale window. Anything else after the grace — foreign, empty, or gone —
-#   means we cannot prove we hold the path (e.g. we were suspended past the
-#   stale window and a waiter stole the path while a successor re-created
-#   it): log loudly, treat as NOT acquired, re-enter the wait loop. A "repair" overwrite would clobber the successor's
+#   After winning the create — or completing a steal's rename-over — the
+#   acquirer re-reads line 1 from the path and claims the hold only if it
+#   finds its own ATTEMPT token. Anything else — foreign, empty, or gone
+#   after the read ladder — means we cannot prove we hold the path (e.g. we
+#   were suspended past the stale window and a waiter stole the path while a
+#   successor re-created it): log loudly, treat as NOT acquired, re-enter
+#   the wait loop. A "repair" overwrite would clobber the successor's
 #   token and produce a silent, undetected double-hold; giving the lock up is
-#   always safe (our own orphan ages into the steal lane and is reclaimed).
+#   always safe (our own orphan ages into the steal lane and is reclaimed,
+#   and per-attempt tokens mean it can never alias a later attempt's
+#   read-back or discovery read).
 #   This lane has no deterministic test (it needs fault injection to make a
 #   winning create unreadable); like the read-retry ladders it is defence in
 #   depth. Side effect: a verified read-back is what lets release treat a GONE
 #   lock file as definitive theft (98) — our token provably WAS at the path.
+#   (SUPERSEDED 2026-06-11: the wave-1 RESTORE GRACE — a ~0.4s re-read loop
+#   waiting for a straggler's grave-token restore — went with the graves.
+#   Under the claim protocol a displaced fresh lock is never moved aside in
+#   the first place, so there is nothing to wait for.)
 #
 # FAIL-OPEN CEILING + the holder's responsibility (important)
 #   The stale window is a LEASE, and the file mtime is stamped once at create
@@ -98,48 +223,79 @@
 #   that invocation.
 #
 # KNOWN RESIDUAL RACES (detected, not silent)
-#   The create/mv/rm primitives cannot make check-then-act fully atomic, so
-#   narrow windows remain even after the re-checks below shrink them:
-#     * acquire-side: between re-reading the stale file's mtime and the steal
-#       `mv`, a rival completes steal+re-acquire, so our `mv` moves a
-#       brand-new live lock aside. Reachable WITHOUT any contract breach:
-#       after a holder crashes, every waiter judges "stale" off the same
-#       ghost mtime in the same poll window, the first one steals and
-#       re-creates, and a straggler's `mv` displaces that innocent recovery
-#       winner (probed 5/5 with 4 waiters on one ancient lock). Since
-#       2026-06-11 this is DETECTED AT STEAL TIME — the stealer compares the
-#       grave's token to the one it classified stale — and REPAIRED: a
-#       mismatch triggers an atomic fail-if-exists hard link of the grave
-#       back to the lock path, so the displaced holder usually never
-#       notices. The residual shrinks to "a third party re-created the path
-#       within the mv->ln window" (or a no-hardlink filesystem), which falls
-#       open as before: detected at the victim's release, 98;
-#     * release-side: between the final token re-read and the unlink, a
-#       boundary-stale steal + re-acquire slips in, so our `rm` deletes the
-#       successor's live file;
-#     * release-retry gap: the D1 share-mode guarantee ("the handle blocking
-#       our unlink also blocks a steal's rename") holds while the handle is
-#       OPEN — it can close BETWEEN our ~20ms delete retries, letting a full
-#       steal+re-create land before the next attempt deletes the successor's
-#       live file. The retry widens the release-side window by its ~100ms
-#       budget; it still needs a contract-breach stale hold to be reachable.
-#   The release-side windows require a hold that already overran the stale
-#   window; the acquire-side one only requires a ghost that did (its victim
-#   can be a brand-new holder — see above). All are DETECTED: where the steal
-#   -time restore cannot repair, the displaced holder's lock_release finds a
-#   missing/foreign token and fails loudly with 98, so no silent lost update
-#   — the cost is a spurious "redo" plus a transient double-hold. (Future
-#   option, ps1 side only: handle-based ops — open with delete sharing,
-#   fstat/read/delete via that one handle — could close these windows
-#   outright there; bash has no handle persistence, so the protocol-level
-#   claim stays "shrunk, detected, not closed".)
+#   The claim serializes stealers, so the wave-1 displaced-live race (a
+#   straggler's mv-to-grave robbing the recovery winner — probed 5/5 with 4
+#   waiters on one ancient lock) is PREVENTED, not detect-and-repaired; the
+#   grave-token compare / hard-link restore / restore-grace machinery is
+#   gone. What remains (numbering follows the design plan's residuals 1-6):
+#     1. verify->rename gap: a live-slow holder releases between our final
+#        re-verify (step 3.3) and our rename, and a waiter's create lands in
+#        that same instant; our rename-over then replaces that fresh lock.
+#        The displaced winner detects via the acquire read-back (if still
+#        inside it) or at release (98). A few ms wide (the mtime stat is a
+#        command substitution, mv is an exec) — strictly narrower than the
+#        pre-wave-1 race, same class as wave 1's unrestorable residual.
+#     2. recheck->rename gap: a clearer whose staleness read predates our
+#        recheck can clear our claim and let a rival claim inside the
+#        recheck->rename gap. Every such two-claimant interleaving is
+#        SELF-HEALING per the ownership-discovery rule: exactly one claim
+#        file ends up installed, its token's live owner discovers ownership
+#        on whatever exit path it takes (discovery read or leaked-token
+#        memory), everyone else reads a foreign token and backs off; any
+#        displacement degrades into the detected-98 lane. No unowned orphan
+#        is possible from a process actively inside an acquire/hold/release
+#        arc (untrappable death and post-arc pending entries are residual 5).
+#     3. lease accuracy: the installed lock's lease starts at the claim's
+#        step-3.2 touch (rename preserves mtime). A claimant suspended
+#        between touch and rename installs a correspondingly aged-mtime lock
+#        (the shortfall is bounded by the touch->rename gap — ms when not
+#        suspended). When a RIVAL renames our claim in (a discovery-HOLD),
+#        the installed lock's age is the claim's age at the rival's rename —
+#        worst case an instantly-stale install, self-healing via the next
+#        steal, detected.
+#     4. version skew: prevention holds only when ALL parties in a tree run
+#        the claim protocol. A mixed-version tree (an old mv-to-grave
+#        stealer) degrades to detection (98) and can leave grave litter this
+#        code no longer sweeps — upgrade both implementations together.
+#     5. untrappable death inside the claim window (SIGKILL, power loss) —
+#        deliberately ACCEPTED, not prevented: the leftover claim can be
+#        installed by a suspended rival's rename -> an unowned fresh lock
+#        stalling waiters <= STALE, recovered by normal staleness; NO false
+#        success anywhere (nobody believes they hold; the stall is the only
+#        cost). The same bounded class covers: leaked-token-memory entries
+#        still pending after the arc ends (97, clean release, or death) —
+#        no discovery mechanism runs outside the arc; the owner's next
+#        acquire can still adopt the token, and the arc-end resolution pass
+#        narrows the window — and a trap-time claim unlink still
+#        blocked-while-present after its one bounded retry. Why accepted:
+#        same magnitude as the tool's FUNDAMENTAL accepted cost (a crashed
+#        holder already stalls a full STALE window) at far lower
+#        probability; the preventing alternative (capture-verify-install, a
+#        two-rename compare-and-swap) reintroduces crash litter at private
+#        names plus an age-gated sweep — the machinery class this redesign
+#        removed — and was rejected.
+#     6. release-side (unchanged from the file era): between the final token
+#        re-read and the unlink, a boundary-stale steal + re-acquire slips
+#        in, so our rm deletes the successor's live file; and the
+#        release-retry gap (the D1 share-mode guarantee holds while the
+#        handle is OPEN — it can close between our ~20ms delete retries).
+#        Both need a hold that already overran the stale window; detected at
+#        the displaced party's release (98). The release-path LEAKED-CLAIM
+#        cleanup unlink shares this boundary class: its
+#        immediately-before-unlink re-read backs off when a successor's
+#        steal already replaced the leaked token, and the remaining
+#        read->unlink gap is detected at the successor's read-back.
+#   All residuals are DETECTED (or, for residual 5, bounded and
+#   false-success-free): no silent lost update — the cost is a spurious
+#   "redo" plus a transient double-hold or a bounded stall.
 #
 # ACCEPTED RESIDUALS (non-race, documented deliberately)
 #   * A torn token write SHORTER than "tok." (e.g. "to"; reachable only via
 #     ENOSPC/crash mid-write) is non-empty and non-prefixed, so it lands in
 #     the never-steal NON-LOCK lane permanently: loud (the config warning
 #     names the path), fixed by one manual `rm`. We trade that vanishing-rare
-#     recovery for never deleting real user files at a typo'd path.
+#     recovery for never deleting real user files at a typo'd path. The same
+#     applies at the CLAIM path (it blocks steals, not acquisition).
 #   * The converse: a stale USER file whose line 1 happens to start "tok." IS
 #     stolen — the prefix is the whole wire test, deliberately (a fuller shape
 #     check would bind the format harder for near-zero added protection).
@@ -148,7 +304,8 @@
 #     intact — nothing stolen or deleted; we just don't read content on every
 #     poll). The same trade as the per-poll type guard avoids.
 #   * FIFOs/devices/sockets at the lock path: bash refuses them all via the
-#     pre-create type guard + `[ -f ]` steal guard. The ps1 port on Unix has
+#     pre-create type guard + `[ -f ]` steal guard — and the CLAIM path gets
+#     the same guards with per-path state. The ps1 port on Unix has
 #     no clean type probe for devices/sockets/FIFOs (they stat as size 0 and
 #     take the empty-orphan lane there); that residual is documented in the
 #     ps1 implementation — reference only here.
@@ -157,15 +314,23 @@
 #     while File.Move would succeed). Nothing in the protocol ever sets
 #     read-only; if something external does, the leftover warning fires and
 #     the stale steal (a rename) recovers the path.
-#   * The steal's grave-token check resolves can't-prove cases by the harm
-#     asymmetry, not by certainty: an UNREADABLE grave (non-empty, but the
-#     read ladder came back blank — a sharing violation) is RESTORED, since
-#     restoring a genuinely stale ghost merely re-ages it for the next steal
-#     while deleting a live lock robs its holder; and in the empty-orphan
-#     lane an EMPTY grave is grave-deleted even though a rival's mid-create
-#     EMPTY file reads identically to the empty ghost — that rival's acquire
-#     verification fails its read-back and re-enters the wait, so the
-#     misclassification is self-healing, never silent.
+#   * Token-checked claim deletion resolves can't-prove cases by the harm
+#     asymmetry, not by certainty: a claim we cannot READ is never unlinked
+#     (deleting a rival's live claim aborts its steal; leaving an orphan
+#     merely delays steals <= CLAIM_STALE) — the leaked-token memory keeps
+#     the leaver's ownership discoverable. The deletion's own read->unlink
+#     gap can in principle unlink a rival's JUST-created claim (clearer and
+#     rival inside a microsecond window) — benign: the rival's recheck finds
+#     its claim gone -> final discovery read -> it retries. No machinery is
+#     added for this.
+#   * No-`mv -T` platforms (BSD/macOS): the rename-over falls back to a
+#     last-instant [ -d ] check + bare `mv`. A directory appearing at the
+#     lock path inside that check->mv gap would have bare mv move the claim
+#     INTO it (probe R4): the read-back then fails, the claimant re-polls,
+#     and the wrong-type guard names the directory — no false success; the
+#     claim file is left as litter inside the misconfigured directory.
+#     Reaching this needs external interference creating a directory at the
+#     lock path inside a ms window, on a platform without GNU mv.
 #
 # LOCK LOCATION
 #   By default the lock and its log live in the repo's git dir
@@ -176,18 +341,50 @@
 #   same git dir and therefore share one lock — exactly what we want.
 #
 # CONFIG (all overridable via env; mainly for tests):
-#   AGENT_LOCK_PATH        lock file path (default <gitdir>/commit.lock)
+#   AGENT_LOCK_PATH        lock file path (default <gitdir>/commit.lock).
+#                          The claim lives beside it at ${AGENT_LOCK_PATH}.next.
 #   AGENT_LOCK_STALE_SECS  steal threshold in seconds vs file mtime (default
 #                          300). Hard fail-open ceiling: keep it >> (max hold
 #                          + any clock skew); no sub-5s windows outside tests.
+#   AGENT_LOCK_CLAIM_STALE_SECS  claim ageout in seconds (default 60): a
+#                          claim older than this is judged crashed and may be
+#                          cleared by any waiter. Claims are normally held
+#                          for milliseconds.
 #   AGENT_LOCK_POLL_SECS   poll interval while waiting (default 2)
 #   AGENT_LOCK_MAX_WAIT    safety cap on total wait (default 420; keep it >
-#                          stale so a steal always gets a chance before we
-#                          give up — a warning is printed if it is not)
+#                          STALE + CLAIM_STALE so a crashed holder AND a
+#                          crashed claimant can both be recovered before
+#                          waiters give up — a warning is printed if it is
+#                          not, gated on MAX_WAIT being left at its default)
 #   AGENT_LOCK_LOG         log file (default <gitdir>/git-commit-lock.log)
-#   STALE_SECS and MAX_WAIT must be positive integers, POLL_SECS may be
-#   fractional; invalid values fall back to the default with a stderr note
-#   (same rules in the ps1 port).
+#   STALE_SECS, CLAIM_STALE_SECS and MAX_WAIT must be positive integers,
+#   POLL_SECS may be fractional; invalid values fall back to the default
+#   with a stderr note (same rules in the ps1 port).
+#
+# PROBE RECORDS (this box: Git-Bash/MSYS on NTFS; see also the per-site
+# probe citations through the code)
+#   A     the noclobber failure message comes from bash itself, not printf
+#         (stderr must be redirected on the SUBSHELL).
+#   C/C1b a freshly created file can transiently report FILETIME zero (1601)
+#         to an observer -> the mtime floor.
+#   D1    a no-delete-share handle blocks our unlink AND a steal's rename
+#         alike (the release-retry grounding).
+#   F     a rival's create->write gap is observable (file exists, no content
+#         yet) -> the escalating read-retry ladders.
+#   R1    (2026-06-11) `mv` rename-over on NTFS: 400 atomic replaces, ZERO
+#         absent reads, ZERO torn reads from a tight reader loop — the
+#         no-path-absent-window property the steal rides on.
+#   R2    (2026-06-11) rename preserves the SOURCE's mtime: the installed
+#         lock's mtime == the claim's just-touched mtime (the lease rule).
+#   R3    (2026-06-11) `touch -c` on a missing file exits 0 and creates
+#         nothing (POSIX) — gone-detection MUST be the explicit [ -e ]
+#         check, never the exit code.
+#   R4    (2026-06-11) bare `mv` onto a directory moves the source INTO it
+#         (POSIX mv semantics); GNU `mv -T` refuses (empty or not) — hence
+#         the probed -T fast path + guarded fallback in _lock_rename_over.
+#   (SUPERSEDED, kept for history: the wave-1 hard-link probes — `ln` is an
+#   atomic fail-if-exists restore that preserves the inode mtime — backed
+#   the grave-token restore removed 2026-06-11 with the claim protocol.)
 #
 # EXIT CODES (the published contract — do not repurpose)
 #   `run` exits with the wrapped command's own exit code, EXCEPT three
@@ -269,6 +466,7 @@ _LOCK_BASE="${_LOCK_GITDIR:-$PWD}"
 AGENT_LOCK_PATH="${AGENT_LOCK_PATH:-$_LOCK_BASE/commit.lock}"
 if [ -n "${AGENT_LOCK_MAX_WAIT:-}" ]; then _LOCK_MAXWAIT_EXPLICIT=1; else _LOCK_MAXWAIT_EXPLICIT=0; fi
 AGENT_LOCK_STALE_SECS="${AGENT_LOCK_STALE_SECS:-300}"
+AGENT_LOCK_CLAIM_STALE_SECS="${AGENT_LOCK_CLAIM_STALE_SECS:-60}"
 AGENT_LOCK_POLL_SECS="${AGENT_LOCK_POLL_SECS:-2}"
 AGENT_LOCK_MAX_WAIT="${AGENT_LOCK_MAX_WAIT:-420}"
 AGENT_LOCK_LOG="${AGENT_LOCK_LOG:-$_LOCK_BASE/git-commit-lock.log}"
@@ -294,30 +492,58 @@ _lock_check_num() {  # $1=name $2=value $3=default $4=int|frac -> prints value t
   fi
 }
 AGENT_LOCK_STALE_SECS="$(_lock_check_num AGENT_LOCK_STALE_SECS "$AGENT_LOCK_STALE_SECS" 300 int)"
+AGENT_LOCK_CLAIM_STALE_SECS="$(_lock_check_num AGENT_LOCK_CLAIM_STALE_SECS "$AGENT_LOCK_CLAIM_STALE_SECS" 60 int)"
 AGENT_LOCK_POLL_SECS="$(_lock_check_num AGENT_LOCK_POLL_SECS "$AGENT_LOCK_POLL_SECS" 2 frac)"
 AGENT_LOCK_MAX_WAIT="$(_lock_check_num AGENT_LOCK_MAX_WAIT "$AGENT_LOCK_MAX_WAIT" 420 int)"
 
-# A waiter gives up at MAX_WAIT, so if STALE >= MAX_WAIT every waiter times
-# out before a crashed holder's lock could ever be stolen. Warn only in the
-# documented footgun case — STALE raised for a slow hold while MAX_WAIT was
-# left at its default. A caller who set BOTH knobs chose the relationship
-# deliberately (test suites do this constantly).
-if [ "$_LOCK_MAXWAIT_EXPLICIT" = 0 ] && [ "$AGENT_LOCK_STALE_SECS" -ge "$AGENT_LOCK_MAX_WAIT" ]; then
-  echo "git-commit-lock: warning — AGENT_LOCK_STALE_SECS ($AGENT_LOCK_STALE_SECS) >= AGENT_LOCK_MAX_WAIT ($AGENT_LOCK_MAX_WAIT, default): waiters will time out before a stale lock can be stolen; raise AGENT_LOCK_MAX_WAIT too" >&2
+# Worst-case recovery now stacks BOTH ageouts: a crashed holder costs a full
+# STALE window, and a crashed claimant on top costs a CLAIM_STALE window
+# before the steal can complete — so a waiter needs MAX_WAIT > STALE +
+# CLAIM_STALE to be guaranteed a recovery chance before giving up (defaults:
+# 300 + 60 < 420). Warn only in the documented footgun case — knobs raised
+# while MAX_WAIT was left at its default; a caller who set MAX_WAIT chose
+# the relationship deliberately (test suites do this constantly). This
+# warning REPLACES the former STALE >= MAX_WAIT warning (2026-06-11): it
+# strictly subsumes it under the same left-default explicitness gate.
+if [ "$_LOCK_MAXWAIT_EXPLICIT" = 0 ] \
+   && [ "$AGENT_LOCK_MAX_WAIT" -le $(( AGENT_LOCK_STALE_SECS + AGENT_LOCK_CLAIM_STALE_SECS )) ]; then
+  echo "git-commit-lock: warning — AGENT_LOCK_MAX_WAIT ($AGENT_LOCK_MAX_WAIT, default) <= AGENT_LOCK_STALE_SECS ($AGENT_LOCK_STALE_SECS) + AGENT_LOCK_CLAIM_STALE_SECS ($AGENT_LOCK_CLAIM_STALE_SECS): waiters may time out before a crashed holder (and a crashed claimant) can be recovered; raise AGENT_LOCK_MAX_WAIT too" >&2
 fi
 
 _LOCK_HELD=0
 # $HOSTNAME is set by bash itself; the `hostname` fork is only a fallback for
 # the rare shell that did not populate it.
 _LOCK_ME="pid=$$ host=${HOSTNAME:-$(hostname 2>/dev/null || echo unknown)}"
-# Unique per acquisition: identifies OUR hold so release can tell whether the
-# lock we are about to free is still the one we took (vs. stolen + re-acquired
-# by someone else). pid alone is not enough — pids get reused across the 5-min
-# window — so mix in $RANDOM and the acquire time. The "tok." prefix is wire
-# format (see LOCK FILE FORMAT above).
+# The HOLD token: set by _lock_take_hold from the WINNING attempt's token
+# (per-attempt tokens — see PER-ATTEMPT TOKENS in the header); release
+# verifies the on-disk lock against it. Empty while not holding.
 _LOCK_TOKEN=""
+# Fresh-token generator state: every create and claim attempt gets its own
+# token (pid + $RANDOM + epoch + an in-process sequence number, so two
+# attempts inside one second can never collide). Command substitution would
+# run the generator in a subshell and lose the sequence increment, so the
+# generator sets _LOCK_NEWTOK instead of printing. The "tok." prefix is wire
+# format (see LOCK FILE FORMAT above).
+_LOCK_SEQ=0
+_LOCK_NEWTOK=""
+_lock_new_token() {
+  _LOCK_SEQ=$((_LOCK_SEQ+1))
+  _LOCK_NEWTOK="tok.$$.${RANDOM}.$(_lock_now).$_LOCK_SEQ"
+}
+# The claim path (set at acquire start: ${AGENT_LOCK_PATH}.next) and the
+# token of the claim attempt currently in flight (non-empty exactly while a
+# claim we created may exist on disk unresolved — the trap handlers key
+# their claim-window cleanup on it).
+_LOCK_CLAIM_PATH=""
+_LOCK_CLAIM_TOKEN=""
+# LEAKED-TOKEN MEMORY (see the header rule): space-separated list of attempt
+# tokens whose claim file was left in place without a verifiable unlink.
+# Almost always empty. Tokens contain no whitespace/glob characters, so
+# word-splitting iteration is safe.
+_LOCK_LEAKED=""
 # The caller's EXIT/INT/TERM traps as they were before lock_acquire installed
-# ours (saved via `trap -p`, restored by lock_release on every path).
+# ours (saved via `trap -p`, restored by lock_release on every path, and by
+# lock_acquire itself when it resolves without a hold).
 _LOCK_SAVED_TRAP_EXIT=""
 _LOCK_SAVED_TRAP_INT=""
 _LOCK_SAVED_TRAP_TERM=""
@@ -347,12 +573,26 @@ fi
 # AGENT_LOCK_PATH=$HOME — a symlink, a device, or a regular file whose
 # content is not lock-shaped). Such a path is NEVER stolen or deleted;
 # waiters will reach 97 until a human fixes the path or removes the object.
+# The warn-once flag is PER PATH (lock vs. claim — see the claim variant
+# below): a shared flag would let a lock-path warning suppress a claim-path
+# one, hiding the second misconfiguration.
 _LOCK_NONLOCK_WARNED=0
 _lock_warn_nonlock() {  # $1 = what is wrong with the object
   [ "$_LOCK_NONLOCK_WARNED" = 1 ] && return 0
   _LOCK_NONLOCK_WARNED=1
   echo "git-commit-lock: WARNING — $AGENT_LOCK_PATH exists but is not a lock file ($1). Refusing to steal or delete it; waiters will time out (97). If AGENT_LOCK_PATH is a typo, fix it; if this is a stray file or a leftover old-protocol lock directory, remove it by hand." >&2
   _lock_log "WARNING: non-lock object at lock path ($1) — never stolen; waiters reach 97 until it is removed by hand"
+}
+
+# The claim-path twin (per-path warn-once state, see above). A non-claim
+# object squatting ${LOCK}.next blocks STEALS only — normal acquisition on a
+# free lock path is unaffected — but a stale lock then wedges waiters to 97.
+_LOCK_NONLOCK_WARNED_CLAIM=0
+_lock_warn_nonlock_claim() {  # $1 = what is wrong with the object
+  [ "$_LOCK_NONLOCK_WARNED_CLAIM" = 1 ] && return 0
+  _LOCK_NONLOCK_WARNED_CLAIM=1
+  echo "git-commit-lock: WARNING — $_LOCK_CLAIM_PATH exists but is not a claim file ($1). Refusing to delete it; stale locks cannot be stolen while it squats the claim path (waiters may time out, 97). If AGENT_LOCK_PATH is a typo, fix it; otherwise remove the object by hand." >&2
+  _lock_log "WARNING: non-claim object at claim path ($1) — never deleted; steals are blocked until it is removed by hand"
 }
 
 # Best-effort single mtime probe (epoch secs) of an arbitrary path; prints
@@ -417,45 +657,91 @@ _lock_path_mtime() {
 # Lock-ReadCurToken): up to 8 read attempts with inter-attempt sleeps of
 # 20/40/80/160/320/320/320 ms — ~1.26s total budget, enough to ride out a
 # sub-second transient (e.g. an AV scanner's no-delete-share open). The full
-# ladder runs ONLY where a verdict hangs on the read — release verification
-# and the acquire read-back — never inside the acquire poll loop (the steal
-# content guard and grave check have their own short reads), so a healthy
+# ladder runs ONLY where a verdict hangs on the read — release verification,
+# the acquire read-back, the claim recheck / token-checked deletion, and the
+# discovery read — never inside the acquire poll loop (the steal content
+# guard and the per-poll leaked-memory read are short reads), so a healthy
 # lock costs one attempt and the poll cadence is unaffected.
-_lock_cur_token() {  # $1 = max read attempts (default 8 = the full ladder)
-  local t="" i=0 max="${1:-8}"
+_lock_read_tok() {  # $1 = path; $2 = max read attempts (default 8 = the full ladder)
+  local p="$1" t="" i=0 max="${2:-8}"
   set -- 0.02 0.04 0.08 0.16 0.32 0.32 0.32   # the shared backoff schedule
   while :; do
     t=""
     # NB: 2>/dev/null BEFORE the input redirect — a failed open's error
     # message is emitted by the shell at the point of failure, so stderr
     # must already be redirected when the open is attempted.
-    { IFS= read -r t || true; } 2>/dev/null < "$AGENT_LOCK_PATH" || true
+    { IFS= read -r t || true; } 2>/dev/null < "$p" || true
     t="${t%"${t##*[![:space:]]}"}"   # strip trailing CR/whitespace (CRLF tolerance)
     [ -n "$t" ] && break
-    [ -e "$AGENT_LOCK_PATH" ] || break   # file gone: genuinely no token
+    [ -e "$p" ] || break   # file gone: genuinely no token
     i=$((i+1)); [ "$i" -ge "$max" ] && break
     sleep "${1:-0.32}"; [ "$#" -gt 0 ] && shift
   done
   printf '%s' "$t"
 }
+_lock_cur_token() {  # $1 = max read attempts (default 8 = the full ladder)
+  _lock_read_tok "$AGENT_LOCK_PATH" "${1:-8}"
+}
 
-# Opportunistic, age-gated sweep of steal graves beside the lock (`.dead.*`,
-# left when a steal winner's grave delete failed — mirrored in the ps1 port).
-# Only entries older than the stale window (with a plausible mtime) are
-# swept, and only with a non-recursive `rm -f`: a directory or other non-file
-# at a grave name is left alone. Pure best-effort: any failure just leaves
-# the entry for a later sweep.
-_lock_sweep_litter() {
-  local d mt now
-  now="$(_lock_now)"
-  for d in "$AGENT_LOCK_PATH".dead.*; do
-    [ -e "$d" ] || continue                  # unmatched glob stays literal
-    mt="$(_lock_stat_mtime "$d")"
-    [ -n "$mt" ] || continue
-    [ "$mt" -gt 946684800 ] || continue      # sub-floor reading: unsettled, skip
-    [ $(( now - mt )) -ge "$AGENT_LOCK_STALE_SECS" ] || continue
-    rm -f -- "$d" 2>/dev/null || continue    # non-recursive: a dir grave fails here and stays
-    _lock_log "SWEPT stale litter ${d##*/}"
+# --- leaked-token memory (see the header rule) -------------------------------
+# _LOCK_LEAKED is a space-separated token list; tokens are
+# whitespace/glob-free by construction, so unquoted iteration is deliberate.
+_LOCK_LEAK_WARNED=0
+_lock_leaked_add() {  # $1 = attempt token; $2 = which feeder lane
+  _LOCK_LEAKED="${_LOCK_LEAKED:+$_LOCK_LEAKED }$1"
+  _lock_log "LEAKED-CLAIM ($2): claim tok=$1 left in place without a verifiable unlink — added to the leaked-token memory; polls will watch the lock path for it"
+  if [ "$_LOCK_LEAK_WARNED" = 0 ]; then
+    _LOCK_LEAK_WARNED=1
+    echo "git-commit-lock: warning — a claim file of ours could not be verified/deleted ($2); its token is remembered and ownership stays discoverable (see the lock log)" >&2
+  fi
+}
+_lock_leaked_member() {  # $1 = token -> 0 iff listed
+  case " $_LOCK_LEAKED " in *" $1 "*) return 0;; esac
+  return 1
+}
+_lock_leaked_drop() {  # $1 = token
+  local out="" t
+  # shellcheck disable=SC2086  # deliberate word-split of the token list
+  for t in $_LOCK_LEAKED; do
+    [ "$t" = "$1" ] || out="${out:+$out }$t"
+  done
+  _LOCK_LEAKED="$out"
+}
+# Arc-end best-effort resolution pass (run at release and at the 97 exit):
+# for each pending entry, one token-checked look at the CLAIM file — the
+# blocking handle may have closed by now. A verified unlink, or a
+# gone/foreign observation, resolves the entry — each followed by one
+# lock-path line-1 read before the drop (gone-from-.next may mean
+# installed-at-lock; an entry whose token sits at the LOCK path stays
+# pending: the owner's next acquire can adopt it). Any failure leaves the
+# entry pending — no waiting, no retry loops.
+_lock_leaked_resolve_pass() {
+  [ -n "$_LOCK_LEAKED" ] || return 0
+  local t ct lk
+  # shellcheck disable=SC2086  # deliberate word-split of the token list
+  for t in $_LOCK_LEAKED; do
+    ct="$(_lock_read_tok "$_LOCK_CLAIM_PATH" 1)"
+    if [ "$ct" = "$t" ]; then
+      # Still ours at the claim path: try the unlink (token-checked, single
+      # best-effort attempt).
+      if rm -f -- "$_LOCK_CLAIM_PATH" 2>/dev/null && ! [ -e "$_LOCK_CLAIM_PATH" ]; then
+        lk="$(_lock_read_tok "$AGENT_LOCK_PATH" 1)"
+        if [ "$lk" != "$t" ]; then
+          _lock_leaked_drop "$t"
+          _lock_log "leaked-token memory: resolved tok=$t (claim unlinked at arc end)"
+        fi
+      fi
+    elif [ -n "$ct" ] || { ! [ -e "$_LOCK_CLAIM_PATH" ] && ! [ -L "$_LOCK_CLAIM_PATH" ]; }; then
+      # Foreign-tokened, or verifiably gone: the leak is resolved UNLESS the
+      # token was installed at the lock path meanwhile.
+      lk="$(_lock_read_tok "$AGENT_LOCK_PATH" 1)"
+      if [ "$lk" != "$t" ]; then
+        _lock_leaked_drop "$t"
+        _lock_log "leaked-token memory: resolved tok=$t (claim gone/foreign at arc end)"
+      fi
+    fi
+    # present-but-empty/unreadable, blocked unlink, or token-at-lock: leave
+    # the entry pending (residual-5 class once the process exits).
   done
 }
 
@@ -482,12 +768,225 @@ _lock_saved_trap_cmd() {
   unset -f trap
 }
 
+# --- steal-protocol helpers ---------------------------------------------------
+
+# Claim the hold: adopt the winning ATTEMPT token as the hold token. ONE
+# helper for all three acquisition paths — create read-back, steal
+# rename-over, and discovery-HOLD — so every hold runs the same HELD/trap
+# machinery (the handlers were installed at acquire start and stay armed
+# through the hold; lock_release restores them).
+_lock_take_hold() {  # $1 = the winning attempt token
+  _LOCK_TOKEN="$1"
+  _LOCK_CLAIM_TOKEN=""
+  _LOCK_HELD=1
+  _lock_log "ACQUIRED ($_LOCK_ME tok=$_LOCK_TOKEN)"
+}
+
+# The OWNERSHIP-DISCOVERY read (see the header rule): the unconditional
+# final act of every post-claim-create exit that did not end in a successful
+# rename. One read of the lock path's line 1 (full ladder — a verdict hangs
+# on it); our attempt token there means a rival's rename installed OUR claim
+# as the lock => we hold it. Returns 0 iff the hold was taken.
+_lock_discover() {  # $1 = attempt token
+  local rb; rb="$(_lock_cur_token)"
+  if [ -n "$rb" ] && [ "$rb" = "$1" ]; then
+    _lock_log "DISCOVERY-HOLD: our claim (tok=$1) was installed at the lock path by a rival's rename — taking the hold"
+    _lock_take_hold "$1"
+    return 0
+  fi
+  return 1
+}
+
+# Classify the claim file against OUR attempt token. Sets _LOCK_CR_STATE to
+# one of: ours | gone | foreign | unreadable, and _LOCK_CR_TOK to the token
+# read (empty unless readable). "foreign" includes a present-but-EMPTY claim:
+# our claim's content write was verified by the creating redirect, so an
+# empty file is not ours — it is a rival's mid-create window or external
+# truncation; either way it is left alone (it ages out). "unreadable" means
+# present, non-empty, but the full read ladder came back blank (a sharing
+# violation): we can NOT verify the claim is not ours, so callers must treat
+# it as a possible leak (see _lock_claim_delete / the recheck).
+_LOCK_CR_STATE=""
+_LOCK_CR_TOK=""
+_lock_claim_state() {  # $1 = our attempt token
+  local t; t="$(_lock_read_tok "$_LOCK_CLAIM_PATH" 8)"
+  _LOCK_CR_TOK="$t"
+  if [ -n "$t" ]; then
+    if [ "$t" = "$1" ]; then _LOCK_CR_STATE="ours"; else _LOCK_CR_STATE="foreign"; fi
+  elif ! [ -e "$_LOCK_CLAIM_PATH" ] && ! [ -L "$_LOCK_CLAIM_PATH" ]; then
+    _LOCK_CR_STATE="gone"
+  elif ! [ -s "$_LOCK_CLAIM_PATH" ]; then
+    _LOCK_CR_STATE="foreign"
+  else
+    _LOCK_CR_STATE="unreadable"
+  fi
+}
+
+# TOKEN-CHECKED CLAIM DELETION (see the header rule): read first, unlink
+# only if line 1 is OUR token; never blind-unlink the claim path. Sets
+# _LOCK_CD_STATE to: deleted | gone | foreign | leaked-unreadable |
+# leaked-blocked. The two leaked-* outcomes append the token to the
+# leaked-token memory (the claim stayed in place without a verifiable
+# unlink, so the one-shot discovery read alone is not conclusive). An
+# unlink hitting ENOENT after the passing read (rm -f masks it) is NOT an
+# error — the claim left the path either way, and the discovery read that
+# every caller runs next decides whether it left INTO the lock path.
+_LOCK_CD_STATE=""
+_lock_claim_delete() {  # $1 = attempt token; $2 = bounded retries on a blocked unlink (0 normal, 1 in traps)
+  local tok="$1" retries="${2:-0}" try=0
+  _lock_claim_state "$tok"
+  case "$_LOCK_CR_STATE" in
+    gone)    _LOCK_CD_STATE="gone";    return 0 ;;
+    foreign) _LOCK_CD_STATE="foreign"; return 0 ;;
+    unreadable)
+      _LOCK_CD_STATE="leaked-unreadable"
+      _lock_leaked_add "$tok" "deletion-read-unreadable"
+      return 0 ;;
+  esac
+  # Ours: unlink, with the caller's bounded retry budget on a blocked unlink
+  # (a no-delete-share handle can refuse the delete while the file stays).
+  while :; do
+    if rm -f -- "$_LOCK_CLAIM_PATH" 2>/dev/null; then
+      _LOCK_CD_STATE="deleted"; return 0
+    fi
+    if ! [ -e "$_LOCK_CLAIM_PATH" ]; then
+      _LOCK_CD_STATE="deleted"; return 0   # vanished mid-try: same as ENOENT
+    fi
+    [ "$try" -ge "$retries" ] && break
+    try=$((try+1))
+    sleep 0.05
+  done
+  _LOCK_CD_STATE="leaked-blocked"
+  _lock_leaked_add "$tok" "deletion-unlink-blocked-while-present"
+  return 0
+}
+
+# Re-judge the LOCK's staleness fresh (the step-2 / step-3.3 re-verify):
+# type, mtime + floor, age, content shape. Sets _LOCK_LV_STATE to one of:
+#   stale     confirmed stale (and _LOCK_LV_TOK/_LOCK_LV_LINE2/_LOCK_LV_AGE)
+#   gone      path absent
+#   fresh     not confirmable as stale (young mtime, sub-floor/unsettled,
+#             unreadable mtime or content — never steal what we can't prove)
+#   wrongtype not a regular file, or content not lock-shaped
+_LOCK_LV_STATE=""
+_LOCK_LV_TOK=""
+_LOCK_LV_LINE2=""
+_LOCK_LV_AGE=""
+_lock_verify_stale() {
+  _LOCK_LV_STATE=""; _LOCK_LV_TOK=""; _LOCK_LV_LINE2=""; _LOCK_LV_AGE=""
+  if ! [ -e "$AGENT_LOCK_PATH" ] && ! [ -L "$AGENT_LOCK_PATH" ]; then
+    _LOCK_LV_STATE="gone"; return 0
+  fi
+  if ! [ -f "$AGENT_LOCK_PATH" ] || [ -L "$AGENT_LOCK_PATH" ]; then
+    _LOCK_LV_STATE="wrongtype"; return 0
+  fi
+  local mt age
+  _lock_path_mtime; mt="$_LOCK_MTIME"
+  if [ -z "$mt" ]; then
+    # Vanished mid-probe, or mtime unreadable while present: not provably
+    # stale either way.
+    if [ -e "$AGENT_LOCK_PATH" ] || [ -L "$AGENT_LOCK_PATH" ]; then
+      _LOCK_LV_STATE="fresh"
+    else
+      _LOCK_LV_STATE="gone"
+    fi
+    return 0
+  fi
+  if ! [ "$mt" -gt 946684800 ] 2>/dev/null; then
+    _LOCK_LV_STATE="fresh"; return 0      # sub-floor: unsettled, never stale
+  fi
+  age=$(( $(_lock_now) - mt ))
+  if [ "$age" -lt "$AGENT_LOCK_STALE_SECS" ]; then
+    _LOCK_LV_STATE="fresh"; return 0
+  fi
+  # Content shape (one open; line 2 is the ghost attribution for the log).
+  local line1="" line2="" rdrc=0
+  { IFS= read -r line1 || rdrc=$?; IFS= read -r line2 || true; } 2>/dev/null < "$AGENT_LOCK_PATH" || rdrc=$?
+  line1="${line1%"${line1##*[![:space:]]}"}"
+  line2="${line2%"${line2##*[![:space:]]}"}"
+  if [ -n "$line1" ]; then
+    case "$line1" in
+      tok.*) _LOCK_LV_STATE="stale" ;;
+      *)     _LOCK_LV_STATE="wrongtype" ;;
+    esac
+  elif ! [ -e "$AGENT_LOCK_PATH" ] && ! [ -L "$AGENT_LOCK_PATH" ]; then
+    _LOCK_LV_STATE="gone"
+  elif ! [ -s "$AGENT_LOCK_PATH" ]; then
+    _LOCK_LV_STATE="stale"                 # the empty crash-orphan lane
+  elif [ "$rdrc" -ne 0 ]; then
+    _LOCK_LV_STATE="fresh"                 # unreadable content: not provable
+  else
+    _LOCK_LV_STATE="wrongtype"             # non-empty but blank line 1
+  fi
+  _LOCK_LV_TOK="$line1"; _LOCK_LV_LINE2="$line2"; _LOCK_LV_AGE="$age"
+}
+
+# Atomic rename-over of the claim onto the lock path. Bare `mv` onto a
+# DIRECTORY destination moves the source INTO it (probe R4) — exactly the
+# wrong thing — so use GNU `mv -T` (refuses any directory destination) where
+# available, probed once per process via a temp-dir micro-rename; on
+# platforms without it (BSD/macOS) fall back to a last-instant [ -d ] guard
+# + bare mv (residual documented in ACCEPTED RESIDUALS). Returns mv's rc.
+_LOCK_MVT=""   # "" = unprobed; 1 = mv -T supported; 0 = not
+_lock_rename_over() {
+  if [ -z "$_LOCK_MVT" ]; then
+    local pd="${TMPDIR:-/tmp}/.gcl-mvt-probe.$$.$RANDOM"
+    if mkdir -p "$pd" 2>/dev/null \
+       && printf 'a' > "$pd/a" 2>/dev/null && printf 'b' > "$pd/b" 2>/dev/null \
+       && mv -T -- "$pd/a" "$pd/b" 2>/dev/null && ! [ -e "$pd/a" ]; then
+      _LOCK_MVT=1
+    else
+      _LOCK_MVT=0
+    fi
+    rm -rf "$pd" 2>/dev/null || true
+  fi
+  if [ "$_LOCK_MVT" = 1 ]; then
+    mv -T -- "$_LOCK_CLAIM_PATH" "$AGENT_LOCK_PATH" 2>/dev/null
+  else
+    [ -d "$AGENT_LOCK_PATH" ] && return 1
+    mv -- "$_LOCK_CLAIM_PATH" "$AGENT_LOCK_PATH" 2>/dev/null
+  fi
+}
+
+# Trap-time claim cleanup (see the header rule; called by the EXIT/INT/TERM
+# handlers when no hold exists): if a claim attempt is in flight, run the
+# token-checked deletion with ONE bounded retry (an exiting trap cannot wait
+# out a blockage), then the final discovery read — a discovery-HOLD here
+# sets _LOCK_HELD, and the handler releases it per normal trap semantics.
+# NO lock-release semantics (98) ever run on a mere claim.
+_lock_claim_trap_cleanup() {
+  [ -n "$_LOCK_CLAIM_TOKEN" ] || return 0
+  local tok="$_LOCK_CLAIM_TOKEN"
+  _LOCK_CLAIM_TOKEN=""
+  _lock_claim_delete "$tok" 1
+  if [ "$_LOCK_CD_STATE" = "leaked-blocked" ]; then
+    _lock_log "trap: claim tok=$tok undeletable after the bounded retry; exiting leaving it (ages out <= ${AGENT_LOCK_CLAIM_STALE_SECS}s — residual-5 class)"
+  fi
+  _lock_discover "$tok" || true
+  return 0
+}
+
 # EXIT while holding the lock: release it, then run the caller's ORIGINAL exit
 # trap ourselves — bash does not re-run an EXIT trap re-armed during EXIT-trap
 # execution, so lock_release's restore alone would silently skip it.
 _lock_on_exit() {
   local rc=$? prev="$_LOCK_SAVED_TRAP_EXIT" cmd=""
-  lock_release || true
+  # Claim-window mode (handlers are armed from acquire START): no hold yet
+  # means a claim attempt may be in flight — clean it up (token-checked, one
+  # bounded retry) and run the discovery read; a discovery-HOLD falls
+  # through into the normal release below.
+  if [ "${_LOCK_HELD:-0}" != 1 ]; then
+    _lock_claim_trap_cleanup
+  fi
+  if [ "${_LOCK_HELD:-0}" = 1 ]; then
+    lock_release || true
+  else
+    # Exiting from the wait loop without a hold: the arc ends here — run the
+    # best-effort resolution pass over any pending leaked entries and put
+    # the caller's traps back.
+    _lock_leaked_resolve_pass
+    _lock_restore_traps
+  fi
   cmd="$(_lock_saved_trap_cmd "$prev")"
   if [ -n "$cmd" ]; then eval "$cmd"; fi
   return "$rc"
@@ -507,11 +1006,233 @@ _lock_on_exit() {
 # release+re-raise machinery directly.
 _lock_on_signal() {
   local sig="$1"
-  lock_release || true
+  # Claim-window mode: see _lock_on_exit. A discovery-HOLD inside the trap
+  # sets _LOCK_HELD and is released per normal trap semantics right below.
+  if [ "${_LOCK_HELD:-0}" != 1 ]; then
+    _lock_claim_trap_cleanup
+  fi
+  if [ "${_LOCK_HELD:-0}" = 1 ]; then
+    lock_release || true
+  else
+    _lock_leaked_resolve_pass
+    _lock_restore_traps
+  fi
   # Belt and braces: if our handler is somehow still armed (release was a
   # no-op), drop it so the re-raise cannot loop back here.
   case "$(trap -p "$sig")" in *_lock_on_signal*) trap - "$sig";; esac
   kill -s "$sig" "$$"
+}
+
+# Squatted-steal log damper (see lock_acquire): epoch of the last logged
+# failed-steal attempt, 0 when the last attempt did not fail that way; and
+# the per-attempt "may we log" verdict derived from it.
+_LOCK_STEAL_FAIL_LAST=0
+_LOCK_STEAL_LOG_OK=1
+
+# The ordered install sequence (protocol steps 2-3.4), entered with OUR
+# claim freshly created (token $1; _LOCK_CLAIM_TOKEN set by the caller).
+# Returns 0 iff a hold was taken (rename-over read-back, or a
+# discovery-HOLD); 1 means the attempt resolved without a hold and the
+# caller falls through to the timeout check + poll sleep. Every exit that
+# does not end in a successful rename runs its token-checked claim handling
+# and then the FINAL DISCOVERY READ as its last act (the header's
+# ownership-discovery rule — position-blind, unconditional).
+_lock_steal_install() {  # $1 = this claim attempt's token
+  local tok="$1" reason ghost rb cm cage
+  # Step 2: re-verify the lock still stale under the claim. The claim
+  # serializes stealers, so this judgment is fresh and exclusive — except
+  # for the inventoried verify->rename residual (header, residual 1).
+  _lock_verify_stale
+  if [ "$_LOCK_LV_STATE" != "stale" ]; then
+    case "$_LOCK_LV_STATE" in
+      gone)      reason="gone" ;;       # do NOT rename onto the absent path:
+                                        # that lane belongs to the create race
+      wrongtype) reason="wrong-type" ;; # next poll's type guard classifies it
+      *)         reason="fresh" ;;
+    esac
+    _lock_claim_delete "$tok" 0
+    _lock_log "CLAIM-ABORT ($reason) tok=$tok (lock re-verify after claim: $_LOCK_LV_STATE)"
+    _LOCK_CLAIM_TOKEN=""
+    _lock_discover "$tok" && return 0
+    return 1
+  fi
+  # Step 3.1: claim recheck — it must still carry OUR token and be YOUNGER
+  # than CLAIM_STALE: a long-suspended claimant must not proceed on a claim
+  # a waiter may already have judged stale (the stale-claim TOCTOU).
+  _lock_claim_state "$tok"
+  case "$_LOCK_CR_STATE" in
+    gone)
+      _lock_log "claim recheck: claim gone (tok=$tok) — a rival's rename may have installed it; discovery read"
+      _LOCK_CLAIM_TOKEN=""
+      _lock_discover "$tok" && return 0
+      return 1 ;;
+    foreign)
+      # A clearer removed ours and a rival claimed (or a rival is
+      # mid-create): leave the rival's claim alone. Ours may have been
+      # installed at the lock BEFORE the rival claimed — discovery decides.
+      _lock_log "claim recheck: foreign token '${_LOCK_CR_TOK:-<empty>}' at the claim (ours tok=$tok) — leaving it; discovery read"
+      _LOCK_CLAIM_TOKEN=""
+      _lock_discover "$tok" && return 0
+      return 1 ;;
+    unreadable)
+      # We cannot verify the claim is ours OR not ours: leave it (it ages
+      # out) and remember the token — the one-shot discovery read below is
+      # NOT conclusive for this exit (the claim stays installable), so the
+      # leaked-token memory keeps watching.
+      _lock_leaked_add "$tok" "recheck-unreadable"
+      _LOCK_CLAIM_TOKEN=""
+      _lock_discover "$tok" && return 0
+      return 1 ;;
+  esac
+  # Ours: overage check (same mtime + floor rules as everywhere; a
+  # sub-floor or unreadable claim mtime means "unsettled, just created" —
+  # never "ancient").
+  cm="$(_lock_stat_mtime "$_LOCK_CLAIM_PATH")"
+  if [ -n "$cm" ] && [ "$cm" -gt 946684800 ] 2>/dev/null; then
+    cage=$(( $(_lock_now) - cm ))
+    if [ "$cage" -ge "$AGENT_LOCK_CLAIM_STALE_SECS" ]; then
+      # Overaged: a clearer may be acting on this claim right now — assume
+      # contested; delete our own claim (token-checked) and back off.
+      _lock_claim_delete "$tok" 0
+      _lock_log "CLAIM-ABORT (contested) tok=$tok claim-age=${cage}s >= ${AGENT_LOCK_CLAIM_STALE_SECS}s"
+      _LOCK_CLAIM_TOKEN=""
+      _lock_discover "$tok" && return 0
+      return 1
+    fi
+  fi
+  # Step 3.2: NON-creating touch — the installed lock's staleness clock is
+  # the claim's mtime (rename preserves it, probe R2), so the touch makes
+  # the new holder's lease start ~now. `touch -c` on a missing file exits 0
+  # (POSIX, probe R3): the exit code carries NO gone signal — only the
+  # explicit existence check does. A creating touch would resurrect a
+  # vanished claim as a fresh empty ${LOCK}.next blocking every rival claim
+  # until it aged out, and mask the gone signal discovery keys on.
+  touch -c -- "$_LOCK_CLAIM_PATH" 2>/dev/null || true
+  if ! [ -e "$_LOCK_CLAIM_PATH" ]; then
+    _lock_log "claim gone at touch (tok=$tok); discovery read"
+    _LOCK_CLAIM_TOKEN=""
+    _lock_discover "$tok" && return 0
+    return 1
+  fi
+  # Step 3.3: re-verify the lock still stale, once more, immediately before
+  # the rename.
+  _lock_verify_stale
+  if [ "$_LOCK_LV_STATE" != "stale" ]; then
+    case "$_LOCK_LV_STATE" in
+      gone)      reason="gone" ;;
+      wrongtype) reason="wrong-type" ;;
+      *)         reason="fresh" ;;
+    esac
+    _lock_claim_delete "$tok" 0
+    _lock_log "CLAIM-ABORT ($reason) tok=$tok (lock re-verify before rename: $_LOCK_LV_STATE)"
+    _LOCK_CLAIM_TOKEN=""
+    _lock_discover "$tok" && return 0
+    return 1
+  fi
+  ghost="${_LOCK_LV_LINE2:-?}"
+  # Step 3.4: rename-over — ghost destroyed + our live lock installed in one
+  # atomic op (probe R1: no path-absent window) — then the normal acquire
+  # read-back verification. Attribution caveat: `ghost` names the last
+  # VERIFIED occupant (the step-3.3 re-read); residual 1's verify->rename
+  # gap means the object actually replaced could in principle differ.
+  if _lock_rename_over; then
+    _lock_log "STOLE-BY-CLAIM $AGENT_LOCK_PATH ghost=$ghost by $_LOCK_ME tok=$tok"
+    _LOCK_STEAL_FAIL_LAST=0
+    rb="$(_lock_cur_token)"
+    if [ "$rb" = "$tok" ]; then
+      _lock_take_hold "$tok"
+      return 0
+    fi
+    _LOCK_CLAIM_TOKEN=""
+    _lock_log "WARNING: acquire verification FAILED — steal rename completed but read-back found '${rb:-<empty-or-gone>}' (ours=$tok); not acquired, re-entering wait"
+    echo "git-commit-lock: WARNING — acquire verification failed after a steal: the lock file did not read back our token; treating the lock as NOT acquired and waiting" >&2
+    return 1
+  fi
+  # Rename failed: classify the failure.
+  if ! [ -e "$_LOCK_CLAIM_PATH" ] && ! [ -L "$_LOCK_CLAIM_PATH" ]; then
+    # Source (claim) gone at rename: the canonical discovery case — a
+    # rival's rename may have installed OUR claim file as the lock.
+    _lock_log "steal rename: claim (source) gone at rename (tok=$tok); discovery read"
+    _LOCK_CLAIM_TOKEN=""
+    _lock_discover "$tok" && return 0
+    return 1
+  fi
+  if { [ -e "$AGENT_LOCK_PATH" ] || [ -L "$AGENT_LOCK_PATH" ]; } \
+     && { ! [ -f "$AGENT_LOCK_PATH" ] || [ -L "$AGENT_LOCK_PATH" ]; }; then
+    # Destination wrong-type (e.g. a directory appeared at the lock path):
+    # refuse; the next poll's wrong-type guard classifies the object.
+    # Shares the squatted-steal damper.
+    _lock_claim_delete "$tok" 0
+    if [ "$_LOCK_STEAL_LOG_OK" = 1 ]; then
+      _lock_log "CLAIM-ABORT (rename-refused) tok=$tok — rename refused, non-file at the lock path; re-polling — repeats logged at most once per ${AGENT_LOCK_STALE_SECS}s"
+      _LOCK_STEAL_FAIL_LAST="$(_lock_now)"
+    fi
+    _LOCK_CLAIM_TOKEN=""
+    _lock_discover "$tok" && return 0
+    return 1
+  fi
+  # Blocked: rename refused with the lock file still present (a
+  # no-delete-share handle on the ghost — it blocks rename exactly like the
+  # release unlink, probe D1 — or an unwritable parent dir). Delete our
+  # claim IMMEDIATELY (a failed steal must NOT cost a CLAIM_STALE ageout
+  # penalty), log damped, re-poll honouring MAX_WAIT (the caller's
+  # fall-through reaches the timeout check — never busy-spin here).
+  _lock_claim_delete "$tok" 0
+  if [ "$_LOCK_STEAL_LOG_OK" = 1 ]; then
+    _lock_log "steal FAILED: rename refused with the lock file still present (no-delete-share handle, or unwritable parent dir); claim deleted, re-polling — repeats logged at most once per ${AGENT_LOCK_STALE_SECS}s"
+    _LOCK_STEAL_FAIL_LAST="$(_lock_now)"
+  fi
+  _LOCK_CLAIM_TOKEN=""
+  _lock_discover "$tok" && return 0
+  return 1
+}
+
+# A claim already exists (our O_EXCL claim create failed): a rival mid-steal,
+# or a crashed claimant's leftover. Clear it ONLY when aged past CLAIM_STALE
+# (same mtime + floor rules as the lock — a sub-floor claim mtime is
+# "unsettled, just created", never "ancient, clear") AND claim-shaped (empty,
+# or a "tok."-prefixed line 1) — the never-steal content guard applies to the
+# claim path exactly as to the lock path, with per-path warn-once state. A
+# successful clear logs CLAIM-STALE-CLEARED; the next poll re-races the
+# claim create. A young claim means a live steal is in progress: just wait.
+_lock_claim_stale_check() {
+  local cm cage l1="" rdrc=0 shaped=0 lk
+  cm="$(_lock_stat_mtime "$_LOCK_CLAIM_PATH")"
+  [ -n "$cm" ] || return 0                          # vanished/unreadable mtime: re-poll
+  [ "$cm" -gt 946684800 ] 2>/dev/null || return 0   # sub-floor: unsettled, never clear
+  cage=$(( $(_lock_now) - cm ))
+  [ "$cage" -ge "$AGENT_LOCK_CLAIM_STALE_SECS" ] || return 0
+  { IFS= read -r l1 || rdrc=$?; } 2>/dev/null < "$_LOCK_CLAIM_PATH" || rdrc=$?
+  l1="${l1%"${l1##*[![:space:]]}"}"
+  if [ -n "$l1" ]; then
+    case "$l1" in
+      tok.*) shaped=1 ;;
+      *)     _lock_warn_nonlock_claim "its content is not claim-shaped" ;;
+    esac
+  elif ! [ -e "$_LOCK_CLAIM_PATH" ] && ! [ -L "$_LOCK_CLAIM_PATH" ]; then
+    return 0                                        # vanished mid-check: re-poll
+  elif ! [ -s "$_LOCK_CLAIM_PATH" ]; then
+    shaped=1                                        # genuinely empty: the crash-orphan lane
+  elif [ "$rdrc" -ne 0 ]; then
+    return 0                                        # unreadable: skip this attempt, re-poll
+  else
+    _lock_warn_nonlock_claim "its content is not claim-shaped"
+  fi
+  [ "$shaped" = 1 ] || return 0
+  if rm -f -- "$_LOCK_CLAIM_PATH" 2>/dev/null; then
+    _lock_log "CLAIM-STALE-CLEARED $_LOCK_CLAIM_PATH age=${cage}s tok=${l1:-<empty>}"
+    # If the cleared token was one of OUR leaked entries, this unlink is a
+    # verified resolution — gated on one lock-path read (a rival's rename
+    # can slip into our read->unlink gap and install it).
+    if [ -n "$l1" ] && _lock_leaked_member "$l1"; then
+      lk="$(_lock_read_tok "$AGENT_LOCK_PATH" 1)"
+      if [ "$lk" != "$l1" ]; then
+        _lock_leaked_drop "$l1"
+        _lock_log "leaked-token memory: resolved tok=$l1 (stale claim cleared)"
+      fi
+    fi
+  fi
+  return 0
 }
 
 lock_acquire() {
@@ -524,22 +1245,38 @@ lock_acquire() {
     return 1
   fi
   mkdir -p "$(dirname "$AGENT_LOCK_PATH")" 2>/dev/null || true
-  _lock_sweep_litter
+  _LOCK_CLAIM_PATH="$AGENT_LOCK_PATH.next"
   local start; start="$(_lock_now)"
-  _LOCK_TOKEN="tok.$$.${RANDOM}.$start"
   local waiting_logged=0
   # Log damper for a squatted stale lock (a no-delete-share handle, or an
   # unwritable parent dir, makes the steal rename fail every poll with the
   # file still present): epoch of the last logged failed-steal attempt, 0 when
   # the last attempt did not fail that way. While the failures persist, the
   # STALE/steal-FAILED pair is logged at most once per stale window, so the
-  # log growth stays bounded however long the squat lasts.
-  local steal_fail_last=0
-  # Two-consecutive-poll confirmation state for the wrong-type guard below
+  # log growth stays bounded however long the squat lasts. (Global, not
+  # local: _lock_steal_install shares it.)
+  _LOCK_STEAL_FAIL_LAST=0
+  _LOCK_STEAL_LOG_OK=1
+  # Two-consecutive-poll confirmation state for the wrong-type guards below
   # (round 3 — see WRONG-TYPE CLASSIFICATION): the concrete classification
   # observed on the PREVIOUS blocked poll, reset to empty whenever a poll
-  # sees the path absent, a regular file, or no concrete type.
-  local nonlock_prev=""
+  # sees the path absent, a regular file, or no concrete type. PER PATH:
+  # the lock path and the claim path each keep their own state (a shared
+  # variable would cross-confirm the two-poll requirement between paths).
+  local nonlock_prev="" claim_nonlock_prev=""
+
+  # Save the caller's traps and arm our handlers NOW — claim-window mode
+  # (see TRAP-TIME CLAIM CLEANUP in the header): the handlers are
+  # state-/token-checked, so a signal landing before any claim or hold
+  # exists passes through harmlessly. They stay armed through a hold
+  # (lock_release restores the caller's traps) and are restored below on
+  # every no-hold return.
+  _LOCK_SAVED_TRAP_EXIT="$(trap -p EXIT)"
+  _LOCK_SAVED_TRAP_INT="$(trap -p INT)"
+  _LOCK_SAVED_TRAP_TERM="$(trap -p TERM)"
+  trap '_lock_on_exit' EXIT
+  trap '_lock_on_signal INT' INT
+  trap '_lock_on_signal TERM' TERM
 
   while true; do
     # PRE-CREATE TYPE GUARD (mandatory). noclobber's exists=>fail protection
@@ -558,8 +1295,15 @@ lock_acquire() {
       creatable=1
     fi
 
+    # Fresh token per CREATE attempt (per-attempt tokens — see the header):
+    # a verification-failure-abandoned lock can then never alias a later
+    # attempt's read-back or a discovery read.
+    local tokc=""
+    if [ "$creatable" = 1 ]; then
+      _lock_new_token; tokc="$_LOCK_NEWTOK"
+    fi
     if [ "$creatable" = 1 ] \
-       && ( set -C; printf '%s\n%s\n' "$_LOCK_TOKEN" "$_LOCK_ME" > "$AGENT_LOCK_PATH" ) 2>/dev/null; then
+       && ( set -C; printf '%s\n%s\n' "$tokc" "$_LOCK_ME" > "$AGENT_LOCK_PATH" ) 2>/dev/null; then
       # The redirect is one open(O_CREAT|O_EXCL)+write+close: the file now
       # carries our token and its mtime (the staleness clock) is stamped.
       # The 2>/dev/null is on the SUBSHELL because the noclobber failure
@@ -569,41 +1313,18 @@ lock_acquire() {
       #
       # VERIFY via a path read-back before claiming the hold (see ACQUIRE
       # VERIFICATION in the header): only our own token proves we hold the
-      # path. NEVER repair a failed read-back by writing to the path.
-      #
-      # RESTORE GRACE (2026-06-11): a straggler's steal can displace this
-      # just-created lock in the create->read-back gap; its grave-token
-      # check then RESTORES the file within milliseconds (see the steal
-      # lane). Without a grace, the victim has already abandoned the hold by
-      # then and the restored lock becomes a fresh ORPHAN squatting the path
-      # for a full stale window (observed in the 4-waiter probe) — so on a
-      # gone/empty read-back, re-read briefly: our token REAPPEARING at the
-      # path is full proof of ownership (the detour through the grave is
-      # invisible — same inode, same mtime). A FOREIGN token ends the grace
-      # at once: the path provably belongs to someone else, and a restore of
-      # OUR file can no longer succeed there (the link is fail-if-exists).
-      local rb vi=0
-      while :; do
-        rb="$(_lock_cur_token)"
-        [ "$rb" = "$_LOCK_TOKEN" ] && break
-        [ -n "$rb" ] && break
-        vi=$((vi+1)); [ "$vi" -ge 8 ] && break
-        sleep 0.05
-      done
-      if [ "$rb" = "$_LOCK_TOKEN" ]; then
-        # Save the caller's traps before installing ours; lock_release
-        # restores them on every path, so the caller's handlers survive.
-        _LOCK_SAVED_TRAP_EXIT="$(trap -p EXIT)"
-        _LOCK_SAVED_TRAP_INT="$(trap -p INT)"
-        _LOCK_SAVED_TRAP_TERM="$(trap -p TERM)"
-        _LOCK_HELD=1
-        trap '_lock_on_exit' EXIT
-        trap '_lock_on_signal INT' INT
-        trap '_lock_on_signal TERM' TERM
-        _lock_log "ACQUIRED ($_LOCK_ME tok=$_LOCK_TOKEN)"
+      # path. NEVER repair a failed read-back by writing to the path. The
+      # read runs the FULL retry ladder (the shared escalating schedule in
+      # _lock_cur_token). The wave-1 restore-grace re-read loop is gone
+      # with the graves: under the claim protocol a displaced fresh lock is
+      # never moved aside, so there is nothing to wait for.
+      local rb
+      rb="$(_lock_cur_token)"
+      if [ "$rb" = "$tokc" ]; then
+        _lock_take_hold "$tokc"
         return 0
       fi
-      _lock_log "WARNING: acquire verification FAILED — create won but read-back found '${rb:-<empty-or-gone>}' (ours=$_LOCK_TOKEN); not acquired, re-entering wait"
+      _lock_log "WARNING: acquire verification FAILED — create won but read-back found '${rb:-<empty-or-gone>}' (ours=$tokc); not acquired, re-entering wait"
       echo "git-commit-lock: WARNING — acquire verification failed: the lock file did not read back our token; treating the lock as NOT acquired and waiting" >&2
       # fall through to the blocked branch of this same iteration
     fi
@@ -614,7 +1335,23 @@ lock_acquire() {
     # tests hold-until-WAITING instead of sleeping.
     if [ "$waiting_logged" = 0 ]; then
       waiting_logged=1
-      _lock_log "WAITING for lock ($_LOCK_ME tok=$_LOCK_TOKEN)"
+      _lock_log "WAITING for lock ($_LOCK_ME)"
+    fi
+
+    # LEAKED-TOKEN MEMORY per-poll check (see the header rule; the list is
+    # almost always empty, so this costs nothing in the common case): while
+    # entries are pending, every poll that observes a lock also reads its
+    # line 1 — a LISTED token there means a rival's rename installed OUR
+    # leaked claim as the lock: adopt it as the hold (the entry drops; the
+    # leak is resolved).
+    if [ -n "$_LOCK_LEAKED" ] && [ -f "$AGENT_LOCK_PATH" ]; then
+      local lt; lt="$(_lock_read_tok "$AGENT_LOCK_PATH" 1)"
+      if [ -n "$lt" ] && _lock_leaked_member "$lt"; then
+        _lock_leaked_drop "$lt"
+        _lock_log "DISCOVERY-HOLD (leaked-token memory): leaked claim tok=$lt found installed at the lock path — adopting the hold"
+        _lock_take_hold "$lt"
+        return 0
+      fi
     fi
 
     # PER-POLL TYPE GUARD (cheap; every blocked poll, NOT age-gated): an
@@ -677,131 +1414,72 @@ lock_acquire() {
 
             if [ "$steal_ok" = 1 ]; then
               local holder="${line2:-?}"
-              # Re-read the mtime IMMEDIATELY before the steal: a rival may
-              # have completed steal+re-acquire since our read above, in
-              # which case the file is now a brand-new LIVE lock and
-              # `mv`-ing it aside would rob it. Any change (fresher,
-              # sub-floor, or gone) aborts this attempt and re-enters the
-              # loop. This SHRINKS the check-then-act window; it cannot
-              # close it with these primitives — see KNOWN RESIDUAL RACES
-              # (the residual is detected at the victim's release).
-              local mt2; _lock_path_mtime; mt2="$_LOCK_MTIME"
-              if [ "$mt2" != "$mt" ]; then
-                _lock_log "steal aborted: lock file mtime changed underneath us (was $mt, now ${mt2:-<gone>})"
-                continue
-              fi
-              # Damp the attempt logging while the steal keeps failing on a
-              # squatted file (see steal_fail_last above): first failure, then
-              # at most once per stale window.
-              local now_s log_steal=1
+              # Damp the attempt logging while steals keep failing on a
+              # squatted file (see _LOCK_STEAL_FAIL_LAST above): first
+              # failure, then at most once per stale window.
+              local now_s
               now_s="$(_lock_now)"
-              if [ "$steal_fail_last" != 0 ] \
-                 && [ $(( now_s - steal_fail_last )) -lt "$AGENT_LOCK_STALE_SECS" ]; then
-                log_steal=0
+              _LOCK_STEAL_LOG_OK=1
+              if [ "$_LOCK_STEAL_FAIL_LAST" != 0 ] \
+                 && [ $(( now_s - _LOCK_STEAL_FAIL_LAST )) -lt "$AGENT_LOCK_STALE_SECS" ]; then
+                _LOCK_STEAL_LOG_OK=0
               fi
-              [ "$log_steal" = 1 ] && _lock_log "STALE (age=${age}s holder=$holder) -> stealing"
-              # Atomic steal: rename the stale file aside. Only one
-              # concurrent stealer wins (the rest get ENOENT); then everyone
-              # re-races the create above. A victim that is NOT recovered by
-              # the grave-token check below will fail at ITS lock_release:
-              # gone or foreign token => 98.
-              local grave; grave="$AGENT_LOCK_PATH.dead.$$.$now_s"
-              if mv -- "$AGENT_LOCK_PATH" "$grave" 2>/dev/null; then
-                # GRAVE-TOKEN CHECK (anti-robbery, 2026-06-11). The mt2
-                # re-read above SHRINKS the displaced-live window but cannot
-                # close it: under crash-recovery contention several waiters
-                # judge "stale" off the same ghost mtime, the first one
-                # steals + re-creates a FRESH lock, and a straggler's mv —
-                # landing in its own mtime-recheck->mv gap — moves that fresh
-                # LIVE lock aside, not the ghost (probed 5/5 with 4 waiters
-                # on one ancient lock). So before deleting the grave, re-read
-                # its line-1 token and compare with the token we classified
-                # as stale (line1; empty for the crash-orphan lane, where the
-                # expected grave is empty by STAT — no read ladder needed).
-                # Only a match proves we buried the ghost we judged.
-                local gtok="" gown="" gmatch=0 gi=0
-                if ! [ -s "$grave" ]; then
-                  # Grave empty (or gone — effectively impossible: the grave
-                  # name is ours alone and far too fresh for the sweep).
-                  # Matches only the empty-orphan classification. Residual,
-                  # accepted: a rival's mid-create EMPTY file displaced in
-                  # that lane reads identically to the empty ghost — but that
-                  # rival's acquire verification fails read-back and it
-                  # re-enters the wait, so nothing is silently lost.
-                  [ -z "$line1" ] && gmatch=1
+              # CLAIM-PATH PRE-CREATE TYPE GUARD (mandatory, same reasoning
+              # as the lock path's: a noclobber `>` onto an existing FIFO at
+              # the claim path would HANG in open(2)). Wrong types get the
+              # same two-consecutive-poll confirmation + warn-once, with
+              # per-path state (claim_nonlock_prev — independent from the
+              # lock path's nonlock_prev).
+              local claim_creatable=0
+              if [ -e "$_LOCK_CLAIM_PATH" ] || [ -L "$_LOCK_CLAIM_PATH" ]; then
+                if [ -f "$_LOCK_CLAIM_PATH" ] && ! [ -L "$_LOCK_CLAIM_PATH" ]; then
+                  claim_creatable=1
+                  claim_nonlock_prev=""
                 else
-                  while :; do
-                    gtok=""; gown=""
-                    { IFS= read -r gtok || true; IFS= read -r gown || true; } 2>/dev/null < "$grave" || true
-                    gtok="${gtok%"${gtok##*[![:space:]]}"}"
-                    gown="${gown%"${gown##*[![:space:]]}"}"
-                    [ -n "$gtok" ] && break
-                    gi=$((gi+1)); [ "$gi" -ge 5 ] && break
-                    sleep 0.02
-                  done
-                  [ -n "$gtok" ] && [ "$gtok" = "$line1" ] && gmatch=1
+                  local claim_nonlock_cur=""
+                  if   [ -L "$_LOCK_CLAIM_PATH" ]; then claim_nonlock_cur="a symlink"
+                  elif [ -d "$_LOCK_CLAIM_PATH" ]; then claim_nonlock_cur="a directory"
+                  elif [ -p "$_LOCK_CLAIM_PATH" ]; then claim_nonlock_cur="a FIFO"
+                  elif [ -S "$_LOCK_CLAIM_PATH" ]; then claim_nonlock_cur="a socket"
+                  elif [ -b "$_LOCK_CLAIM_PATH" ] || [ -c "$_LOCK_CLAIM_PATH" ]; then claim_nonlock_cur="a device node"
+                  fi
+                  if [ -n "$claim_nonlock_cur" ] && [ "$claim_nonlock_cur" = "$claim_nonlock_prev" ]; then
+                    _lock_warn_nonlock_claim "it is $claim_nonlock_cur"
+                  fi
+                  claim_nonlock_prev="$claim_nonlock_cur"
+                  # No claim create possible: steals are blocked until the
+                  # object is removed; fall through to timeout + sleep.
                 fi
-                if [ "$gmatch" = 1 ]; then
-                  rm -f -- "$grave" 2>/dev/null || true
-                  _lock_log "STOLE stale lock (was held by $holder)"
-                  steal_fail_last=0
-                  continue   # won the steal: immediately re-race the create
-                fi
-                # DISPLACED-LIVE: the file we moved is, by token proof, NOT
-                # the stale ghost we judged — almost certainly a rival's
-                # brand-new live lock (the other reading — a second straggler's
-                # own displace-then-restore put a different fresh lock here —
-                # changes nothing: either way the file was NOT our ghost).
-                # An UNREADABLE grave (non-empty but the read ladder came back
-                # blank: a Windows sharing violation) takes this lane too: we
-                # cannot prove it matches, and the asymmetry decides it —
-                # restoring a genuinely stale ghost is harmless (it re-ages
-                # and is promptly re-stolen), while deleting a live lock robs
-                # its holder. RESTORE: an atomic fail-if-exists hard link of
-                # the grave back to the lock path (probed on MSYS/NTFS:
-                # plain `ln` makes a real hard link, fails with EEXIST when
-                # the destination exists, and preserves the inode's mtime, so
-                # the restored lock keeps the rival's FRESH staleness clock
-                # and the rival never notices). Then the grave is just a
-                # second name for the same inode; removing it leaves the
-                # restored lock intact (probed). On a filesystem without
-                # hard links the ln fails and we land in the same fallback
-                # as a lost link race.
-                steal_fail_last=0
-                local gdesc="token '${gtok:-<empty-or-unreadable>}' owner '${gown:-?}'"
-                if ln -- "$grave" "$AGENT_LOCK_PATH" 2>/dev/null; then
-                  rm -f -- "$grave" 2>/dev/null || true
-                  _lock_log "STEAL-DISPLACED-LIVE: steal displaced a fresh lock ($gdesc), not the stale ghost we judged (token '${line1:-<empty>}' holder=$holder); RESTORED it via hard link — re-entering wait"
+              else
+                claim_creatable=1
+                claim_nonlock_prev=""
+              fi
+              if [ "$claim_creatable" = 1 ]; then
+                # Fresh token per CLAIM attempt (per-attempt tokens — see
+                # the header). _LOCK_CLAIM_TOKEN arms the trap handlers'
+                # claim-window cleanup BEFORE the create: the handler is
+                # token-checked, so a signal landing pre-create is a
+                # harmless no-op.
+                _lock_new_token
+                local toka="$_LOCK_NEWTOK"
+                _LOCK_CLAIM_TOKEN="$toka"
+                if ( set -C; printf '%s\n%s\n' "$toka" "$_LOCK_ME" > "$_LOCK_CLAIM_PATH" ) 2>/dev/null; then
+                  [ "$_LOCK_STEAL_LOG_OK" = 1 ] && _lock_log "STALE (age=${age}s holder=$holder) -> stealing (claim-serialized)"
+                  _lock_log "CLAIM $_LOCK_CLAIM_PATH tok=$toka by $_LOCK_ME"
+                  if _lock_steal_install "$toka"; then
+                    return 0
+                  fi
+                  # Attempt resolved without a hold: fall through to the
+                  # timeout check + poll sleep (never busy-spin — a blocked
+                  # rename means nothing changes until the squatter lets go).
                 else
-                  # The path was re-created by a third waiter inside our
-                  # mv->ln window (or this filesystem has no hard links):
-                  # the displaced lock cannot go back. Fall open exactly as
-                  # before this check existed — the robbed holder detects at
-                  # ITS release (98, the documented redo).
-                  rm -f -- "$grave" 2>/dev/null || true
-                  _lock_log "STEAL-DISPLACED-LIVE: steal displaced a fresh lock ($gdesc), not the stale ghost we judged (token '${line1:-<empty>}' holder=$holder); restore FAILED (lock path re-created meanwhile) — the displaced holder will detect the theft at release (98)"
+                  # Claim create lost (or failed): a rival is stealing, or a
+                  # crashed claimant's leftover squats the claim path. Clear
+                  # the latter only when aged + claim-shaped; otherwise just
+                  # wait — the rival's steal is in flight.
+                  _LOCK_CLAIM_TOKEN=""
+                  _lock_claim_stale_check
                 fi
-                # Either way we did NOT win: a live lock is (back) at the
-                # path. Re-enter the wait loop — the next iteration loses
-                # the create to that live lock and re-reads its FRESH mtime
-                # (the staleness reading is thereby reset, never carried
-                # over), so it waits rather than re-stealing.
-                continue
-              fi
-              if ! [ -e "$AGENT_LOCK_PATH" ] && ! [ -L "$AGENT_LOCK_PATH" ]; then
-                steal_fail_last=0
-                continue   # lost the race (a rival's rename won; ENOENT): re-race the create
-              fi
-              # The rename failed with the file STILL PRESENT: a no-delete-share
-              # handle squatting the file (it blocks rename exactly like the
-              # release unlink — probe D1) or an unwritable parent dir. Nothing
-              # will change until the squatter lets go, so this must NOT skip
-              # the timeout check + poll sleep below: an unconditional
-              # `continue` here busy-spun flat-out and could never reach 97
-              # (review finding, 2026-06-11). Fall through instead.
-              if [ "$log_steal" = 1 ]; then
-                _lock_log "steal FAILED: rename refused with the lock file still present (no-delete-share handle, or unwritable parent dir); re-polling — repeats logged at most once per ${AGENT_LOCK_STALE_SECS}s"
-                steal_fail_last="$now_s"
               fi
             fi
           fi
@@ -869,6 +1547,11 @@ lock_acquire() {
     if [ $(( $(_lock_now) - start )) -ge "$AGENT_LOCK_MAX_WAIT" ]; then
       _lock_log "TIMEOUT after ${AGENT_LOCK_MAX_WAIT}s waiting for lock"
       echo "git-commit-lock: timed out after ${AGENT_LOCK_MAX_WAIT}s waiting for commit lock" >&2
+      # The arc ends here without a hold: run the best-effort resolution
+      # pass over any pending leaked entries (the blocking handle may have
+      # closed by now) and put the caller's traps back.
+      _lock_leaked_resolve_pass
+      _lock_restore_traps
       return 97
     fi
     sleep "$AGENT_LOCK_POLL_SECS"
@@ -884,8 +1567,11 @@ lock_acquire() {
 # (ownership unverifiable — see the lane comment below); returns 1 if the
 # lock file could not be deleted (LEFTOVER: left behind; recovery needs the
 # stale window AND the blocking handle to close). Always restores the
-# caller's pre-acquire traps. Idempotent: a second call (or a call without a
-# hold) is a successful no-op.
+# caller's pre-acquire traps, and always runs the best-effort arc-end
+# resolution pass over any pending leaked-claim entries (see the
+# leaked-token memory rule; a lock token found in the leaked set is OUR
+# installed leaked claim — cleaned up here, still verdict 98). Idempotent: a
+# second call (or a call without a hold) is a successful no-op.
 lock_release() {
   [ "${_LOCK_HELD:-0}" = "1" ] || return 0
   _LOCK_HELD=0
@@ -904,6 +1590,42 @@ lock_release() {
     cur="$(_lock_cur_token)"
   fi
   if [ "$cur" != "$_LOCK_TOKEN" ]; then
+    # LEAKED-CLAIM CLEANUP (see the leaked-token memory rule): a token that
+    # is not our hold token but IS in our leaked set is — by per-attempt
+    # token uniqueness — OUR leaked claim, installed over our held lock by a
+    # rival's rename. Our actual hold WAS displaced (the verdict stays 98),
+    # but the installed orphan is ours to clean: re-read immediately before
+    # the unlink (the ours-path boundary mitigation — an instantly-stale
+    # installed leak can already have been stolen by a successor whose live
+    # lock a naive unlink would rob), then unlink with the ours-path bounded
+    # retry + LEFTOVER behaviour.
+    if [ -n "$cur" ] && _lock_leaked_member "$cur"; then
+      local lre; lre="$(_lock_cur_token)"
+      if [ "$lre" = "$cur" ]; then
+        local _ltry=0 lcleaned=1
+        while ! rm -f -- "$AGENT_LOCK_PATH" 2>/dev/null; do
+          _ltry=$((_ltry+1))
+          if [ "$_ltry" -ge 5 ]; then lcleaned=0; break; fi
+          sleep 0.02
+        done
+        if [ "$lcleaned" = 1 ]; then
+          _lock_log "RELEASE-CLEANED-LEAKED-CLAIM $AGENT_LOCK_PATH tok=$cur"
+        else
+          _lock_log "WARNING: release could not delete our installed leaked claim after $_ltry attempts; LEFTOVER (tok=$cur). It ages out within ${AGENT_LOCK_STALE_SECS}s once the blocking handle closes."
+          echo "git-commit-lock: WARNING — could not remove our leaked claim installed at $AGENT_LOCK_PATH; it is left behind and will block waiters until the ${AGENT_LOCK_STALE_SECS}s stale window expires and whatever holds it open lets go" >&2
+        fi
+      fi
+      # Re-read no longer the leaked token: a successor stole/replaced it —
+      # its rename destroyed our leaked claim, resolving the leak; do NOT
+      # touch the successor's live lock. Either way the entry is resolved.
+      _lock_leaked_drop "$cur"
+      _lock_leaked_resolve_pass
+      _lock_restore_traps
+      _lock_log "WARNING: lock LOST before release — our held lock was displaced by our own leaked claim (rival rename). This commit was NOT exclusive — redo it. (ours=$_LOCK_TOKEN installed-leak=$cur)"
+      echo "git-commit-lock: WARNING — lock was stolen mid-hold (displaced by a leaked claim of ours, since cleaned). Your commit was NOT serialised; verify with 'git log' and redo under the lock." >&2
+      return 98
+    fi
+    _lock_leaked_resolve_pass
     _lock_restore_traps
     if [ -z "$cur" ] && [ -e "$AGENT_LOCK_PATH" ]; then
       # The file still exists but reads EMPTY after the retry ladder. NOT
@@ -943,6 +1665,7 @@ lock_release() {
       # success — waiters stay blocked until the stale window elapses AND the
       # blocking handle closes (the same handle blocks their steal rename,
       # so until then they re-poll and may reach 97).
+      _lock_leaked_resolve_pass
       _lock_restore_traps
       _lock_log "WARNING: release FAILED — could not delete the lock file after $_try attempts; LEFTOVER (tok=$_LOCK_TOKEN). Waiters are blocked until the ${AGENT_LOCK_STALE_SECS}s stale window elapses AND the blocking handle closes."
       echo "git-commit-lock: WARNING — could not remove the lock file ($AGENT_LOCK_PATH); it is left behind and will block waiters until the ${AGENT_LOCK_STALE_SECS}s stale window expires and whatever holds it open lets go" >&2
@@ -950,6 +1673,9 @@ lock_release() {
     fi
     sleep 0.02
   done
+  # Arc end: one best-effort resolution pass over any pending leaked entries
+  # (almost always a no-op — the list is empty in the common case).
+  _lock_leaked_resolve_pass
   _lock_restore_traps
   _lock_log "RELEASED ($_LOCK_ME tok=$_LOCK_TOKEN)"
   return 0
