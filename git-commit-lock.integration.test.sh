@@ -16,10 +16,24 @@
 # absent; the bash-only section always runs. Exit 0 == all pass.
 #   bash ~/.local/bin/git-commit-lock.integration.test.sh
 #
+# Fan-out: the worker swarms default to REDUCED width so routine dev runs
+# don't lag a live shared machine; set GCL_TEST_FULL=1 (CI does) for the
+# full-strength canary. The suite prints which mode ran — a reduced pass must
+# never masquerade as the full one.
+#
 # On failure the work dir (scratch repo, per-worker stdout/stderr/rc captures,
 # lock log) is PRESERVED (path printed) for post-mortem; set
 # GCL_TEST_PRESERVE_DIR=<dir> to additionally copy everything there regardless
 # of outcome (used by CI) — same semantics as the unit suite.
+#
+# shellcheck disable=SC2015  # The pervasive `<assert> && ok ... || bad ...`
+# idiom is deliberate throughout: ok/bad are echo+counter helpers that cannot
+# fail, so the classic A && B || C pitfall (C running after B fails) is moot.
+# shellcheck disable=SC2312  # info-level, deliberate: command substitutions
+# run inside conditions all over a test suite; the suite runs WITHOUT errexit
+# (set -uo only) and asserts on values, not on implicit exit propagation.
+# shellcheck disable=SC2016  # single-quoted command strings are deliberate:
+# they expand inside a worker's `bash -c` invocation, not here.
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -53,16 +67,28 @@ bad() { echo "FAIL: $*"; FAIL=$((FAIL+1)); }
 # --- sizing ------------------------------------------------------------------
 # Commits serialise (that's the whole point), so wall time ≈ workers x commit
 # cost, and on this Windows/Cygwin box a spawn+add+commit is ~0.5-1s, a pwsh
-# startup 1-3s. 2 rounds x 12 bash workers + 1 mixed round of 5+5 = 34 commits
-# keeps the suite well under ~2-3 minutes even on a loaded machine, while still
-# being a real 12-way concurrent pile-up on one index. Assertions are STRICT —
-# a worker that fails to launch or commit fails the suite (no "fan-out
-# flakiness" tolerance here, unlike the interop suite's exclusion test: this
-# suite exists to prove every commit LANDS). If heavy process fan-out ever
-# makes launches flaky at this size, reduce N further rather than tolerating
-# loss. 12-way is modest enough that launches have been reliable in practice.
-BN=12; BROUNDS=2          # bash swarm: BROUNDS rounds x BN workers
-MSH=5; MPS=5              # mixed swarm: MSH bash + MPS pwsh workers, 1 round
+# startup 1-3s. FULL: 2 rounds x 12 bash workers + 1 mixed round of 5+5 = 34
+# commits keeps the suite well under ~2-3 minutes even on a loaded machine,
+# while still being a real 12-way concurrent pile-up on one index; REDUCED
+# (the default) scales that to 1 x 6 + 3+3 = 12 commits — still a real
+# concurrent pile-up, ~1/3 the spawn load. Assertions are STRICT in both
+# modes — a worker that fails to launch or commit fails the suite (no
+# "fan-out flakiness" tolerance here, unlike the interop suite's exclusion
+# test: this suite exists to prove every commit LANDS). If heavy process
+# fan-out ever makes launches flaky at this size, reduce N further rather
+# than tolerating loss. 12-way is modest enough that launches have been
+# reliable in practice.
+if [ "${GCL_TEST_FULL:-0}" = 1 ]; then
+  GCL_MODE="FULL"
+  BN=12; BROUNDS=2        # bash swarm: BROUNDS rounds x BN workers
+  MSH=5; MPS=5            # mixed swarm: MSH bash + MPS pwsh workers, 1 round
+else
+  GCL_MODE="REDUCED"
+  BN=6; BROUNDS=1
+  MSH=3; MPS=3
+fi
+echo "fan-out mode: $GCL_MODE (bash swarm ${BROUNDS}x${BN}, mixed swarm ${MSH}+${MPS})"
+[ "$GCL_MODE" = REDUCED ] && echo "  (set GCL_TEST_FULL=1 for the full-strength canary — CI runs it)"
 # Lock knobs: default-equivalent stale window (no spurious steals in a
 # minutes-long run), fast poll so waiters don't add 2s each, and a generous but
 # bounded max wait so a wedge fails the suite instead of hanging it.
@@ -83,7 +109,7 @@ git -C "$REPO" commit -q --allow-empty -m "initial (empty)" \
   || { echo "FATAL: could not create initial commit"; exit 1; }
 
 GITDIR="$(git -C "$REPO" rev-parse --absolute-git-dir)"
-LOCKDIR="$GITDIR/commit.lock"           # both impls' default lock location
+LOCKFILE="$GITDIR/commit.lock"          # both impls' default lock location
 LLOG="$GITDIR/git-commit-lock.log"      # both impls' default lock log
 
 # --- workers -----------------------------------------------------------------
@@ -221,9 +247,8 @@ done
 # worker should ever have hit git's own index.lock failure.
 if grep -l -e "index.lock" -e "Unable to create" "$OUTD"/*.err "$OUTD"/*.out 2>/dev/null; then
   bad "index.lock / 'Unable to create' errors in worker output (files listed above)"
-  for f in $(grep -l -e "index.lock" -e "Unable to create" "$OUTD"/*.err "$OUTD"/*.out 2>/dev/null); do
-    dump_worker "$(basename "${f%.*}")"
-  done
+  grep -l -e "index.lock" -e "Unable to create" "$OUTD"/*.err "$OUTD"/*.out 2>/dev/null \
+    | while read -r f; do dump_worker "$(basename "${f%.*}")"; done
 else
   ok "no index.lock / 'Unable to create' errors in any worker's output"
 fi
@@ -231,6 +256,12 @@ fi
 # 3f. Lock log: every hold acquired+released cleanly; no stolen leases, no
 # spurious steals, no timeouts (stale=300 over a minutes-long run means any
 # steal would be a real bug).
+# KNOWN-WATCH (flake risk, Windows FULL mode): these counts read ONE shared
+# log that all workers append to concurrently, and both impls' guarded log
+# writes silently drop a line on a transient sharing violation. If this gate
+# ever flakes, switch to per-worker lock logs summed over the concatenation,
+# as the interop suite's T1 does (see its comment). First full-strength CI
+# run passed, so watch only.
 a="$(grep -c ACQUIRED "$LLOG" 2>/dev/null)"; rl="$(grep -c RELEASED "$LLOG" 2>/dev/null)"
 [ "$a" = "$TOTAL" ] && [ "$rl" = "$TOTAL" ] \
   && ok "lock log balanced: $a acquired, $rl released (== $TOTAL workers)" \
@@ -247,9 +278,9 @@ st="$(git -C "$REPO" status --porcelain)"
 [ -z "$st" ] && ok "working tree clean at end" \
              || { bad "working tree not clean:"; echo "$st" | sed 's/^/  /'; }
 
-# 3h. No leftover lock dir.
-[ -e "$LOCKDIR" ] && bad "leftover lock dir: $LOCKDIR" || ok "no leftover lock dir"
+# 3h. No leftover lock file.
+[ -e "$LOCKFILE" ] && bad "leftover lock file: $LOCKFILE" || ok "no leftover lock file"
 
 echo
-echo "==== INTEGRATION RESULT: $PASS passed, $FAIL failed ===="
+echo "==== INTEGRATION RESULT: $PASS passed, $FAIL failed (fan-out: $GCL_MODE) ===="
 [ "$FAIL" = 0 ]
