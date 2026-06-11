@@ -29,9 +29,9 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB="$DIR/git-commit-lock.sh"
 
 if [ "${GCL_TEST_FULL:-0}" = 1 ]; then
-  GCL_MODE="FULL"; T1_ROUNDS=8; T1_N=25
+  GCL_MODE="FULL"; T1_ROUNDS=8; T1_N=25; T2B_ROUNDS=4
 else
-  GCL_MODE="REDUCED"; T1_ROUNDS=3; T1_N=8
+  GCL_MODE="REDUCED"; T1_ROUNDS=3; T1_N=8; T2B_ROUNDS=2
 fi
 echo "fan-out mode: $GCL_MODE (T1 ${T1_ROUNDS} rounds x ${T1_N} workers)"
 [ "$GCL_MODE" = REDUCED ] && echo "  (set GCL_TEST_FULL=1 for the full-strength 8x25 canary — CI runs it)"
@@ -139,6 +139,82 @@ grep -q STOLE "$LOG" && ok "log records a steal" || bad "no STOLE entry"
 grep -q "holder=pid=99999 host=ghost" "$LOG" \
   && ok "STALE log line carries the holder parsed from line 2" \
   || bad "holder from line 2 missing in the STALE log line"
+
+echo "== Test 2b: crash recovery under CONTENTION — stragglers must not rob the recovery winner ($GCL_MODE: $T2B_ROUNDS rounds) =="
+# The acquire-side displaced-live race (KNOWN RESIDUAL RACES in the impl
+# header): after a holder crashes, every waiter judges "stale" off the same
+# ghost mtime in the same poll window; the first steals + re-creates a FRESH
+# lock, and a straggler's mv — landing in its own mtime-recheck->mv gap —
+# displaces that innocent recovery winner, not the ghost. The grave-token
+# check must detect the mismatch and RESTORE the displaced lock (atomic hard
+# link), with the unrestorable third-party-re-create window staying a LOUD
+# 98. The interleaving is probabilistic, so the assertions are
+# outcome-shaped (they hold whichever interleaving happened) plus one
+# regression discriminator: pre-fix, the straggler's robbery logged a SECOND
+# STOLE line misattributed to the ghost (probed 5/5 with 4 waiters on one
+# ancient lock) and no displacement detection existed at all.
+# Sync: waiters launch against a FRESH fabricated lock and only once all
+# have logged WAITING is the lock backdated — so all judge stale within one
+# poll window (launch jitter would otherwise stagger them past the race).
+T2B_N=4
+t2b_fail=0; t2b_ghost_stole=0; t2b_disp=0; t2b_rest=0; t2b_dispfail=0
+for r in $(seq 1 "$T2B_ROUNDS"); do
+  LOCK="$WORK/recov.$r.lock"; RAN="$WORK/recov.$r.ran"; : > "$RAN"
+  fabricate_lock "$LOCK" "tok.ghost.t2b.$r" "pid=999 host=ghost"   # fresh mtime: not yet stale
+  pids=()
+  for i in $(seq 1 "$T2B_N"); do
+    : > "$WORK/recov.$r.$i.log"   # per-waiter logs: concurrent appends to one log drop lines
+    AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$WORK/recov.$r.$i.log" AGENT_LOCK_STALE_SECS=3 \
+      AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=120 \
+      bash "$LIB" run -- bash -c 'echo ran >> "$1"; sleep 0.1' _ "$RAN" 2>/dev/null &
+    pids+=($!)
+  done
+  for i in $(seq 1 "$T2B_N"); do
+    wait_for_grep "WAITING for lock" "$WORK/recov.$r.$i.log" 30 \
+      || { t2b_fail=1; echo "  round $r: waiter $i never logged WAITING"; }
+  done
+  backdate "$LOCK" 9999            # all waiters now judge the ghost stale together
+  n98=0
+  for i in $(seq 1 "$T2B_N"); do
+    wait "${pids[$((i-1))]}"; rc=$?
+    case "$rc" in
+      0)  ;;
+      98) n98=$((n98+1)) ;;       # loud fail-open redo: allowed, accounted below
+      *)  t2b_fail=1; echo "  round $r: waiter $i rc=$rc (want 0 or a loud 98)" ;;
+    esac
+  done
+  cat "$WORK/recov.$r."*.log > "$WORK/recov.$r.all.log"
+  nran="$(grep -c ran "$RAN")"
+  [ "$nran" = "$T2B_N" ] || { t2b_fail=1; echo "  round $r: only $nran/$T2B_N commands ran"; }
+  nlost="$(grep -c "WARNING: lock LOST" "$WORK/recov.$r.all.log")"
+  [ "$nlost" -ge "$n98" ] || { t2b_fail=1; echo "  round $r: $n98 exit-98s but only $nlost LOST warnings — silent robbery?"; }
+  [ -e "$LOCK" ] && { t2b_fail=1; echo "  round $r: leftover lock"; }
+  for d in "$LOCK".dead.*; do
+    [ -e "$d" ] && { t2b_fail=1; echo "  round $r: leftover grave ${d##*/}"; }
+  done
+  t2b_ghost_stole=$(( t2b_ghost_stole + $(grep -c "STOLE stale lock (was held by pid=999 host=ghost)" "$WORK/recov.$r.all.log") ))
+  t2b_disp=$((     t2b_disp     + $(grep -c "STEAL-DISPLACED-LIVE" "$WORK/recov.$r.all.log") ))
+  t2b_rest=$((     t2b_rest     + $(grep -c "RESTORED it via hard link" "$WORK/recov.$r.all.log") ))
+  t2b_dispfail=$(( t2b_dispfail + $(grep -c "restore FAILED" "$WORK/recov.$r.all.log") ))
+done
+[ "$t2b_fail" = 0 ] && ok "$T2B_ROUNDS rounds x $T2B_N waiters on one crashed lock: all ran, every exit 0 or a loud 98, clean final state" \
+                    || bad "crash-recovery contention failure (see above)"
+[ "$t2b_ghost_stole" -ge 1 ] && ok "the crashed ghost was reclaimed (ghost-attributed STOLE x$t2b_ghost_stole)" \
+                             || bad "ghost never stolen — crash recovery did not happen"
+# Regression discriminator (see the test header comment): more ghost-
+# attributed steals than ghosts with ZERO displacement detections means the
+# grave-token check is gone. (With the check present, the only way a ghost
+# is "stolen twice" is the rare unreadable-grave restore resurrecting it —
+# which logs a STEAL-DISPLACED line first, so t2b_disp > 0 keeps this green.)
+if [ "$t2b_ghost_stole" -gt "$T2B_ROUNDS" ] && [ "$t2b_disp" = 0 ]; then
+  bad "ghost stolen $t2b_ghost_stole times across $T2B_ROUNDS rounds with zero STEAL-DISPLACED detections — grave-token check regression!"
+else
+  ok "no misattributed double-steal of the ghost (displacements detected=$t2b_disp restored=$t2b_rest unrestorable=$t2b_dispfail)"
+fi
+# The displaced lane must always conclude loudly, one of exactly two ways.
+[ "$t2b_disp" = $((t2b_rest + t2b_dispfail)) ] \
+  && ok "every detected displacement concluded loudly (RESTORED or restore-FAILED)" \
+  || bad "displacement accounting wrong: $t2b_disp detected != $t2b_rest restored + $t2b_dispfail restore-failed"
 
 echo "== Test 3: REGRESSION — EMPTY lock file (crash between create and write) is still stolen =="
 # The file-protocol descendant of the 2026-05-30 orphan bug: an acquirer that

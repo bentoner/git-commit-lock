@@ -805,6 +805,73 @@ grep -q "is not a lock file" "$WORK/psuser.err" && ok "ps1: config warning names
 grep -q STOLE "$LOG" && bad "ps1 STOLE the user file" || ok "ps1: no steal of the user file"
 rm -f "$LOCK"
 
+echo "== Test 16: crash recovery under CONTENTION, mixed impls — stragglers must not rob the recovery winner =="
+# Cross-impl variant of the unit suite's Test 2b (which carries the full
+# rationale): 2 bash + 2 pwsh waiters race ONE crashed lock, so a straggler
+# of either implementation can displace the other implementation's fresh
+# recovery winner — the grave-token check + hard-link restore must hold
+# across the wire format. The interleaving is probabilistic, so the
+# assertions are outcome-shaped: every waiter must RUN its command and exit
+# 0 or a LOUD 98 (97s and silent losses fail), the final state must be
+# clean, and every displacement detection must conclude loudly (RESTORED or
+# restore-FAILED). Sync: waiters launch against a FRESH fabricated lock and
+# only once all four have logged WAITING is it backdated, so all judge
+# stale within one poll window despite pwsh's slow cold start.
+LOCK="$WORK/recov.lock"
+fabricate_lock "$LOCK" "tok.ghost.recov.1" "pid=999 host=ghost"   # fresh mtime: not yet stale
+rm -f "$WORK"/recov.ran.* 2>/dev/null
+pids=()
+for i in 1 2; do
+  : > "$WORK/recov-sh$i.log"   # per-waiter logs: concurrent appends to one log drop lines
+  AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$WORK/recov-sh$i.log" AGENT_LOCK_STALE_SECS=3 \
+    AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=120 \
+    bash "$SH" run -- bash -c 'touch "$1"; sleep 0.1' _ "$WORK/recov.ran.sh$i" 2>/dev/null &
+  pids+=($!)
+done
+for i in 1 2; do
+  : > "$WORK/recov-ps$i.log"
+  AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$WORK/recov-ps$i.log" AGENT_LOCK_STALE_SECS=3 \
+    AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=120 \
+    pwsh -NoProfile -File "$PS1WIN" run "[IO.File]::WriteAllText('$WORK/recov.ran.ps$i', 'x'); Start-Sleep -Milliseconds 100" 2>/dev/null &
+  pids+=($!)
+done
+t16_sync=1
+for f in "$WORK/recov-sh1.log" "$WORK/recov-sh2.log" "$WORK/recov-ps1.log" "$WORK/recov-ps2.log"; do
+  wait_for_grep "WAITING for lock" "$f" 60 || { t16_sync=0; bad "T16 waiter never contended (no WAITING in ${f##*/})"; }
+done
+backdate "$LOCK" 9999            # all four now judge the ghost stale together
+t16_fail=0; n98=0
+for p in "${pids[@]}"; do
+  wait "$p"; rc=$?
+  case "$rc" in
+    0)  ;;
+    98) n98=$((n98+1)) ;;        # loud fail-open redo: allowed, accounted below
+    *)  t16_fail=1; echo "  T16 waiter rc=$rc (want 0 or a loud 98)" ;;
+  esac
+done
+cat "$WORK"/recov-*.log > "$WORK/recov-all.log" 2>/dev/null || : > "$WORK/recov-all.log"
+nran="$(ls "$WORK"/recov.ran.* 2>/dev/null | wc -l | tr -d ' ')"
+nlost="$(grep -c "WARNING: lock LOST" "$WORK/recov-all.log")"
+ndisp="$(grep -c "STEAL-DISPLACED-LIVE" "$WORK/recov-all.log")"
+nrest="$(grep -c "RESTORED it via hard link" "$WORK/recov-all.log")"
+ndispfail="$(grep -c "restore FAILED" "$WORK/recov-all.log")"
+[ "$t16_fail" = 0 ] && [ "$t16_sync" = 1 ] \
+  && ok "2 bash + 2 pwsh waiters on one crashed lock: every exit 0 or a loud 98" \
+  || bad "mixed crash-recovery exits wrong (see above)"
+[ "$nran" = 4 ] && ok "all 4 waiters ran their command (98 = ran-but-redo, never silent)" \
+                || bad "only $nran/4 waiter commands ran"
+[ "$nlost" -ge "$n98" ] && ok "every exit-98 backed by a logged LOST warning ($n98 exit-98s, $nlost warnings)" \
+                        || bad "$n98 exit-98s but only $nlost LOST warnings — silent robbery?"
+grep -q "STOLE stale lock (was held by pid=999 host=ghost)" "$WORK/recov-all.log" \
+  && ok "the crashed ghost was reclaimed cross-impl" || bad "ghost never stolen — crash recovery did not happen"
+[ "$ndisp" = $((nrest + ndispfail)) ] \
+  && ok "every detected displacement concluded loudly (detected=$ndisp restored=$nrest unrestorable=$ndispfail)" \
+  || bad "displacement accounting wrong: $ndisp detected != $nrest restored + $ndispfail restore-failed"
+[ -e "$LOCK" ] && bad "leftover crash-recovery lock" || ok "no leftover lock"
+t16_graves=0
+for d in "$LOCK".dead.*; do [ -e "$d" ] && t16_graves=$((t16_graves+1)); done
+[ "$t16_graves" = 0 ] && ok "no leftover graves" || bad "$t16_graves leftover grave(s)"
+
 if command -v powershell >/dev/null 2>&1; then
 echo "== Test 17: Windows PowerShell 5.1 smoke lane — the ps1 must run, not just parse, on the in-box engine =="
 # Everything above runs the port under pwsh (7+). 5.1 ships in every Windows

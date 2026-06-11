@@ -64,11 +64,16 @@
 #
 # ACQUIRE VERIFICATION (never repair by overwriting)
 #   After winning the create, the acquirer re-reads line 1 from the path and
-#   claims the hold only if it finds its own token. Anything else after the
-#   retry ladder — foreign, empty, or gone — means we cannot prove we hold the
-#   path (e.g. we were suspended past the stale window and a waiter stole the
-#   path while a successor re-created it): log loudly, treat as NOT acquired,
-#   re-enter the wait loop. A "repair" overwrite would clobber the successor's
+#   claims the hold only if it finds its own token. A gone/empty read-back
+#   gets a brief RESTORE GRACE first (re-reads over ~0.4s): a straggler's
+#   steal that displaced this just-created lock is usually REPAIRED by its
+#   grave-token restore within milliseconds (see the steal lane), and the
+#   token reappearing at the path is full proof of ownership — abandoning
+#   without the grace would leave the restored lock an unowned orphan for a
+#   stale window. Anything else after the grace — foreign, empty, or gone —
+#   means we cannot prove we hold the path (e.g. we were suspended past the
+#   stale window and a waiter stole the path while a successor re-created
+#   it): log loudly, treat as NOT acquired, re-enter the wait loop. A "repair" overwrite would clobber the successor's
 #   token and produce a silent, undetected double-hold; giving the lock up is
 #   always safe (our own orphan ages into the steal lane and is reclaimed).
 #   This lane has no deterministic test (it needs fault injection to make a
@@ -97,7 +102,18 @@
 #   narrow windows remain even after the re-checks below shrink them:
 #     * acquire-side: between re-reading the stale file's mtime and the steal
 #       `mv`, a rival completes steal+re-acquire, so our `mv` moves a
-#       brand-new live lock aside;
+#       brand-new live lock aside. Reachable WITHOUT any contract breach:
+#       after a holder crashes, every waiter judges "stale" off the same
+#       ghost mtime in the same poll window, the first one steals and
+#       re-creates, and a straggler's `mv` displaces that innocent recovery
+#       winner (probed 5/5 with 4 waiters on one ancient lock). Since
+#       2026-06-11 this is DETECTED AT STEAL TIME — the stealer compares the
+#       grave's token to the one it classified stale — and REPAIRED: a
+#       mismatch triggers an atomic fail-if-exists hard link of the grave
+#       back to the lock path, so the displaced holder usually never
+#       notices. The residual shrinks to "a third party re-created the path
+#       within the mv->ln window" (or a no-hardlink filesystem), which falls
+#       open as before: detected at the victim's release, 98;
 #     * release-side: between the final token re-read and the unlink, a
 #       boundary-stale steal + re-acquire slips in, so our `rm` deletes the
 #       successor's live file;
@@ -107,14 +123,16 @@
 #       steal+re-create land before the next attempt deletes the successor's
 #       live file. The retry widens the release-side window by its ~100ms
 #       budget; it still needs a contract-breach stale hold to be reachable.
-#   All require a hold that already overran the stale window, and all are
-#   DETECTED: the displaced holder's lock_release finds a missing/foreign
-#   token and fails loudly with 98, so no silent lost update — the cost is a
-#   spurious "redo" plus a transient double-hold. (Future option, ps1 side
-#   only: handle-based ops — open with delete sharing, fstat/read/delete via
-#   that one handle — could close these windows outright there; bash has no
-#   handle persistence, so the protocol-level claim stays "shrunk, detected,
-#   not closed".)
+#   The release-side windows require a hold that already overran the stale
+#   window; the acquire-side one only requires a ghost that did (its victim
+#   can be a brand-new holder — see above). All are DETECTED: where the steal
+#   -time restore cannot repair, the displaced holder's lock_release finds a
+#   missing/foreign token and fails loudly with 98, so no silent lost update
+#   — the cost is a spurious "redo" plus a transient double-hold. (Future
+#   option, ps1 side only: handle-based ops — open with delete sharing,
+#   fstat/read/delete via that one handle — could close these windows
+#   outright there; bash has no handle persistence, so the protocol-level
+#   claim stays "shrunk, detected, not closed".)
 #
 # ACCEPTED RESIDUALS (non-race, documented deliberately)
 #   * A torn token write SHORTER than "tok." (e.g. "to"; reachable only via
@@ -139,6 +157,15 @@
 #     while File.Move would succeed). Nothing in the protocol ever sets
 #     read-only; if something external does, the leftover warning fires and
 #     the stale steal (a rename) recovers the path.
+#   * The steal's grave-token check resolves can't-prove cases by the harm
+#     asymmetry, not by certainty: an UNREADABLE grave (non-empty, but the
+#     read ladder came back blank — a sharing violation) is RESTORED, since
+#     restoring a genuinely stale ghost merely re-ages it for the next steal
+#     while deleting a live lock robs its holder; and in the empty-orphan
+#     lane an EMPTY grave is grave-deleted even though a rival's mid-create
+#     EMPTY file reads identically to the empty ghost — that rival's acquire
+#     verification fails its read-back and re-enters the wait, so the
+#     misclassification is self-healing, never silent.
 #
 # LOCK LOCATION
 #   By default the lock and its log live in the repo's git dir
@@ -543,7 +570,26 @@ lock_acquire() {
       # VERIFY via a path read-back before claiming the hold (see ACQUIRE
       # VERIFICATION in the header): only our own token proves we hold the
       # path. NEVER repair a failed read-back by writing to the path.
-      local rb; rb="$(_lock_cur_token)"
+      #
+      # RESTORE GRACE (2026-06-11): a straggler's steal can displace this
+      # just-created lock in the create->read-back gap; its grave-token
+      # check then RESTORES the file within milliseconds (see the steal
+      # lane). Without a grace, the victim has already abandoned the hold by
+      # then and the restored lock becomes a fresh ORPHAN squatting the path
+      # for a full stale window (observed in the 4-waiter probe) — so on a
+      # gone/empty read-back, re-read briefly: our token REAPPEARING at the
+      # path is full proof of ownership (the detour through the grave is
+      # invisible — same inode, same mtime). A FOREIGN token ends the grace
+      # at once: the path provably belongs to someone else, and a restore of
+      # OUR file can no longer succeed there (the link is fail-if-exists).
+      local rb vi=0
+      while :; do
+        rb="$(_lock_cur_token)"
+        [ "$rb" = "$_LOCK_TOKEN" ] && break
+        [ -n "$rb" ] && break
+        vi=$((vi+1)); [ "$vi" -ge 8 ] && break
+        sleep 0.05
+      done
       if [ "$rb" = "$_LOCK_TOKEN" ]; then
         # Save the caller's traps before installing ours; lock_release
         # restores them on every path, so the caller's handlers survive.
@@ -656,14 +702,91 @@ lock_acquire() {
               [ "$log_steal" = 1 ] && _lock_log "STALE (age=${age}s holder=$holder) -> stealing"
               # Atomic steal: rename the stale file aside. Only one
               # concurrent stealer wins (the rest get ENOENT); then everyone
-              # re-races the create above. The victim (if still alive) will
-              # fail at ITS lock_release: gone or foreign token => 98.
+              # re-races the create above. A victim that is NOT recovered by
+              # the grave-token check below will fail at ITS lock_release:
+              # gone or foreign token => 98.
               local grave; grave="$AGENT_LOCK_PATH.dead.$$.$now_s"
               if mv -- "$AGENT_LOCK_PATH" "$grave" 2>/dev/null; then
-                rm -f -- "$grave" 2>/dev/null || true
-                _lock_log "STOLE stale lock (was held by $holder)"
+                # GRAVE-TOKEN CHECK (anti-robbery, 2026-06-11). The mt2
+                # re-read above SHRINKS the displaced-live window but cannot
+                # close it: under crash-recovery contention several waiters
+                # judge "stale" off the same ghost mtime, the first one
+                # steals + re-creates a FRESH lock, and a straggler's mv —
+                # landing in its own mtime-recheck->mv gap — moves that fresh
+                # LIVE lock aside, not the ghost (probed 5/5 with 4 waiters
+                # on one ancient lock). So before deleting the grave, re-read
+                # its line-1 token and compare with the token we classified
+                # as stale (line1; empty for the crash-orphan lane, where the
+                # expected grave is empty by STAT — no read ladder needed).
+                # Only a match proves we buried the ghost we judged.
+                local gtok="" gown="" gmatch=0 gi=0
+                if ! [ -s "$grave" ]; then
+                  # Grave empty (or gone — effectively impossible: the grave
+                  # name is ours alone and far too fresh for the sweep).
+                  # Matches only the empty-orphan classification. Residual,
+                  # accepted: a rival's mid-create EMPTY file displaced in
+                  # that lane reads identically to the empty ghost — but that
+                  # rival's acquire verification fails read-back and it
+                  # re-enters the wait, so nothing is silently lost.
+                  [ -z "$line1" ] && gmatch=1
+                else
+                  while :; do
+                    gtok=""; gown=""
+                    { IFS= read -r gtok || true; IFS= read -r gown || true; } 2>/dev/null < "$grave" || true
+                    gtok="${gtok%"${gtok##*[![:space:]]}"}"
+                    gown="${gown%"${gown##*[![:space:]]}"}"
+                    [ -n "$gtok" ] && break
+                    gi=$((gi+1)); [ "$gi" -ge 5 ] && break
+                    sleep 0.02
+                  done
+                  [ -n "$gtok" ] && [ "$gtok" = "$line1" ] && gmatch=1
+                fi
+                if [ "$gmatch" = 1 ]; then
+                  rm -f -- "$grave" 2>/dev/null || true
+                  _lock_log "STOLE stale lock (was held by $holder)"
+                  steal_fail_last=0
+                  continue   # won the steal: immediately re-race the create
+                fi
+                # DISPLACED-LIVE: the file we moved is, by token proof, NOT
+                # the stale ghost we judged — almost certainly a rival's
+                # brand-new live lock (the other reading — a second straggler's
+                # own displace-then-restore put a different fresh lock here —
+                # changes nothing: either way the file was NOT our ghost).
+                # An UNREADABLE grave (non-empty but the read ladder came back
+                # blank: a Windows sharing violation) takes this lane too: we
+                # cannot prove it matches, and the asymmetry decides it —
+                # restoring a genuinely stale ghost is harmless (it re-ages
+                # and is promptly re-stolen), while deleting a live lock robs
+                # its holder. RESTORE: an atomic fail-if-exists hard link of
+                # the grave back to the lock path (probed on MSYS/NTFS:
+                # plain `ln` makes a real hard link, fails with EEXIST when
+                # the destination exists, and preserves the inode's mtime, so
+                # the restored lock keeps the rival's FRESH staleness clock
+                # and the rival never notices). Then the grave is just a
+                # second name for the same inode; removing it leaves the
+                # restored lock intact (probed). On a filesystem without
+                # hard links the ln fails and we land in the same fallback
+                # as a lost link race.
                 steal_fail_last=0
-                continue   # won the steal: immediately re-race the create
+                local gdesc="token '${gtok:-<empty-or-unreadable>}' owner '${gown:-?}'"
+                if ln -- "$grave" "$AGENT_LOCK_PATH" 2>/dev/null; then
+                  rm -f -- "$grave" 2>/dev/null || true
+                  _lock_log "STEAL-DISPLACED-LIVE: steal displaced a fresh lock ($gdesc), not the stale ghost we judged (token '${line1:-<empty>}' holder=$holder); RESTORED it via hard link — re-entering wait"
+                else
+                  # The path was re-created by a third waiter inside our
+                  # mv->ln window (or this filesystem has no hard links):
+                  # the displaced lock cannot go back. Fall open exactly as
+                  # before this check existed — the robbed holder detects at
+                  # ITS release (98, the documented redo).
+                  rm -f -- "$grave" 2>/dev/null || true
+                  _lock_log "STEAL-DISPLACED-LIVE: steal displaced a fresh lock ($gdesc), not the stale ghost we judged (token '${line1:-<empty>}' holder=$holder); restore FAILED (lock path re-created meanwhile) — the displaced holder will detect the theft at release (98)"
+                fi
+                # Either way we did NOT win: a live lock is (back) at the
+                # path. Re-enter the wait loop — the next iteration loses
+                # the create to that live lock and re-reads its FRESH mtime
+                # (the staleness reading is thereby reset, never carried
+                # over), so it waits rather than re-stealing.
+                continue
               fi
               if ! [ -e "$AGENT_LOCK_PATH" ] && ! [ -L "$AGENT_LOCK_PATH" ]; then
                 steal_fail_last=0

@@ -72,6 +72,18 @@
 #     bash `rm -f` clears it). Nothing in the protocol ever sets read-only;
 #     if something external does, the leftover warning fires and the stale
 #     steal (a rename) recovers the path.
+#   * The steal's grave-token check (anti-robbery; protocol rationale in
+#     git-commit-lock.sh's KNOWN RESIDUAL RACES) restores a displaced live
+#     lock with `New-Item -ItemType HardLink` - probed (pwsh 7.5 and Windows
+#     PowerShell 5.1, NTFS, 2026-06-11): WITHOUT -Force it refuses an
+#     existing destination (IOException) leaving it untouched, the link
+#     preserves the inode's mtime (the rival's staleness clock survives the
+#     grave detour), and deleting the grave name afterwards leaves the
+#     restored lock intact. NEVER add -Force: probed to silently REPLACE an
+#     existing destination. On Unix pwsh the cmdlet maps to link(2) (atomic
+#     EEXIST refusal), so the CI-only POSIX lane stays portable; a
+#     filesystem without hard links just fails the link and falls open to
+#     the pre-restore behaviour (victim detects at release, 98).
 #   * Future option, this side only (recorded per the plan; NOT implemented):
 #     handle-based ops (open with delete sharing, fstat the mtime / read the
 #     token / delete via FILE_DISPOSITION on that one handle) could close the
@@ -640,7 +652,27 @@ function Lock-Acquire {
             # proves we hold the path. NEVER repair a failed read-back by
             # writing to the path - after a long suspension the path may
             # legitimately belong to a successor.
+            #
+            # RESTORE GRACE (2026-06-11; mirrors git-commit-lock.sh): a
+            # straggler's steal can displace this just-created lock in the
+            # create->read-back gap; its grave-token check then RESTORES the
+            # file within milliseconds. Without a grace the victim has
+            # already abandoned the hold by then and the restored lock
+            # becomes a fresh ORPHAN squatting the path for a full stale
+            # window - so on a gone/unreadable read-back, re-read briefly:
+            # our token REAPPEARING at the path is full proof of ownership
+            # (same inode, same mtime; the grave detour is invisible). A
+            # FOREIGN token ends the grace at once - the path provably
+            # belongs to someone else, and a restore of OUR file can no
+            # longer succeed there (the link is fail-if-exists).
             $rb = script:Lock-ReadCurToken -MaxTries 8
+            if ($rb.Status -ne 'ok') {
+                for ($vi = 0; $vi -lt 8; $vi++) {
+                    Start-Sleep -Milliseconds 50
+                    $rb = script:Lock-ReadCurToken -MaxTries 1
+                    if ($rb.Status -eq 'ok') { break }
+                }
+            }
             if ($rb.Status -eq 'ok' -and $rb.Token -eq $script:LockToken) {
                 $script:LockHeld = $true
                 script:Lock-RegisterExitBackstop
@@ -727,7 +759,13 @@ function Lock-Acquire {
                         # final mtime re-read below - an open inserted after
                         # the re-read would widen exactly the window it
                         # shrinks.
-                        $stealOk = $false; $holder = '?'
+                        # $staleTok = the token this classification judged
+                        # stale ('' for the empty-orphan lane) - captured
+                        # EXPLICITLY because $line1 survives across loop
+                        # iterations here (no bash-style per-iteration
+                        # `local`), and the grave-token check below must
+                        # compare against THIS iteration's judgement.
+                        $stealOk = $false; $holder = '?'; $staleTok = ''
                         $len = $null
                         try { $len = (New-Object System.IO.FileInfo $script:LockPath).Length } catch { $len = $null }
                         if ($null -ne $len) {
@@ -765,6 +803,7 @@ function Lock-Acquire {
                                         if ($null -ne $line2) { $line2 = $line2.TrimEnd() }
                                         if ($line1 -and $line1.StartsWith('tok.')) {
                                             $stealOk = $true
+                                            $staleTok = $line1
                                             if ($line2) { $holder = $line2 }
                                         } elseif ($line1) {
                                             script:Lock-WarnNonLock 'its content is not lock-shaped'
@@ -811,9 +850,10 @@ function Lock-Acquire {
                             if ($logSteal) { script:Lock-Log "STALE (age=${age}s holder=$holder) -> stealing" }
                             # Atomic steal: rename the stale file aside. Only
                             # one concurrent stealer wins (the rest throw and
-                            # re-poll); then everyone re-races the create. The
-                            # victim (if still alive) will fail at ITS release:
-                            # gone or foreign token => 98.
+                            # re-poll); then everyone re-races the create. A
+                            # victim NOT recovered by the grave-token check
+                            # below will fail at ITS release: gone or foreign
+                            # token => 98.
                             $grave = "$($script:LockPath).dead.$PID.$nowS"
                             $stole = $false
                             try {
@@ -821,10 +861,103 @@ function Lock-Acquire {
                                 $stole = $true
                             } catch { }
                             if ($stole) {
-                                try { [System.IO.File]::Delete($grave) } catch { }
-                                script:Lock-Log "STOLE stale lock (was held by $holder)"
+                                # GRAVE-TOKEN CHECK (anti-robbery, 2026-06-11;
+                                # mirrors git-commit-lock.sh - the full
+                                # rationale lives there). The mtime re-read
+                                # above shrinks but cannot close the window in
+                                # which a rival completes steal+re-create, so
+                                # our Move may have displaced a brand-new LIVE
+                                # lock rather than the ghost we judged. Re-read
+                                # the GRAVE's line-1 token and compare with
+                                # $staleTok before deleting; "empty" is by
+                                # STAT, not a read-open (a FIFO grave on the
+                                # ps1-on-POSIX lane must not block - same rule
+                                # as the content guard above).
+                                $gTok = ''; $gOwn = ''; $gMatch = $false
+                                $gLen = $null
+                                try { $gLen = (New-Object System.IO.FileInfo $grave).Length } catch { $gLen = $null }
+                                if ($null -eq $gLen -or $gLen -eq 0) {
+                                    # Empty (or unstattable - effectively
+                                    # impossible: the grave name is ours
+                                    # alone): matches only the empty-orphan
+                                    # classification. A rival's mid-create
+                                    # EMPTY file displaced here reads the
+                                    # same, but its acquire verification
+                                    # fails read-back and re-enters the wait
+                                    # - self-healing, never silent.
+                                    if (-not $staleTok) { $gMatch = $true }
+                                } else {
+                                    for ($gi = 0; $gi -lt 5; $gi++) {
+                                        try {
+                                            $fs = [System.IO.File]::Open($grave, [System.IO.FileMode]::Open,
+                                                [System.IO.FileAccess]::Read,
+                                                ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+                                            try {
+                                                $sr = New-Object System.IO.StreamReader($fs)
+                                                $gTok = $sr.ReadLine()
+                                                $gOwn = $sr.ReadLine()
+                                            } finally { $fs.Dispose() }
+                                        } catch { }
+                                        if ($null -ne $gTok) { $gTok = $gTok.TrimEnd() }
+                                        if ($null -ne $gOwn) { $gOwn = $gOwn.TrimEnd() }
+                                        if ($gTok) { break }
+                                        Start-Sleep -Milliseconds 20
+                                    }
+                                    if ($gTok -and $staleTok -and $gTok -eq $staleTok) { $gMatch = $true }
+                                }
+                                if ($gMatch) {
+                                    try { [System.IO.File]::Delete($grave) } catch { }
+                                    script:Lock-Log "STOLE stale lock (was held by $holder)"
+                                    $stealFailLast = 0
+                                    continue   # won the steal: immediately re-race the create
+                                }
+                                # DISPLACED-LIVE: by token proof we moved a
+                                # fresh lock, not the judged ghost (an
+                                # UNREADABLE grave lands here too: the harm
+                                # asymmetry decides it - restoring a real
+                                # ghost just re-ages it, deleting a live lock
+                                # robs its holder). RESTORE: an atomic
+                                # fail-if-exists hard link of the grave back
+                                # to the lock path. New-Item -ItemType
+                                # HardLink WITHOUT -Force refuses an existing
+                                # destination (IOException; probed on pwsh
+                                # 7.5 and Windows PowerShell 5.1, NTFS) and
+                                # preserves the inode's mtime, so the
+                                # restored lock keeps the rival's FRESH
+                                # staleness clock; on Unix pwsh it maps to
+                                # link(2), keeping the CI-only POSIX lane
+                                # portable. NEVER add -Force: probed to
+                                # CLOBBER an existing destination. After a
+                                # successful link the grave is just a second
+                                # name for the same inode; deleting it leaves
+                                # the restored lock intact (probed).
                                 $stealFailLast = 0
-                                continue   # won the steal: immediately re-race the create
+                                $gd = $gTok; if (-not $gd) { $gd = '<empty-or-unreadable>' }
+                                $go = $gOwn; if (-not $go) { $go = '?' }
+                                $std = $staleTok; if (-not $std) { $std = '<empty>' }
+                                $restored = $false
+                                try {
+                                    $null = New-Item -ItemType HardLink -Path $script:LockPath -Value $grave -ErrorAction Stop
+                                    $restored = $true
+                                } catch { }
+                                try { [System.IO.File]::Delete($grave) } catch { }
+                                if ($restored) {
+                                    script:Lock-Log "STEAL-DISPLACED-LIVE: steal displaced a fresh lock (token '$gd' owner '$go'), not the stale ghost we judged (token '$std' holder=$holder); RESTORED it via hard link - re-entering wait"
+                                } else {
+                                    # Path re-created by a third waiter inside
+                                    # our Move->link window (or no hard links
+                                    # on this filesystem): fall open exactly
+                                    # as before this check existed - the
+                                    # robbed holder detects at ITS release
+                                    # (98, the documented redo).
+                                    script:Lock-Log "STEAL-DISPLACED-LIVE: steal displaced a fresh lock (token '$gd' owner '$go'), not the stale ghost we judged (token '$std' holder=$holder); restore FAILED (lock path re-created meanwhile) - the displaced holder will detect the theft at release (98)"
+                                }
+                                # Either way we did NOT win: a live lock is
+                                # (back) at the path. Re-enter the wait loop -
+                                # the next iteration loses the create to it
+                                # and re-reads its FRESH mtime (staleness
+                                # reading reset, never carried over).
+                                continue
                             }
                             if ($null -eq (script:Lock-GetPathItem)) {
                                 # Lost the race (a rival's rename won; the file
