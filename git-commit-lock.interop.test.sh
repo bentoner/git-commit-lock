@@ -443,6 +443,24 @@ n_ps="$(grep -c 'ignoring invalid' "$WORK/frac-ps.err")"
 [ "$rc_ps" = 0 ] && [ "$n_ps" = 2 ] \
   && ok "pwsh rejects fractional STALE/MAX_WAIT with notes (rc 0, 2 notes)" \
   || bad "pwsh fractional knobs: rc=$rc_ps notes=$n_ps (want 0/2)"
+# POLL_SECS takes the shared digits-with-at-most-one-dot grammar; .NET's
+# TryParse(Float) is wider (exponents, signs), so without the ps1 raw-shape
+# gate the same env var would configure DIFFERENT poll intervals across the
+# two impls (e.g. POLL_SECS=1e3: bash rejects -> default 2s; an ungated parse
+# accepts -> one poll every 1000s). Both impls must reject these identically.
+for v in 1e3 +2; do
+  AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_POLL_SECS="$v" \
+    bash "$SH" run -- bash -c 'true' 2> "$WORK/poll-sh.err"; rc_sh=$?
+  n_sh="$(grep -c 'ignoring invalid AGENT_LOCK_POLL_SECS' "$WORK/poll-sh.err")"
+  AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_POLL_SECS="$v" \
+    pwsh -NoProfile -File "$PS1WIN" run "exit 0" 2> "$WORK/poll-ps.err"; rc_ps=$?
+  n_ps="$(grep -c 'ignoring invalid AGENT_LOCK_POLL_SECS' "$WORK/poll-ps.err")"
+  if [ "$rc_sh" = 0 ] && [ "$n_sh" = 1 ] && [ "$rc_ps" = 0 ] && [ "$n_ps" = 1 ]; then
+    ok "POLL_SECS='$v' rejected with a note + default by BOTH impls"
+  else
+    bad "POLL_SECS='$v': sh rc=$rc_sh notes=$n_sh; pwsh rc=$rc_ps notes=$n_ps (want rc 0 + 1 note each)"
+  fi
+done
 
 if [ "$GCL_WINDOWS" = 1 ]; then
 

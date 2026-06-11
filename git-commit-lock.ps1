@@ -218,6 +218,13 @@ function script:Get-LockNum {
     # would otherwise be silently rounded here but rejected there - same
     # input, different steal threshold across the two impls.
     if ($IntegerOnly -and $Raw -notmatch '^[0-9]+$') { $ok = $false }
+    # The fractional knob (POLL_SECS) takes the same raw shape as
+    # git-commit-lock.sh's grammar: digits with at most one dot and at least
+    # one digit (e.g. "2", "0.5", ".5"). TryParse(Float) alone is WIDER - it
+    # accepts exponents ("1e3" = 1000s between polls!), signs ("+2") and
+    # leading whitespace, all of which bash rejects, so the same env var
+    # would configure different poll intervals across the two impls.
+    if (-not $IntegerOnly -and $Raw -notmatch '^(?=.*[0-9])[0-9]*\.?[0-9]*$') { $ok = $false }
     if (-not $ok -or $val -le 0) {
         $want = 'positive number'; if ($IntegerOnly) { $want = 'positive integer' }
         [Console]::Error.WriteLine("git-commit-lock: ignoring invalid $Name='$Raw' (want a $want); using default $Default")
@@ -296,6 +303,15 @@ function script:Lock-Log([string]$msg) {
     Set-StrictMode -Off
     try {
         $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        # Dumb size cap (same 1MB rule as git-commit-lock.sh): if the log has
+        # grown past ~1MB (it gains ~2 lines per commit and nothing ever
+        # prunes it), start it over rather than rotating.
+        try {
+            $li = New-Object System.IO.FileInfo $script:LockLog
+            if ($li.Exists -and $li.Length -gt 1048576) {
+                [System.IO.File]::WriteAllText($script:LockLog, "$ts [pid=$PID] log exceeded 1MB; truncated`n")
+            }
+        } catch { }
         [System.IO.File]::AppendAllText($script:LockLog, "$ts [pid=$PID] $msg`n")
     } catch { }
 }
@@ -822,13 +838,15 @@ function Lock-Release {
     # the displaced party, never silent.
     $read = script:Lock-ReadCurToken -MaxTries 8
     if ($read.Status -eq 'ok' -and $read.Token -eq $script:LockToken) {
-        $read = script:Lock-ReadCurToken -MaxTries 2
+        # Full-width re-read, same ladder as the first (and as bash's boundary
+        # re-read): same verdicts from the same evidence on both reads.
+        $read = script:Lock-ReadCurToken -MaxTries 8
     }
     if (-not ($read.Status -eq 'ok' -and $read.Token -eq $script:LockToken)) {
         if ($read.Status -eq 'unreadable') {
             $script:LockReleaseStatus = 'unreadable'
-            script:Lock-Log "WARNING: lock file present but EMPTY at release (after retries); ownership unverifiable. Leaving it in place. (ours=$script:LockToken)"
-            [Console]::Error.WriteLine("git-commit-lock: WARNING - the lock file read empty at release (still present). Ownership unverifiable; lock file left in place. Verify with 'git log'.")
+            script:Lock-Log "WARNING: lock file present but EMPTY/unreadable at release (after retries); ownership unverifiable. Leaving it in place. (ours=$script:LockToken)"
+            [Console]::Error.WriteLine("git-commit-lock: WARNING - the lock file read empty/unreadable at release (still present). Ownership unverifiable; lock file left in place. Verify with 'git log'.")
             return $false
         }
         # Gone, or a foreign token: our lease expired and the lock was stolen

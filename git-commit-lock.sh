@@ -715,8 +715,8 @@ lock_release() {
       # not claim success — leave the file (the staleness backstop recovers
       # a true orphan) and fail distinctly. The ps1 port's 'unreadable' lane
       # gives the same verdict for the same state.
-      _lock_log "WARNING: lock file present but EMPTY at release (after retries); ownership unverifiable. Leaving it in place. (ours=$_LOCK_TOKEN)"
-      echo "git-commit-lock: WARNING — the lock file read empty at release (still present). Ownership unverifiable; lock file left in place. Verify with 'git log'." >&2
+      _lock_log "WARNING: lock file present but EMPTY/unreadable at release (after retries); ownership unverifiable. Leaving it in place. (ours=$_LOCK_TOKEN)"
+      echo "git-commit-lock: WARNING — the lock file read empty/unreadable at release (still present). Ownership unverifiable; lock file left in place. Verify with 'git log'." >&2
       return 2
     fi
     # Gone, or a foreign token: our lease expired and the lock was stolen
