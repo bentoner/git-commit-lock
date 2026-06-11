@@ -672,7 +672,7 @@ if wait_for "$BREADY" 400; then
   # Clean up the squatter deterministically: signal it via its go-marker and
   # reap by ITS exact pid (never a name-based kill).
   touch "$BGO"
-  wait "$blk14b" 2>/dev/null || kill "$blk14b" 2>/dev/null
+  wait "$blk14b" 2>/dev/null || true   # nonzero exit is fine; pid is already reaped (match T13)
 else
   touch "$BGO"; wait "$blk14b" 2>/dev/null
   bad "T14b squatter never signalled its handle open"

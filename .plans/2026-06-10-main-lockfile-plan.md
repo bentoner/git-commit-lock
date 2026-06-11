@@ -474,7 +474,12 @@ FILETIME zero (−11644473600) to a `Get-Item` observer at ~0.04–0.5% of reads
 so claim (c) of the hypothesis is refuted: sub-floor still means "unsettled,
 wait", in both impls.
 
-**Steal** — rename-aside, as today, with one new guard. Ordering note: the
+**Steal** — rename-aside, as today, with one new guard. (Implementation
+deviation, recorded in the changelog's wave-2 entry: the landed bash per-poll
+guard warns only on a *concretely identified* wrong type — `-d/-L/-p/-S/-b/-c`
+— never on exists-but-unclassifiable, because Windows delete-pending ghosts
+defeat existence re-probes; the "exists = `-e || -L`" pin below describes the
+original spec.) Ordering note: the
 cheap **type guard (step 2) is evaluated on every blocked poll**, not only
 once the lock looks stale — an actively-written non-lock path (the canonical
 `AGENT_LOCK_DIR=$HOME` typo: writes inside keep refreshing the dir's mtime)
