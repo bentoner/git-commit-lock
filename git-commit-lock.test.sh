@@ -625,20 +625,22 @@ echo "== Test 17d: REGRESSION — create/delete churn at the lock path must NOT 
 # (fork-free with fast POSIX syscalls; a 2ms present-hold keeps the file
 # present-dominant). Reaped by its exact PID only, via a stop marker.
 LOCK="$WORK/churn.lock"; LOG="$WORK/churn.log"; : > "$LOG"
-STOP="$WORK/churn.stop"; rm -f "$STOP"
+STOP="$WORK/churn.stop"; START="$WORK/churn.start"; rm -f "$STOP" "$START"
 churn_pid=""; churn_skip=""
 case "$(uname -s 2>/dev/null)" in
   MINGW*|MSYS*|CYGWIN*)
     if command -v pwsh >/dev/null 2>&1; then
       LOCKW="$(cygpath -m "$LOCK" 2>/dev/null || echo "$LOCK")"
       STOPW="$(cygpath -m "$STOP" 2>/dev/null || echo "$STOP")"
+      STARTW="$(cygpath -m "$START" 2>/dev/null || echo "$START")"
       pwsh -NoProfile -Command "
+        [IO.File]::WriteAllText('$STARTW', 'x')
         for (\$i = 1; \$i -le 2000000; \$i++) {
           try { [IO.File]::WriteAllText('$LOCKW', \"tok.churn.1.1\`npid=1 host=churn\`n\") } catch { }
           if ((\$i % 256) -eq 0 -and (Test-Path -LiteralPath '$STOPW')) { break }
           try { [IO.File]::Delete('$LOCKW') } catch { }
         }
-      " >/dev/null 2>&1 &
+      " > "$WORK/t17d.churner.err" 2>&1 &
       churn_pid=$!
     else
       churn_skip="pwsh not on PATH (Windows churner)"
@@ -647,14 +649,15 @@ case "$(uname -s 2>/dev/null)" in
   *)
     if command -v perl >/dev/null 2>&1; then
       perl -e '
-        my ($lock, $stop) = @ARGV;
+        my ($lock, $stop, $start) = @ARGV;
+        if (open(my $sf, ">", $start)) { print $sf "x"; close $sf; }
         for (my $i = 1; $i <= 2000000; $i++) {
           if (open(my $fh, ">", $lock)) { print $fh "tok.churn.1.1\npid=1 host=churn\n"; close $fh; }
           last if (($i % 256) == 0 && -e $stop);
           select(undef, undef, undef, 0.002);
           unlink $lock;
         }
-      ' "$LOCK" "$STOP" &
+      ' "$LOCK" "$STOP" "$START" &
       churn_pid=$!
     else
       churn_skip="perl not available (POSIX churner)"
@@ -662,7 +665,14 @@ case "$(uname -s 2>/dev/null)" in
     ;;
 esac
 if [ -n "$churn_pid" ]; then
-  if wait_for_file "$LOCK"; then
+  # Readiness gate = the STATIC start marker, never the churned lock path:
+  # on Windows a rapidly rewritten file can sit in DELETE-PENDING (e.g. an
+  # AV scan handle) where Cygwin stat reports ENOENT even though the .NET
+  # side sees it existing — observed 2026-06-11: bash polled [ -e ] for 60s
+  # straight while pwsh Test-Path said True. The marker is written once and
+  # never churned, so bash sees it reliably. Budget 60s: pwsh cold start on
+  # a loaded box can take >15s.
+  if wait_for_file "$START" 60; then
     warn17d=0; got97=0
     for r in 1 2 3; do
       pids=()
@@ -684,7 +694,9 @@ if [ -n "$churn_pid" ]; then
     [ "$got97" -ge 1 ] && ok "waiters still timed out at 97 under churn ($got97/12)" \
                        || bad "no waiter reached 97 under churn (got97=$got97/12) — timeout lane bypassed?"
   else
-    bad "T17d churner never started churning"
+    bad "T17d churner never signalled its start marker"
+    echo "  diag: churner pid=$churn_pid alive=$(kill -0 "$churn_pid" 2>/dev/null && echo yes || echo no)"
+    [ -s "$WORK/t17d.churner.err" ] && sed 's/^/  churner: /' "$WORK/t17d.churner.err" | head -5
   fi
   # Reap the churner deterministically: stop marker, bounded wait on ITS
   # exact pid, hard-kill of that same pid as a last resort (never by name).
@@ -693,7 +705,7 @@ if [ -n "$churn_pid" ]; then
   for _ in $(seq 1 100); do kill -0 "$churn_pid" 2>/dev/null || { reaped=1; break; }; sleep 0.05; done
   [ "$reaped" = 1 ] || kill -9 "$churn_pid" 2>/dev/null
   wait "$churn_pid" 2>/dev/null
-  rm -f "$LOCK" "$STOP"
+  rm -f "$LOCK" "$STOP" "$START"
 else
   echo "note: $churn_skip — churn-vs-guard regression not exercised here (CI legs cover it)"
 fi

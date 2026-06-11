@@ -472,10 +472,10 @@ done
 # The EMPTY boundary of that contract: set-but-empty means "use the default"
 # SILENTLY in both impls (bash's ${VAR:-} fills it before the validator ever
 # runs; ps1's IsNullOrEmpty early-return mirrors that) - no note, rc 0.
-AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_POLL_SECS= \
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_POLL_SECS='' \
   bash "$SH" run -- bash -c 'true' 2> "$WORK/poll-sh.err"; rc_sh=$?
 n_sh="$(grep -c 'ignoring invalid' "$WORK/poll-sh.err")"
-AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_POLL_SECS= \
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_POLL_SECS='' \
   pwsh -NoProfile -File "$PS1WIN" run "exit 0" 2> "$WORK/poll-ps.err"; rc_ps=$?
 n_ps="$(grep -c 'ignoring invalid' "$WORK/poll-ps.err")"
 [ "$rc_sh" = 0 ] && [ "$n_sh" = 0 ] && [ "$rc_ps" = 0 ] && [ "$n_ps" = 0 ] \
