@@ -1,3 +1,9 @@
+> **IMPLEMENTED 2026-06-11** on branch `worktree-lockfile-protocol` — all four
+> phases; record in `.plans/2026-06-10-main-lockfile-changelog.md`. Local
+> verification ran the three suites in REDUCED fan-out (green); Phase 3's
+> full-strength 3-OS gate is CI's, on push of this branch (the PR must show
+> the macOS interop leg green before merge — it closes TODO 59).
+
 ## Review round 4 of the convergence loop, 2026-06-11 — CONVERGED
 
 > **Codex: clean — no findings at any severity.** Claude: concur with GO, no

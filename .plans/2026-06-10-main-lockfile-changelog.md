@@ -169,3 +169,83 @@ REDUCED) ====`; `Invoke-ScriptAnalyzer -Severity Warning,Error` clean
   take ~1.6s of deliberate retrying — expected, not a hang.
 - Phase 4 must still fix docs/README wording + TODO items (11, 48, 53–56,
   58, 59 closure per the plan's table).
+
+## Phase 3 — integration suite (2026-06-11)
+
+**`git-commit-lock.integration.test.sh` ported**: the suite used defaults and
+`-e` assertions throughout, so — as the plan predicted — the port is small:
+the `LOCKDIR` variable renamed `LOCKFILE` and the 3h assertion's wording
+("no leftover lock file"); no knob references existed. TODO 58 folded in
+with the unit/interop convention exactly: REDUCED default (1 round x 6 bash
+workers + 3+3 mixed = 12 commits), FULL under `GCL_TEST_FULL=1` (2x12 + 5+5
+= 34), `fan-out mode:` header line + `(fan-out: MODE)` in the RESULT line;
+sizing comment rewritten for both modes (assertions stay STRICT in both).
+
+**TODO 48 finished alongside (it lives in the suites Phase 3 touches):**
+file-level info-level directives with rationale (SC2015 assert-idiom,
+SC2312 no-errexit, SC2016 worker-quoting; mirroring the unit suite's header)
+added to the interop and integration suites; one real fix — integration 3e's
+`for f in $(grep -l ...)` word-split loop became a `while read -r` pipeline
+(SC2013). `shellcheck -S info` is now clean on all five shell files
+(style-level SC2292 etc. deliberately left unsuppressed, the same convention
+Phases 1–2 set).
+
+**Deviation from the plan text (with why):** Phase 3's local "all three
+suites x3 with `GCL_TEST_FULL=1`" full-strength canary is delegated to CI
+(Ben's call at phase hand-off): the dev box is live and shared — the very
+motivation of TODO 58 — and CI runs the full-strength suites on 3 OSes when
+the branch is pushed, which the plan's own sequencing section already made
+the real verification layer (the POSIX/macOS claims are reasoned-not-probed
+locally). Local verification ran all three suites in REDUCED mode, green:
+
+    ==== RESULT: 92 passed, 0 failed (fan-out: REDUCED) ====
+    ==== INTEROP RESULT: 63 passed, 0 failed (fan-out: REDUCED) ====
+    ==== INTEGRATION RESULT: 11 passed, 0 failed (fan-out: REDUCED) ====
+
+(Integration reports 11 in REDUCED — one bash round instead of two.)
+
+## Phase 4 — docs, TODO, linters (2026-06-11)
+
+**README.md:** "How it works" rewritten (atomic create-or-fail lock FILE,
+token-as-content); "one lock directory and protocol" → "one lock file and
+protocol"; the exit-96 row's `AGENT_LOCK_DIR` → `AGENT_LOCK_PATH`; "Running
+the tests" gains the reduced-by-default fan-out paragraph (`GCL_TEST_FULL=1`
+runs the full canary; CI sets it) and DELETES the known-issue paragraph
+about the deliberately-red macOS leg (TODO 59 is closed by this branch; the
+PR's CI run must show that leg green before merge). The platform scoping is
+preserved as Ben specified: ps1 is supported on Windows only; the POSIX
+interop CI legs are cross-implementation protocol verification, not
+platform support. No badge added (post-merge step, per the CI plan).
+
+**docs/git-commit-lock.md:** "How the lock works" rewritten for the file
+protocol — acquire (O_EXCL create, content in the same open, read-back
+verification that NEVER repairs by overwriting), the lock-shaped never-steal
+guards (incl. the old-protocol-directory lane and the no-rm-rf claim),
+release classification (foreign/gone ⇒ 98; empty-but-present ⇒ unverifiable,
+no delete; delete-blocked ⇒ leftover with the D1 retry rationale), and the
+mtime floor's file-era rationale (FILETIME-zero transients on plain file
+creation, probed) — with the partial-`rm -rf` / rename-aside-release /
+`.new.*` / epoch-file prose deleted. "Why not flock" kept (cross-references
+verified; the races sentence now says "a few ... remain" and points at the
+implementation headers' inventory, which carries the release-retry gap).
+PowerShell-port bullets rewritten: through-the-creation-handle write,
+delete-share `FileStream` reads, escalating-backoff release read. API:
+`lock_release` verdicts re-pinned to the file-era classification; knob table
+`AGENT_LOCK_PATH`. "Verifying on a new machine": fan-out mode lines +
+`GCL_TEST_FULL=1` noted; unit/interop coverage paragraphs updated to the
+ported/new tests. Sweep: no "lock dir(ectory)" wording remains in either doc
+(the two surviving "directory" protocol mentions are the deliberate
+old-protocol references).
+
+**TODO-main.md:** deleted 11, 53, 54, 55, 56, 58, 59 — each verified landed
+on this branch before deletion (no `rm -rf`/`AGENT_LOCK_DIR` anywhere in the
+impls; symlink + content steal guards; lazy gitdir; sh builtins; marker
+polling; WAITING line in both impls and asserted in the suites; the fan-out
+knob in all three suites; the file protocol itself = the macOS fix) — and 48
+(info-level triage completed in Phase 3, warning level clean). Items 60 and
+61 left (CI follow-ups, out of this branch's scope); header sentence
+rewritten; 60's now-dangling "TODO 59" cross-reference smoothed.
+
+**Linters (final pass):** `shellcheck -S warning` clean on all five shell
+files; `shellcheck -S info` also clean; `Invoke-ScriptAnalyzer -Path
+./git-commit-lock.ps1 -Severity Warning,Error`: 0 findings.
