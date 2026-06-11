@@ -52,19 +52,20 @@ or use separate checkouts (see
 
 ## How it works
 
-The lock is a directory in the repo's git dir (`.git/commit.lock`), acquired
-with an atomic `mkdir` — atomic on POSIX filesystems and NTFS alike, with no
-dependency on `flock`. Every worktree has its own git dir, so independent
-worktrees get independent locks, while all agents sharing one checkout contend
-on the same lock. A lock held longer than 5 minutes (configurable) is presumed
-crashed and is stolen, so a dead agent can't wedge the others; a holder that
-loses the lock mid-hold finds out at release (exit code 98) rather than
-silently claiming success. Full design and rationale — including why `flock`
-and other OS lock primitives don't fit this cross-runtime setting:
-[`docs/git-commit-lock.md`](docs/git-commit-lock.md).
+The lock is a file in the repo's git dir (`.git/commit.lock`), created with an
+atomic create-or-fail open (`O_CREAT|O_EXCL` / `FileMode.CreateNew`) — atomic
+on POSIX filesystems and NTFS alike, with no dependency on `flock` — whose
+content is the holder's unique token. Every worktree has its own git dir, so
+independent worktrees get independent locks, while all agents sharing one
+checkout contend on the same lock. A lock held longer than 5 minutes
+(configurable) is presumed crashed and is stolen, so a dead agent can't wedge
+the others; a holder that loses the lock mid-hold finds out at release (exit
+code 98) rather than silently claiming success. Full design and rationale —
+including why `flock` and other OS lock primitives don't fit this
+cross-runtime setting: [`docs/git-commit-lock.md`](docs/git-commit-lock.md).
 
-Two wire-compatible implementations share one lock directory and protocol, so
-a bash holder and a PowerShell holder in the same tree serialise against
+Two wire-compatible implementations share one lock file and protocol, so a
+bash holder and a PowerShell holder in the same tree serialise against
 **each other**:
 
 - `git-commit-lock.sh` — bash (the authoritative implementation)
@@ -199,7 +200,7 @@ high codes that report the lock's own outcomes:
 
 | Exit code | Meaning |
 |-----------|---------|
-| 96 | usage error — bad arguments, or `run` outside a git repo with `AGENT_LOCK_DIR` unset; the command was never run |
+| 96 | usage error — bad arguments, or `run` outside a git repo with `AGENT_LOCK_PATH` unset; the command was never run |
 | 97 | lock acquisition timed out (`AGENT_LOCK_MAX_WAIT`, default 7 minutes) — the command was never run |
 | 98 | lock stolen mid-hold — the command ran but was NOT serialised; verify with `git log` and redo it under the lock |
 
@@ -248,15 +249,16 @@ They use throwaway temp dirs and never touch the repo you launch them from.
 On Windows, run the interop suite from Git Bash/MSYS2 bash, **not** WSL bash,
 so the bash and PowerShell sides resolve the same `C:/...` lock path.
 
+The heavy fan-out tests default to a REDUCED width so a routine run doesn't
+lag a shared development machine; set `GCL_TEST_FULL=1` for the full-strength
+concurrency canary (CI sets it). Each suite prints which mode ran and tags
+its result line with it, so a reduced pass can't masquerade as the full one.
+
 The same three suites run in CI on Linux, macOS, and Windows
 (`.github/workflows/tests.yml`), alongside a shellcheck + PSScriptAnalyzer
 lint job. The POSIX legs exercise the PowerShell implementation purely as
 cross-implementation protocol verification (it is only *supported* on
-Windows — see above). Known issue: that verification is currently doing its
-job — the macOS interop leg is deliberately red on a real protocol gap in
-the PowerShell acquire on POSIX (`TODO-main.md` item 59); a protocol
-revision that closes it is planned, and all suites are green on Windows and
-Linux. All three suites copy their logs and work dirs to
+Windows — see above). All three suites copy their logs and work dirs to
 `$GCL_TEST_PRESERVE_DIR` when it is set, and keep the work dir on disk on any
 failure.
 
