@@ -40,9 +40,17 @@ have worktrees, so we need a lock inside the shared tree.
 ## How the lock works
 
 `flock(1)` is not reliably available here — Git for Windows ships none, and a
+
+why are we jumping straight to Windows. I think we'd better off saying "How the lock works" rather than getting defensive about something else.
+
+I'd suggest this section becomes a concise intro - it's a file, works with pwsh and bash. Not a OS lock (see next section) etc. etc.
+
 Cygwin/MSYS2-installed one is invisible to .NET anyway (see [Why not
 `flock`?](#why-not-flock-or-another-os-lock-primitive) for the full story) —
 so the lock is built from primitives that are atomic on NTFS:
+
+
+Then the rest of this (at least in this much detail) belongs after the Why not flock? section.
 
 - **acquire** = create the lock **file** with an atomic create-or-fail open
   (bash: a `noclobber` redirect, i.e. `O_CREAT|O_EXCL`; .NET:
@@ -138,6 +146,8 @@ MINGW64 environment, and PowerShell/.NET, contending on the *same* lock in the
 same repo, with the bash side also portable to macOS and Linux. No OS lock
 primitive survives that intersection:
 
+Windows support was a motivating reason for me, but it also seems also correct that this implementation is better than a flock based on linux and Macs for the problem it solves. the problem with flock locks is they're absolute, you'd have to skill another agent process to get the lock back, but this implementaiton supports stealing. And it's not uncommon for agents to get wedged, and you wouldn't want using a tool like this to stop your overnight run prematurely. and also it's not that big a deal if two agents collide - we almost always would get a failed commit, or a mixed up commit at worse. So in a file aimed at not-me, I'd probably lead with this reason alongside the Windows one -- if you agree with it.
+
 - **Availability.** Git for Windows deliberately excludes util-linux from its
   payload, so its bash has no `flock(1)` at all (MSYS2 proper offers one via
   `pacman -S util-linux`, but Git for Windows users don't have pacman). macOS
@@ -174,6 +184,8 @@ primitive survives that intersection:
   design recovers from both within the stale window, at the documented cost
   of being fail-open — a theft is detected (exit 98) rather than prevented.
 
+yeah this is buried below a bunch of windows specific stuff
+
 So the only locking primitive every runtime here observes identically is the
 **filesystem namespace** — atomic create and atomic rename — and that is what
 the lock is built from. The trade-off is owned in the sections above:
@@ -191,7 +203,11 @@ design's guarantees.
 
 Some agents (Codex on Windows, for example) run their commands in
 **PowerShell**, where a bare `bash` resolves to `C:\Windows\system32\bash.exe`
-— the **WSL** launcher. If your commits are signed by a Windows-side SSH agent,
+— the **WSL** launcher. 
+
+this seems like a statement about my machine, not something that holds true in general.
+
+If your commits are signed by a Windows-side SSH agent,
 WSL's Linux git can't reach the signer (no private key in WSL; SSH-agent
 forwarding into WSL typically only fires in *interactive* shells, not an
 agent's `bash -c`), so a bash-wrapped commit fails to sign (`No private key
@@ -234,6 +250,9 @@ backtick before `$LASTEXITCODE` in the double-quoted command string, which
 defers the interpolation until the command runs under the lock. Exit
 code 98 = lock lost mid-hold, redo.
 
+
+I think we should def have the extended example from the README here too (where you can review the commit in the middle)
+
 ## API
 
 Source it (`source ~/.local/bin/git-commit-lock.sh`) for:
@@ -274,6 +293,8 @@ Config knobs (env, mainly for tests):
 ## The golden rule: hold the lock only to commit
 
 The lock must protect a *sub-second* critical section. Decide what to stage,
+it really does not need to be sub-second. we have a default 5 min timeout!! review the doc for other overstatements.
+
 build any patch, and resolve failures **outside** it. If a commit fails under
 the lock (e.g. a pre-commit hook rejects it), unstage your paths
 (`git reset -- <paths>`, which never touches the working tree) and
@@ -338,6 +359,8 @@ suites — into `~/.local/bin/`):
 | `git-commit-lock.integration.test.sh` | end-to-end: many concurrent workers make real commits into one shared repo; the history is audited for the tool's guarantees |
 
 ## Verifying on a new machine
+
+should it be necessary to "verify on a new machine" I think you mean "Tests" or something
 
 From a clone of this repository (the suites are not installed to
 `~/.local/bin`):
