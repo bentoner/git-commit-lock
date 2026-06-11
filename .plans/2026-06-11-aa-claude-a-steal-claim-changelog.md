@@ -194,3 +194,60 @@ Where each plan rule landed:
 - The interop and integration suites are EXPECTED to break against the new
   bash side until Phase 3 ports the ps1 half (ps1 still speaks graves); per
   the phase plan they were NOT run in this phase.
+
+## Phase 3 — ps1 port + interop tests
+
+### ps1 probes (2026-06-12, this box: Win11, pwsh 7.5.5 + Windows PowerShell
+5.1.26100, NTFS; scripts `.agent-testing/steal-claim-probes/probe-ps1.ps1` +
+`probe-ps1b.ps1`, not committed)
+
+- **P1 (pwsh 7) overwrite-Move atomicity**: 3-arg
+  `[IO.File]::Move($src,$dst,$true)` overload present; 400 rename-overs under
+  a tight reader loop: **0 absent reads, 0 torn reads** when the Move
+  succeeds. BUT **129/400 attempts threw** (UnauthorizedAccessException) while
+  the reader held the destination open — see P6/Q4.
+- **Q4 (pwsh 7) open-handle interference — NEW finding**: a single 3-arg Move
+  with the destination held open by a reader granting FULL sharing
+  (ReadWrite|Delete) **fails** (UnauthorizedAccessException): .NET's rename
+  uses classic Windows semantics, not FILE_RENAME_POSIX_SEMANTICS (Cygwin/MSYS
+  `mv` uses POSIX semantics, which is why bash probe R1 saw zero failures).
+  The failure leaves BOTH files intact, so it routes into the existing
+  blocked-rename lane (claim deleted, damped log, re-poll) — a transient
+  deferral, not an atomicity break. Recorded as a port-specific accepted
+  residual in the ps1 header; NOT a plan abort criterion (the rename is
+  atomic when it succeeds, and the installed mtime is the claim's).
+- **P2 mtime preservation**: installed lock mtime == the claim's
+  just-touched mtime EXACTLY (tick-identical) on both lanes: pwsh 7 3-arg
+  Move and the 5.1 unlink+2-arg-Move ladder. The lease rule rides on this.
+- **P3 (both engines) fail-if-exists Move**: 2-arg Move onto an existing
+  dest throws IOException with src AND dest intact; **exactly 1 of 6
+  concurrent Moves onto one dest wins** (atomic fail-if-exists); File.Delete
+  on a missing file is silent (no gone signal from the unlink — the ladder's
+  gone-detection is the pre-delete existence check).
+- **P4/Q1 (both engines) non-creating touch**: `SetLastWriteTimeUtc` on an
+  existing claim refreshes mtime, content untouched; on a MISSING claim it
+  throws **FileNotFoundException** (the inner exception — PowerShell wraps it
+  in MethodInvocationException; the implementation catches by walking to the
+  inner type) and does NOT create the file. The gone-detection fires.
+- **P5/Q3 rename onto a DIRECTORY (both engines, both Move forms)**: throws
+  (3-arg: UnauthorizedAccessException; 2-arg: IOException), directory AND
+  claim intact, claim NOT moved into the directory — .NET Move has native
+  `mv -T` semantics; **no extra dir guard is needed** (unlike bash's bare-mv
+  fallback).
+- **P6 blocked destination (no-delete-share Read handle)**: 3-arg Move AND
+  File.Delete both throw with everything intact — the blocked-steal lane
+  works as on the bash side (probe D1 class).
+- **Q5 (both engines) 5.1-ladder robustness**: File.Delete of a file whose
+  open handle GRANTS delete sharing succeeds and frees the NAME immediately
+  (POSIX delete semantics on this Win11), and the freed name is immediately
+  re-creatable by the 2-arg Move — the ladder is not blocked by friendly
+  readers.
+- **Q2 Move failure classification**: src-missing -> FileNotFoundException
+  (both forms, both engines); dest-exists -> IOException (2-arg). Used by the
+  ladder's lane classification.
+- **File.Replace**: confirmed unnecessary — not used anywhere (plan test 15
+  static check added to the interop suite).
+
+**Abort criteria check**: rename-over IS atomic-no-absent-window when it
+succeeds and the installed mtime IS the claim's fresh mtime on both engines'
+lanes — no abort; proceeding with the rename-over design.
