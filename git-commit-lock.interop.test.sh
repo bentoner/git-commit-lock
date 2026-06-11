@@ -26,6 +26,16 @@
 #
 # On failure the temp dir is PRESERVED (path printed) for post-mortem; set
 # GCL_TEST_PRESERVE_DIR=<dir> to always copy the work dir (logs etc.) there.
+#
+# shellcheck disable=SC2015  # The pervasive `<assert> && ok ... || bad ...`
+# idiom is deliberate throughout: ok/bad are echo+counter helpers that cannot
+# fail, so the classic A && B || C pitfall (C running after B fails) is moot.
+# shellcheck disable=SC2310,SC2312  # info-level, deliberate: helper functions
+# and command substitutions run inside conditions all over a test suite; the
+# suite runs WITHOUT errexit (set -uo only) and asserts on values, not on
+# implicit exit propagation.
+# shellcheck disable=SC2016  # single-quoted command strings are deliberate:
+# they expand inside a worker's `bash -c` or pwsh invocation, not here.
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
