@@ -540,7 +540,11 @@ AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" \
 
 echo "== Test 17: NON-FILE at the lock path — never stolen, loud one-time config warning, waiters reach 97 =="
 # (a) a directory (a config typo like AGENT_LOCK_PATH=\$HOME, or a leftover
-# old-protocol dir lock). The per-poll type guard fires regardless of age.
+# old-protocol dir lock). The per-poll type guard fires regardless of age —
+# but only after the SAME concrete type is seen on two consecutive polls
+# (round-3 anti-ghost confirmation, 2026-06-11), so these tests need
+# MAX_WAIT/POLL to give at least three polls of headroom (0.1s polls in a
+# 1s wait = ~10 here).
 LOCK="$WORK/nonfile.lock"; LOG="$WORK/nonfile.log"; : > "$LOG"
 mkdir -p "$LOCK/sub"; echo data > "$LOCK/sub/file"
 AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
@@ -611,10 +615,13 @@ echo "== Test 17d: REGRESSION — create/delete churn at the lock path must NOT 
 # them — or a Windows delete-pending ghost (the unlink queues behind a rival
 # reader's transient handle; attribute stats fail while a bare -e still
 # reports existence, for up to ~ms) — made a normal contended poll warn
-# "is not a regular file": a loud config-warning false alarm under plain
+# a non-lock warning: a loud config-warning false alarm under plain
 # contention (round-2 review, 2026-06-11; the ghost defeats an immediate
-# re-probe, which is why the guard now classifies CONCRETE wrong types
-# only). A single-process churner create/deletes the lock file rapidly (the
+# re-probe, which is why the guard classifies CONCRETE wrong types only —
+# and, after CI run 27325971668 caught a ghost transiently matching one of
+# the concrete stats on windows-2025, additionally requires the SAME type
+# on two consecutive polls before warning). A single-process churner
+# create/deletes the lock file rapidly (the
 # absent window is one back-to-back delete->create gap, far too narrow for
 # a waiter to slip its create into) while 3 rounds x 4 parallel short
 # waiters poll through thousands of unlink transitions. ANY non-lock warning

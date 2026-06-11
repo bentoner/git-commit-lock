@@ -687,7 +687,10 @@ fi
 echo "== Test 15: ps1-side never-steal guards — dir, dangling symlink, non-lock content (parity with the bash guards) =="
 # The ps1 guards use different APIs than bash (PSIsContainer, reparse
 # attributes, the catch-all CreateNew exception), so bash coverage proves
-# nothing about them. (a) a DIRECTORY at the lock path: the CreateNew open
+# nothing about them. The wrong-type warning needs the SAME concrete type on
+# two consecutive polls (round-3 confirmation parity, 2026-06-11), so these
+# tests need at least three polls of headroom (0.1s polls in a 2s wait = ~20
+# here). (a) a DIRECTORY at the lock path: the CreateNew open
 # throws UnauthorizedAccessException, which must degrade to the wait/warn
 # lane (97), never throw out of Lock-Acquire.
 LOCK="$WORK/psdir.lock"; LOG="$WORK/psdir.log"; : > "$LOG"

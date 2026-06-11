@@ -489,6 +489,11 @@ lock_acquire() {
   # STALE/steal-FAILED pair is logged at most once per stale window, so the
   # log growth stays bounded however long the squat lasts.
   local steal_fail_last=0
+  # Two-consecutive-poll confirmation state for the wrong-type guard below
+  # (round 3 — see WRONG-TYPE CLASSIFICATION): the concrete classification
+  # observed on the PREVIOUS blocked poll, reset to empty whenever a poll
+  # sees the path absent, a regular file, or no concrete type.
+  local nonlock_prev=""
 
   while true; do
     # PRE-CREATE TYPE GUARD (mandatory). noclobber's exists=>fail protection
@@ -558,6 +563,7 @@ lock_acquire() {
     # contention every poll and starve the waiter to 97 with no diagnosis.
     if [ -e "$AGENT_LOCK_PATH" ] || [ -L "$AGENT_LOCK_PATH" ]; then
       if [ -f "$AGENT_LOCK_PATH" ] && ! [ -L "$AGENT_LOCK_PATH" ]; then
+        nonlock_prev=""   # regular file: any prior wrong-type observation is moot
         # A regular file: a live lock, a stale one, or a crash orphan.
         # Steal if the FILE's mtime is older than the stale window — but only
         # on a PLAUSIBLE mtime (>= 2000-01-01): a freshly created file can
@@ -659,36 +665,56 @@ lock_acquire() {
           fi
         fi
       else
-        # WRONG-TYPE CLASSIFICATION (TOCTOU-hardened): the "exists" (-e/-L)
-        # and "regular file" (-f && ! -L) checks above are SEPARATE stats,
-        # so a normal contended poll can land here looking wrong-type and
-        # used to fire the loud config warning as a pure false alarm
-        # (reproduced under vanilla contention and deterministically under
-        # create/delete churn, 2026-06-11). Two transients cause it: a
-        # rival's release/steal unlink between the two stats, and — worse —
-        # a Windows DELETE-PENDING ghost (the unlink is queued until a
-        # rival reader's transient handle closes; for up to ~ms the
-        # attribute stats FAIL while a bare -e still reports existence),
-        # which probing showed defeats any immediate re-check of the same
-        # -e/-f pair: the ghost outlives it. So warn only on a CONCRETE
-        # wrong type — directory, symlink, FIFO, socket, device — which a
-        # churned regular file can never read as (a vanished or
-        # delete-pending path fails every one of these stats, and a rival's
-        # re-created lock is a regular file again), while a real misconfig
-        # object always carries one of them, so its warning still fires on
-        # this same poll. Residual: an object so exotic that no stat
-        # classifies it would starve waiters to 97 undiagnosed — transient
-        # ghosts are exactly that state, so they win the tie.
-        if [ -d "$AGENT_LOCK_PATH" ] || [ -L "$AGENT_LOCK_PATH" ] \
-           || [ -p "$AGENT_LOCK_PATH" ] || [ -S "$AGENT_LOCK_PATH" ] \
-           || [ -b "$AGENT_LOCK_PATH" ] || [ -c "$AGENT_LOCK_PATH" ]; then
-          _lock_warn_nonlock "it is not a regular file"
+        # WRONG-TYPE CLASSIFICATION (TOCTOU-hardened, three rounds): the
+        # "exists" (-e/-L) and "regular file" (-f && ! -L) checks above are
+        # SEPARATE stats, so a normal contended poll can land here looking
+        # wrong-type and used to fire the loud config warning as a pure
+        # false alarm (reproduced under vanilla contention and
+        # deterministically under create/delete churn, 2026-06-11). Two
+        # transients cause it: a rival's release/steal unlink between the
+        # two stats, and — worse — a Windows DELETE-PENDING ghost (the
+        # unlink is queued until a rival reader's transient handle closes;
+        # for up to ~ms the attribute stats FAIL while a bare -e still
+        # reports existence), which probing showed defeats any immediate
+        # re-check of the same -e/-f pair: the ghost outlives it. Round 2
+        # (2026-06-11) therefore warned only on a CONCRETE wrong type —
+        # directory, symlink, FIFO, socket, device — on the theory that a
+        # vanished or delete-pending path fails every one of these stats.
+        # CI falsified that theory (windows-2025, run 27325971668, unit
+        # T17d): a delete-pending ghost transiently matched one of the six
+        # concrete stats under Cygwin, firing the warning on a path that
+        # only ever held churned REGULAR files. Round 3 (2026-06-11) adds
+        # TWO-CONSECUTIVE-POLL CONFIRMATION: warn only when the SAME
+        # concrete type is observed on two consecutive blocked polls. A
+        # ghost transient cannot reproduce an identical misclassification
+        # across a full poll interval (it resolves in milliseconds), while
+        # a real misconfig object classifies identically forever — its
+        # once-per-process warning just arrives one poll later, and the
+        # never-steal safety is unaffected either way (the guard never
+        # steals non-locks regardless of warning state). Residual: an
+        # object so exotic that no stat classifies it would starve waiters
+        # to 97 undiagnosed — transient ghosts are exactly that state, so
+        # they win the tie. -L is tested FIRST so a symlink (whose target
+        # would otherwise satisfy -d etc.) is named as the link it is.
+        local nonlock_cur=""
+        if   [ -L "$AGENT_LOCK_PATH" ]; then nonlock_cur="a symlink"
+        elif [ -d "$AGENT_LOCK_PATH" ]; then nonlock_cur="a directory"
+        elif [ -p "$AGENT_LOCK_PATH" ]; then nonlock_cur="a FIFO"
+        elif [ -S "$AGENT_LOCK_PATH" ]; then nonlock_cur="a socket"
+        elif [ -b "$AGENT_LOCK_PATH" ] || [ -c "$AGENT_LOCK_PATH" ]; then nonlock_cur="a device node"
         fi
-        # (else: vanished or delete-pending ghost — normal contention; the
-        # next iteration re-races the create)
+        if [ -n "$nonlock_cur" ] && [ "$nonlock_cur" = "$nonlock_prev" ]; then
+          _lock_warn_nonlock "it is $nonlock_cur"
+        fi
+        nonlock_prev="$nonlock_cur"
+        # (no concrete type: vanished or delete-pending ghost — normal
+        # contention; the next iteration re-races the create)
       fi
+    else
+      # path absent: normal contention — the next iteration re-races the
+      # create. Also resets the wrong-type confirmation state above.
+      nonlock_prev=""
     fi
-    # (path absent: normal contention — the next iteration re-races the create)
 
     # A live holder has it (or a never-steal object squats it) — wait,
     # unless we have waited too long.
