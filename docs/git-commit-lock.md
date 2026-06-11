@@ -384,6 +384,39 @@ git to `--only` semantics, re-reading the *working tree* and pulling the other
 party's WIP back in. (Verified: `git commit -- file` after `git apply --cached`
 ignores the clean index and stages the whole working-tree file.)
 
+## Security and trust assumptions
+
+The lock is **advisory**: it serialises *cooperating* agents and defends
+against nothing. The lock file is an ordinary file with no special
+permissions, so any process running as the same user can delete or
+overwrite it at will — the protocol *detects* such interference where it
+can (the token checks; exit 98) but cannot prevent it. The threat model is
+honest agents racing each other; against an actively hostile local process
+no file-based mutex helps.
+
+A **hostile repository can choose where the lock lives**. The lock and log
+paths come from `git rev-parse --absolute-git-dir`, and git honours a
+`.git` *file* containing a `gitdir:` pointer — so a crafted repo can point
+the git dir at any path the user can write, and the tool will operate
+there. The damage is capped by what the tool ever does on disk: it creates
+the lock file (and the lock path's parent directories), appends to — and,
+past a 1 MB cap, restarts — its log file, and creates and removes its small
+set of lock-protocol files at its own names beside the lock, gated by the
+shape and age checks above. Deletion is never recursive, and everything
+happens with the invoking user's own permissions. Still, treat a repo you
+wouldn't enable hooks from with the same caution here: don't run the lock
+(or agents) inside it.
+
+**Log content is attacker-influenceable — and never holds secrets.**
+Whoever can write the lock file controls its owner line, which flows
+unsanitised into log lines such as `STALE (… holder=…)`; under a redirected
+git dir the lock *path* echoed in warnings is attacker-chosen too. That is
+one-line spoofing of log text, with no execution — but don't build
+automation that trusts what the log *says*. Conversely the tool itself
+writes only its token (`tok.<pid>.…`), a `pid=<pid> host=<host>` owner
+line, and protocol events (timestamps, pids, paths, ages) — no credentials
+or repo content ever appear in the lock file or the log.
+
 ## Files
 
 In the repository (`install.sh` installs the **two scripts** — not the test

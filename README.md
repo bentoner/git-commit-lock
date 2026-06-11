@@ -64,7 +64,11 @@ from a stuck holder halts the whole run — while a rare collision costs little
 more than a failed commit. So a lock held longer than 5 minutes (configurable)
 is presumed abandoned and can be stolen by a waiter, and a holder that loses
 the lock mid-hold finds out at release (exit code 98) rather than silently
-claiming success. Full design and rationale — why a stealable lease beats
+claiming success. The lock is advisory: it serialises cooperating
+agents and trusts the repo and every process running as the same user — see
+[Security and trust
+assumptions](docs/git-commit-lock.md#security-and-trust-assumptions).
+Full design and rationale — why a stealable lease beats
 `flock` and other kernel locks here, and why no OS lock primitive spans
 bash-on-MINGW64 and PowerShell/.NET anyway:
 [`docs/git-commit-lock.md`](docs/git-commit-lock.md).
