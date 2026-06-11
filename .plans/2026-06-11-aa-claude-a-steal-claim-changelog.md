@@ -662,3 +662,43 @@ Stability evidence (REDUCED, this Windows box, counts read back):
   `Invoke-ScriptAnalyzer -Severity Warning,Error` clean on the ps1.
 - Preserved failure dirs (`cl-interop-42280df2` and this wave's two)
   deleted after extraction.
+
+## Close-out (2026-06-12, final wave)
+
+All phases complete: 1 (bash probes), 2 (bash implementation + unit
+tests), 3 (ps1 port + interop/integration adaptations), 4 (docs/README),
+plus the round-1 implementation-review fix wave (Phase 5), fix wave 2
+(backdate-harness race), and the CI/harness wave. Plan Status set to
+IMPLEMENTED (v7 as converged).
+
+Review history: plan review ran 7 rounds to convergence (round-7 Codex
+confirmation clean; round-6 Claude confirmation clean given the v7
+folds); implementation review ran 2 rounds (round 1: 3 blocking + 5
+non-blocking, all fixed in Phase 5; round 2: confirmation-review
+cosmetics, folded into fix wave 2) plus the harness fix wave for the
+recovery-test backdate race.
+
+Final wave also adopted shfmt (style `-i 2 -ci -bn`, declared in
+`.editorconfig`; mechanical-formatting commit `8c959bc`, listed in
+`.git-blame-ignore-revs`; `shfmt -d` gate added to the CI lint job,
+binary sha256-pinned at v3.13.1). All suites re-run green AFTER the
+formatting:
+
+- Unit REDUCED: **213 passed, 0 failed**, exit 0
+  (`.agent-testing/unit-shfmt-run1.log`).
+- Interop REDUCED: **141 passed, 0 failed**, exit 0
+  (`.agent-testing/interop-shfmt-run1.log`).
+- Integration REDUCED: **12 passed, 0 failed**, exit 0
+  (`.agent-testing/integration-shfmt-run1.log`).
+- Integration FULL (`GCL_TEST_FULL=1`): **13 passed, 0 failed**, exit 0
+  (`.agent-testing/integration-full-run1.log`) — the last suite not yet
+  FULL-run since the harness fix; FULL adds one leg over REDUCED's 12.
+- `bash -n` + `shellcheck -S info` clean on all five shell files
+  post-format.
+
+Earlier FULL runs on this implementation: unit FULL 213/0 (fix wave 1);
+interop FULL 130/0 at Phase 3 (pre-fix-wave — the later 141 count adds
+the fix-wave tests, which all RUN in REDUCED mode on this box; for the
+interop suite the FULL knob widens fan-out only, it adds no tests:
+Phase 3 measured REDUCED and FULL at the same 130). CI runs all three
+suites FULL on the 3-OS matrix.

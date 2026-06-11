@@ -1,6 +1,6 @@
 # Plan: claim-serialized stealing (claim-is-the-next-lock + atomic rename-over)
 
-Status: CONVERGED (v7) — round-7 Codex confirmation clean; round-6 Claude confirmation clean given the v7 folds. IMPLEMENTING..
+Status: IMPLEMENTED (v7 as converged) — all phases complete; suites green (unit 213/0, interop 141/0, integration FULL 13/0); see the changelog.
 
 ## Goal
 
