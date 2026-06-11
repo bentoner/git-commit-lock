@@ -318,9 +318,14 @@ function script:Lock-Log([string]$msg) {
 
 # Loud, once-per-process config warning for a non-lock object at the lock path
 # (a directory - e.g. a leftover old-protocol dir lock or a typo like
-# AGENT_LOCK_PATH=$HOME - a symlink, a device, or a regular file whose content
-# is not lock-shaped). Such a path is NEVER stolen or deleted; waiters will
-# reach 97 until a human fixes the path or removes the object.
+# AGENT_LOCK_PATH=$HOME - a symlink, or a regular file whose content is not
+# lock-shaped). Such a path is NEVER stolen or deleted; waiters will reach 97
+# until a human fixes the path or removes the object. CAVEAT (ps1-on-POSIX
+# only, an unsupported CI-only config): FIFOs/devices/sockets are NOT routed
+# here - .NET has no clean portable type probe for them, so they stat as
+# length 0 and take the empty-orphan steal lane instead (the ACCEPTED RESIDUAL
+# in PORT-SPECIFIC NOTES). bash, and this port on Windows, deliver the full
+# never-steal guarantee.
 $script:LockNonLockWarned = $false
 function script:Lock-WarnNonLock([string]$reason) {
     Set-StrictMode -Off
@@ -343,6 +348,12 @@ function script:Lock-GetPathItem {
 # Is this FileSystemInfo a plain regular file (not a directory, not any kind
 # of symlink/reparse point)? The only shape acquire may create over and the
 # steal may rename - everything else is the never-steal config-warning lane.
+# CAVEAT (ps1-on-POSIX only): this probe cannot tell a FIFO/device/socket
+# from a regular file (.NET surfaces no portable type bit for them), so on
+# Unix those pass as "plain", stat as length 0, and end in the empty-orphan
+# steal lane - the documented ACCEPTED RESIDUAL in PORT-SPECIFIC NOTES. bash
+# refuses them all via its `[ -f ]` guard; on Windows the reparse/container
+# checks make this guard complete.
 function script:Lock-IsPlainFile($item) {
     Set-StrictMode -Off
     if ($null -eq $item) { return $false }

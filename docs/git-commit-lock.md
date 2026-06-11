@@ -81,7 +81,13 @@ identify as a lock, so a typo'd `AGENT_LOCK_PATH` — pointing at `$HOME`, or
 at a real user file — is harmless. (bash also refuses the *create* on a
 non-regular path up front: `noclobber`'s exists⇒fail protection covers
 regular files only, and an open on an existing FIFO would block before any
-timeout logic runs.)
+timeout logic runs.) One scoped exception: bash delivers this guarantee in
+full, but the **PowerShell port running on POSIX** — an unsupported, CI-only
+configuration — has no clean .NET type probe for FIFOs/devices/sockets, which
+stat there as size 0 and take the empty-orphan steal lane (renamed aside and
+grave-deleted, capping damage at the one misconfigured inode). That residual
+is documented in `git-commit-lock.ps1`'s PORT-SPECIFIC NOTES; on Windows the
+ps1 guard is complete.
 
 **Release** = compare the file's token to ours, then one unlink. A non-empty
 foreign token, or a gone file, means the lease was stolen → fail loudly with

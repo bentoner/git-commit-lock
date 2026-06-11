@@ -249,3 +249,76 @@ rewritten; 60's now-dangling "TODO 59" cross-reference smoothed.
 **Linters (final pass):** `shellcheck -S warning` clean on all five shell
 files; `shellcheck -S info` also clean; `Invoke-ScriptAnalyzer -Path
 ./git-commit-lock.ps1 -Severity Warning,Error`: 0 findings.
+
+## Round-1 review fix wave (2026-06-11)
+
+Round-1 implementation review (fresh Claude + Codex, after the green 3-OS
+full-strength CI run on PR #1) returned 7 findings; all fixed. Probes for the
+blocking finding live at `.agent-testing/review-probes/busyspin{,-ps1}.sh`
+(re-runnable; not committed).
+
+**1 [BLOCKING] Blocked-steal lane bypassed `AGENT_LOCK_MAX_WAIT` and
+busy-spun (BOTH impls).** When the steal decision was made but the rename
+failed with the lock file still present (a no-delete-share handle squatting
+it — probe D1's class — or an unwritable parent dir on POSIX), the iteration
+ended in an unconditional `continue` that skipped the timeout check AND the
+poll sleep: the waiter spun flat-out and could never reach 97. Probe
+baselines (squatter holds 6s, MAX_WAIT=2): bash `rc=0 elapsed=7s`; ps1
+`rc=0 elapsed=6s` with 1428 STALE lines / 126KB of log in those 6 seconds.
+Fix in both impls: the failed-rename-with-file-present case now FALLS THROUGH
+to the timeout check + poll sleep; the immediate `continue` is kept for a
+successful steal and for the lost-the-race/file-gone case (re-race the
+create); the mtime-changed abort is untouched. Logging damped via a
+`steal_fail_last` epoch: the STALE/steal-FAILED pair logs on the first
+failure, then at most once per stale window while the squat persists (damper
+reset on success or file-gone). Post-fix probes: bash `rc=97 elapsed=4s`,
+2 STALE lines, 754-byte log; ps1 `rc=97 elapsed=2s`, 3 STALE lines,
+1024-byte log. Regression test: interop T14b (Windows-gated like T13/T14) —
+stale lock + never-closing FileShare.Read squatter + MAX_WAIT=2 ⇒ both
+impls' waiters exit 97 with bounded STALE/steal-FAILED counts; the squatter
+is reaped via its go-marker + exact-pid wait.
+
+**2 [MAJOR] ps1 accepted `AGENT_LOCK_POLL_SECS` forms bash rejects.**
+`Get-LockNum` TryParsed with `NumberStyles::Float`, so `1e3` configured a
+1000s poll and `+2`/whitespace forms diverged from bash — breaking the
+"same rules as git-commit-lock.sh" contract. Fix: a raw-shape regex gate
+mirroring bash's grammar (digits with at most one dot, at least one digit:
+`^(?=.*[0-9])[0-9]*\.?[0-9]*$`) before TryParse, same stderr note + default
+fallback. Interop T12 extended with a table-driven `1e3`/`+2` loop asserting
+both impls reject identically (rc 0, exactly one note each).
+
+**3 [MINOR] 1MB log-truncation cap ported to ps1 `Lock-Log`** (bash had it;
+the plan's Logging section promised parity; finding 1's spin made the gap
+material).
+
+**4 [MINOR] Never-steal docs now carry the ps1-on-POSIX residual.**
+docs/git-commit-lock.md's "never stolen or deleted" paragraph, plus the
+ps1 `Lock-WarnNonLock`/`Lock-IsPlainFile` helper comments, now state the
+scoped exception: ps1 on POSIX (unsupported, CI-only) has no .NET type probe
+for FIFOs/devices/sockets, which stat as size 0 and take the empty-orphan
+steal lane; bash — and ps1 on Windows — deliver the full guarantee.
+
+**5 [NIT] Release boundary re-read width aligned:** ps1's second (boundary)
+token read was `-MaxTries 2` vs bash's full ladder; now the full `-MaxTries
+8` ladder, same as its first read.
+
+**6 [NIT] Unverifiable-lane wording:** both impls' release warning now says
+"EMPTY/unreadable" (log) / "empty/unreadable" (stderr) — the lane also covers
+the persistently-won't-open state; wording kept identical across impls.
+
+**7 [watch, comment only] Integration 3f** counts ACQUIRED/RELEASED on one
+shared log while concurrent appends can drop lines (Windows FULL-mode flake
+risk): a KNOWN-WATCH comment now records the per-worker-log fallback
+(interop T1's pattern) to apply if it ever flakes. First full CI run passed.
+
+**Verification:** probes re-run green (quoted above); all three suites
+REDUCED-mode green on the live box —
+
+    ==== RESULT: 92 passed, 0 failed (fan-out: REDUCED) ====
+    ==== INTEROP RESULT: 69 passed, 0 failed (fan-out: REDUCED) ====
+    ==== INTEGRATION RESULT: 11 passed, 0 failed (fan-out: REDUCED) ====
+
+(interop 63→69: 2 new T12 POLL rows + 4 T14b assertions = 6 new passes.)
+`shellcheck -S info` clean on
+all five shell files; PSScriptAnalyzer (Warning,Error) 0 findings; ps1 still
+pure ASCII.

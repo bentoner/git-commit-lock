@@ -256,6 +256,12 @@ fi
 # 3f. Lock log: every hold acquired+released cleanly; no stolen leases, no
 # spurious steals, no timeouts (stale=300 over a minutes-long run means any
 # steal would be a real bug).
+# KNOWN-WATCH (flake risk, Windows FULL mode): these counts read ONE shared
+# log that all workers append to concurrently, and both impls' guarded log
+# writes silently drop a line on a transient sharing violation. If this gate
+# ever flakes, switch to per-worker lock logs summed over the concatenation,
+# as the interop suite's T1 does (see its comment). First full-strength CI
+# run passed, so watch only.
 a="$(grep -c ACQUIRED "$LLOG" 2>/dev/null)"; rl="$(grep -c RELEASED "$LLOG" 2>/dev/null)"
 [ "$a" = "$TOTAL" ] && [ "$rl" = "$TOTAL" ] \
   && ok "lock log balanced: $a acquired, $rl released (== $TOTAL workers)" \
