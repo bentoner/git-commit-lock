@@ -1,5 +1,7 @@
 # git-commit-lock
 
+[![tests](https://github.com/bentoner/git-commit-lock/actions/workflows/tests.yml/badge.svg)](https://github.com/bentoner/git-commit-lock/actions/workflows/tests.yml)
+
 A small mutex that lets several agents **commit from one shared Git checkout
 without tripping over each other**.
 

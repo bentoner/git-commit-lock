@@ -33,14 +33,16 @@ jobs:
       fail-fast: false               # an OS-specific failure is the signal we want; let the others finish
       matrix:
         os: [ubuntu-24.04, macos-15, windows-2025]
-    timeout-minutes: ${{ matrix.os == 'windows-2025' && 65 || 40 }}   # backstop only: sum of step budgets + upload headroom
+    timeout-minutes: ${{ matrix.os == 'windows-2025' && 40 || 35 }}   # backstop only: sum of step budgets + upload headroom
     defaults:
       run:
         shell: bash                  # on windows-2025 this is Git Bash (MINGW) — what the interop suite requires
     env:
       GCL_TEST_FULL: 1               # full fan-out — CI runners are dedicated; the reduced default protects live dev boxes (TODO 58)
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0   # v6.0.3, SHA-pinned
+        with:
+          persist-credentials: false   # neither job uses the token after fetch
 
       - name: Toolchain versions (for reconstructing failures)
         run: |
@@ -55,7 +57,7 @@ jobs:
           stat --version 2>/dev/null | head -1 || echo "stat: BSD variant"
 
       - name: Unit suite
-        timeout-minutes: ${{ matrix.os == 'windows-2025' && 35 || 15 }}   # a step timeout FAILS the step (not the job), so the upload step reliably runs
+        timeout-minutes: ${{ matrix.os == 'windows-2025' && 15 || 10 }}   # a step timeout FAILS the step (not the job), so the upload step reliably runs; sized from run 27325978197 + one internal MAX_WAIT hang
         env:
           GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/unit
         run: |
@@ -64,7 +66,7 @@ jobs:
 
       - name: Interop suite (bash + pwsh)
         if: ${{ !cancelled() }}      # run even if an earlier suite failed — every signal is useful
-        timeout-minutes: ${{ matrix.os == 'windows-2025' && 12 || 10 }}
+        timeout-minutes: 10
         env:
           GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/interop
         run: |
@@ -73,7 +75,7 @@ jobs:
 
       - name: Integration suite (real concurrent commits)
         if: ${{ !cancelled() }}
-        timeout-minutes: ${{ matrix.os == 'windows-2025' && 12 || 10 }}
+        timeout-minutes: 7           # its internal AGENT_LOCK_MAX_WAIT cap is 240s
         env:
           GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/integration
         run: |
@@ -82,7 +84,7 @@ jobs:
 
       - name: Upload failure diagnostics
         if: ${{ failure() || cancelled() }}   # failure() covers step timeouts (they fail the step); cancelled() is best-effort cover for manual cancels / the job-level backstop
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1, SHA-pinned
         with:
           name: test-logs-${{ matrix.os }}
           path: test-output/
@@ -94,7 +96,9 @@ jobs:
     runs-on: ubuntu-24.04            # static analysis is OS-independent; one fast leg
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0   # v6.0.3, SHA-pinned
+        with:
+          persist-credentials: false   # neither job uses the token after fetch
 
       - name: shellcheck (gate at warning severity)
         run: |
