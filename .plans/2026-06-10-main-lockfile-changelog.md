@@ -322,3 +322,93 @@ REDUCED-mode green on the live box —
 `shellcheck -S info` clean on
 all five shell files; PSScriptAnalyzer (Warning,Error) 0 findings; ps1 still
 pure ASCII.
+
+## Round-2 review fix wave (2026-06-11)
+
+Round-2 reviews (fresh Claude with empirical probes + Codex static) returned
+six findings; all landed. Commits: `33476d1` (finding 1), `4af87c5`
+(findings 2+3), `1081286` (finding 4), `452daea` (findings 5+6), `01bcf35`
+(T17d readiness hardening).
+
+**1 [MAJOR] bash per-poll type guard TOCTOU — spurious loud config warning
+under normal contention.** The guard's existence (`-e || -L`) and
+classification (`-f && ! -L`) checks are separate stats; a rival's
+release/steal unlink between them routed a normal contended poll into
+`_lock_warn_nonlock "it is not a regular file"`. The reviewer prescribed an
+immediate existence re-check plus a second wrong-type probe — **implemented
+and probed, and it did NOT fix it**: a churner repro still warned at the
+pre-fix rate, because of a Windows **delete-pending ghost** (the unlink
+queues behind a rival reader's transient handle; for up to ~ms the attribute
+stats FAIL while a bare `-e` still reports existence), which outlives any
+back-to-back re-probe of the same `-e`/`-f` pair. Landed fix (deviation
+from the prescription, same intent): warn only on a **concrete** wrong type
+— `-d`/`-L`/`-p`/`-S`/`-b`/`-c` — which a churned regular file can never
+read as (vanished and delete-pending paths fail every concrete stat; a
+rival's re-created lock is `-f` again), while a real misconfig object always
+passes one, so its warning still fires on the same poll. Documented
+residual: an object so exotic no stat classifies it starves waiters to 97
+undiagnosed — ghosts are exactly that state, so they win the tie. ps1
+confirmed immune (single `Get-Item` snapshot classified once), unchanged.
+Probe evidence (`.agent-testing/review-probes/r2-toctou-churn.sh`, pwsh
+create/delete churner ~400 unlinks/s + 3 rounds x 4 parallel waiters,
+POLL=0.02 MAX_WAIT=2):
+
+    pre-fix:  warnings in 5/5 reps (1..9 per rep), 97s 12/12 each
+    re-probe: warnings in 2/5+ reps (ghost defeats it)
+    landed:   8 reps — nonlock-warnings=0, timeouts-97=96/96
+
+Regression test: unit **T17d** — single-process churner (pwsh on Windows,
+perl elsewhere with a 2ms present-hold; reaped via stop marker + exact-pid
+wait, hard-kill of that pid as last resort), 12 waiters, asserts ZERO
+non-lock warnings and >=1 waiter at 97. Readiness gates on a one-shot
+START MARKER, not the churned lock path: the same delete-pending state
+makes Cygwin `[ -e ]` report ENOENT for 60s straight while pwsh Test-Path
+says True (observed; flaked ~1-in-3 suite runs before regating). 6/6
+consecutive Windows suite runs green after; WSL Ubuntu (perl branch) green
+(9/12 waiters at 97 there — fast ext4 lets a few slip into the absent gap;
+the >=1 floor is what the lane guarantees).
+
+**2 [MINOR] ps1 knob regexes accepted trailing newlines bash rejects.**
+.NET `$` matches before a final `\n` and TryParse tolerates trailing
+whitespace, so `AGENT_LOCK_POLL_SECS=$'5\n'` configured ps1 5s vs bash
+default 2, and `AGENT_LOCK_STALE_SECS=$'200\n'` gave different steal
+thresholds. Both shape gates anchored `\A..\z` (ps1 integer + fractional).
+
+**3 [MINOR] whitespace-only knob parity.** bash notes-and-defaults `"   "`
+(non-empty passes `:-`, fails the validator); ps1's `IsNullOrWhiteSpace`
+early-return silently defaulted. Now `IsNullOrEmpty`, pinning the contract:
+EMPTY => silent default in both; whitespace-only / non-empty invalid =>
+note + default in both. Interop T12 extended with whitespace-only,
+trailing-newline AND empty rows (69 -> 72 passes); the reviewer's
+`r2-poll-parity.sh` probe is all-agree, 17/17 rows (the `"   "` row
+diverged pre-fix).
+
+**4 [NIT] T14b hang-on-regression shape.** The squatted-steal waiters ran
+foreground, so a busy-spin regression (the exact bug T14b guards) would
+HANG the suite, not fail it. Converted to background + bounded reap (T17c's
+`kill -0` poll pattern, 30s budget, hard-kill by exact pid) => clean FAIL.
+
+**5 [MINOR, docs] "a typo'd user file is harmless" overstated.**
+docs/git-commit-lock.md now bounds the claim with the two accepted
+residuals already in the sh header: a stale EMPTY user file (crash-orphan
+lane) and a stale file whose line 1 starts `tok.` (the prefix IS the wire
+test) ARE stolen.
+
+**6 [MINOR, docs] README exit-code contract omitted two run lanes.**
+"anything else is the command's own exit code" now carries the caveats
+(verified against `lock_run` sh:766 and `Invoke-WithLock` ps1:976):
+unverifiable release (file reads EMPTY while present) fails a SUCCESSFUL
+command with 1, a failing command keeps its own code; a LEFTOVER
+(undeletable lock) keeps the command's code — cleanup failure, not a
+serialisation failure.
+
+**Verification:** all three suites REDUCED-mode green on the live box —
+
+    ==== RESULT: 94 passed, 0 failed (fan-out: REDUCED) ====
+    ==== INTEROP RESULT: 72 passed, 0 failed (fan-out: REDUCED) ====
+    ==== INTEGRATION RESULT: 11 passed, 0 failed (fan-out: REDUCED) ====
+
+(unit 92 -> 94: T17d's 2 assertions; interop 69 -> 72: 2 new T12 POLL rows
++ 1 empty row.) Unit also green on WSL Ubuntu 24.04 (the perl-churner
+branch). `shellcheck -S info` clean on all five shell files; PSScriptAnalyzer
+(Warning,Error) 0 findings; ps1 still pure ASCII.
