@@ -659,7 +659,33 @@ lock_acquire() {
           fi
         fi
       else
-        _lock_warn_nonlock "it is not a regular file"
+        # WRONG-TYPE CLASSIFICATION (TOCTOU-hardened): the "exists" (-e/-L)
+        # and "regular file" (-f && ! -L) checks above are SEPARATE stats,
+        # so a normal contended poll can land here looking wrong-type and
+        # used to fire the loud config warning as a pure false alarm
+        # (reproduced under vanilla contention and deterministically under
+        # create/delete churn, 2026-06-11). Two transients cause it: a
+        # rival's release/steal unlink between the two stats, and — worse —
+        # a Windows DELETE-PENDING ghost (the unlink is queued until a
+        # rival reader's transient handle closes; for up to ~ms the
+        # attribute stats FAIL while a bare -e still reports existence),
+        # which probing showed defeats any immediate re-check of the same
+        # -e/-f pair: the ghost outlives it. So warn only on a CONCRETE
+        # wrong type — directory, symlink, FIFO, socket, device — which a
+        # churned regular file can never read as (a vanished or
+        # delete-pending path fails every one of these stats, and a rival's
+        # re-created lock is a regular file again), while a real misconfig
+        # object always carries one of them, so its warning still fires on
+        # this same poll. Residual: an object so exotic that no stat
+        # classifies it would starve waiters to 97 undiagnosed — transient
+        # ghosts are exactly that state, so they win the tie.
+        if [ -d "$AGENT_LOCK_PATH" ] || [ -L "$AGENT_LOCK_PATH" ] \
+           || [ -p "$AGENT_LOCK_PATH" ] || [ -S "$AGENT_LOCK_PATH" ] \
+           || [ -b "$AGENT_LOCK_PATH" ] || [ -c "$AGENT_LOCK_PATH" ]; then
+          _lock_warn_nonlock "it is not a regular file"
+        fi
+        # (else: vanished or delete-pending ghost — normal contention; the
+        # next iteration re-races the create)
       fi
     fi
     # (path absent: normal contention — the next iteration re-races the create)

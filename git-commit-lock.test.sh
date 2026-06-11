@@ -605,6 +605,99 @@ else
   echo "note: mkfifo unavailable/unusable here — FIFO guard not exercised (CI POSIX legs cover it)"
 fi
 
+echo "== Test 17d: REGRESSION — create/delete churn at the lock path must NOT fire the non-lock warning =="
+# The per-poll guard's existence (-e/-L) and classification (-f && ! -L)
+# checks are SEPARATE stats. A rival's release/steal unlink landing between
+# them — or a Windows delete-pending ghost (the unlink queues behind a rival
+# reader's transient handle; attribute stats fail while a bare -e still
+# reports existence, for up to ~ms) — made a normal contended poll warn
+# "is not a regular file": a loud config-warning false alarm under plain
+# contention (round-2 review, 2026-06-11; the ghost defeats an immediate
+# re-probe, which is why the guard now classifies CONCRETE wrong types
+# only). A single-process churner create/deletes the lock file rapidly (the
+# absent window is one back-to-back delete->create gap, far too narrow for
+# a waiter to slip its create into) while 3 rounds x 4 parallel short
+# waiters poll through thousands of unlink transitions. ANY non-lock warning
+# fails; the waiters must still time out at 97 (the churned file always
+# reads as a fresh live lock at STALE=300 — never stealable, never held).
+# Churner: pwsh on Windows (fork-free tight loop; reverting the guard fix
+# reproduced warnings in 5/5 probe reps of this shape); perl elsewhere
+# (fork-free with fast POSIX syscalls; a 2ms present-hold keeps the file
+# present-dominant). Reaped by its exact PID only, via a stop marker.
+LOCK="$WORK/churn.lock"; LOG="$WORK/churn.log"; : > "$LOG"
+STOP="$WORK/churn.stop"; rm -f "$STOP"
+churn_pid=""; churn_skip=""
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*)
+    if command -v pwsh >/dev/null 2>&1; then
+      LOCKW="$(cygpath -m "$LOCK" 2>/dev/null || echo "$LOCK")"
+      STOPW="$(cygpath -m "$STOP" 2>/dev/null || echo "$STOP")"
+      pwsh -NoProfile -Command "
+        for (\$i = 1; \$i -le 2000000; \$i++) {
+          try { [IO.File]::WriteAllText('$LOCKW', \"tok.churn.1.1\`npid=1 host=churn\`n\") } catch { }
+          if ((\$i % 256) -eq 0 -and (Test-Path -LiteralPath '$STOPW')) { break }
+          try { [IO.File]::Delete('$LOCKW') } catch { }
+        }
+      " >/dev/null 2>&1 &
+      churn_pid=$!
+    else
+      churn_skip="pwsh not on PATH (Windows churner)"
+    fi
+    ;;
+  *)
+    if command -v perl >/dev/null 2>&1; then
+      perl -e '
+        my ($lock, $stop) = @ARGV;
+        for (my $i = 1; $i <= 2000000; $i++) {
+          if (open(my $fh, ">", $lock)) { print $fh "tok.churn.1.1\npid=1 host=churn\n"; close $fh; }
+          last if (($i % 256) == 0 && -e $stop);
+          select(undef, undef, undef, 0.002);
+          unlink $lock;
+        }
+      ' "$LOCK" "$STOP" &
+      churn_pid=$!
+    else
+      churn_skip="perl not available (POSIX churner)"
+    fi
+    ;;
+esac
+if [ -n "$churn_pid" ]; then
+  if wait_for_file "$LOCK"; then
+    warn17d=0; got97=0
+    for r in 1 2 3; do
+      pids=()
+      for i in 1 2 3 4; do
+        AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=300 \
+          AGENT_LOCK_POLL_SECS=0.02 AGENT_LOCK_MAX_WAIT=2 \
+          bash "$LIB" run -- bash -c 'true' 2> "$WORK/t17d.$r.$i.err" &
+        pids+=($!)
+      done
+      for i in 1 2 3 4; do
+        wait "${pids[$((i-1))]}"; rc=$?
+        [ "$rc" = 97 ] && got97=$((got97+1))
+        n="$(grep -c 'is not a lock file' "$WORK/t17d.$r.$i.err")"
+        warn17d=$((warn17d+n))
+      done
+    done
+    [ "$warn17d" = 0 ] && ok "12 waiters polled through churn with ZERO spurious non-lock warnings" \
+                       || bad "churned regular file fired $warn17d non-lock warning(s) — per-poll guard TOCTOU regression!"
+    [ "$got97" -ge 1 ] && ok "waiters still timed out at 97 under churn ($got97/12)" \
+                       || bad "no waiter reached 97 under churn (got97=$got97/12) — timeout lane bypassed?"
+  else
+    bad "T17d churner never started churning"
+  fi
+  # Reap the churner deterministically: stop marker, bounded wait on ITS
+  # exact pid, hard-kill of that same pid as a last resort (never by name).
+  touch "$STOP"
+  reaped=0
+  for _ in $(seq 1 100); do kill -0 "$churn_pid" 2>/dev/null || { reaped=1; break; }; sleep 0.05; done
+  [ "$reaped" = 1 ] || kill -9 "$churn_pid" 2>/dev/null
+  wait "$churn_pid" 2>/dev/null
+  rm -f "$LOCK" "$STOP"
+else
+  echo "note: $churn_skip — churn-vs-guard regression not exercised here (CI legs cover it)"
+fi
+
 echo "== Test 18: stale NON-LOCK CONTENT at the lock path is never stolen; torn tokens split on the tok. prefix =="
 # The content guard (age-gated): steal only an empty file or a line 1 starting
 # "tok.". A real user file at a typo'd AGENT_LOCK_PATH must survive, forever.
