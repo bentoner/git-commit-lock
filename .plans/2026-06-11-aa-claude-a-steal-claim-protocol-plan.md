@@ -1,6 +1,6 @@
 # Plan: claim-serialized stealing (claim-is-the-next-lock + atomic rename-over)
 
-Status: DRAFT v7 — round-6 findings folded; final confirmation.
+Status: CONVERGED (v7) — round-7 Codex confirmation clean; round-6 Claude confirmation clean given the v7 folds. IMPLEMENTING..
 
 ## Goal
 
