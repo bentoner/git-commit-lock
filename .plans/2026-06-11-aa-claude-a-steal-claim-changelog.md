@@ -376,3 +376,27 @@ Where each plan rule landed (ps1:line anchors at commit time):
 
 - Final no-leftover sweep (3h) also asserts no `*.next` and no `*.next.*`
   leftovers beside the lock (the plan's Coordination note).
+
+### Phase 3 verification (counts read back from the logs)
+
+- Interop REDUCED: **130 passed, 0 failed**, exit 0
+  (`.agent-testing/interop-reduced-run1.log`).
+- Interop FULL (`GCL_TEST_FULL=1`): **130 passed, 0 failed**, exit 0
+  (`.agent-testing/interop-full-run1.log`). The 5.1 lane RAN (engine
+  5.1.26100.8115, not skipped) and the new unlink+Move steal-ladder leg
+  passed.
+- Integration REDUCED: **12 passed, 0 failed**, exit 0
+  (`.agent-testing/integration-reduced-run1.log`) — including the new
+  no-`*.next` sweep.
+- Unit REDUCED (re-run to prove no interference; Phase 2 files untouched):
+  **210 passed, 0 failed**, exit 0 (`.agent-testing/unit-phase3-run1.log`).
+- `shellcheck -S info` clean on `git-commit-lock.interop.test.sh` +
+  `git-commit-lock.integration.test.sh`; `Invoke-ScriptAnalyzer -Severity
+  Warning,Error` clean on `git-commit-lock.ps1`. ps1 parse-checked on BOTH
+  engines; ASCII-only verified.
+- Deviations from the plan: NONE at the protocol level. One probe-driven
+  port-specific accepted residual recorded (Q4: .NET's classic non-POSIX
+  rename defers the pwsh-7 rename-over while any rival handle is open on the
+  destination — routed through the existing damped blocked-steal lane;
+  header-documented). The 5.1 'lost' lane gained a log line with no bash
+  counterpart (the lane itself is plan-specified).
