@@ -1,6 +1,6 @@
 # Plan: claim-serialized stealing (claim-is-the-next-lock + atomic rename-over)
 
-Status: DRAFT v4 — round-3 findings folded; awaiting round-4 review.
+Status: DRAFT v5 — round-4 findings folded; awaiting round-5 review.
 
 ## Goal
 
@@ -10,7 +10,9 @@ stale lock you must first win an O_EXCL claim file; the claim file carries your
 own token and *becomes* the new lock via one atomic rename-over. This
 **prevents** the displaced-live race (a straggler stealing the recovery
 winner's fresh lock) that wave 1 (`2843d4e`, `4e3f890`) could only detect and
-repair.
+repair. (Prevention is scoped, not absolute: live processes are fully covered,
+trappable exits clean up after themselves, and one untrappable-death residual
+is deliberately accepted — see residual 5 in the residual inventory.)
 
 Design lineage: Ben proposed serializing steals through a second
 create-or-fail file; this plan adopts that with one refinement — the claim file
@@ -81,8 +83,11 @@ content, plausible mtime ≥ floor, age > `AGENT_LOCK_STALE_SECS`):
         `CLAIM-ABORT (contested)`, then the final discovery read (a rival's
         rename can land between this recheck's read and the deletion),
         re-poll.
-      - **Unreadable after the retry ladder** → leave it (it ages out),
-        re-poll.
+      - **Unreadable after the retry ladder** → leave it (it ages out) and
+        append our attempt token to the **leaked-token memory** (global
+        rule, below) — the claim stays in place without a verifiable
+        unlink, so the one-shot final read alone is not conclusive for
+        this exit; re-poll.
    2. **Touch the claim** (refresh its mtime) — **non-creating**, with
       per-runtime gone-detection (the two mechanisms differ; the spec names
       the real ones):
@@ -149,11 +154,17 @@ is our token**. Outcomes:
   claim vanished in the read→unlink gap) is NOT an error: it routes into the
   final discovery read like every other exit — a rival may have renamed the
   claim in as the lock inside that gap.
+- **Ours at the read, but the unlink FAILS with the file still present** (a
+  no-delete-share handle blocking deletion — the outcome round 4 found
+  unspecified) → treat as **leaked**: append the attempt token to the
+  leaked-token memory, damped warning, re-poll.
 - **Gone at the read** → likewise routes into the final discovery read.
 - **Foreign** → leave the claim (it's a rival's live claim); the final
   discovery read still runs (ours may already have been installed as the
   lock before the rival claimed).
-- **Unreadable after the retry ladder** → leave it to age out.
+- **Unreadable after the retry ladder** → leave it to age out AND append the
+  attempt token to the leaked-token memory (the read could not verify the
+  claim is not ours, so ours may still be installable after our final read).
 Never blind-unlink the claim path. (The deletion's own read→unlink gap can in
 principle unlink a rival's just-created claim — clearer and rival inside a
 microsecond window; benign: the rival's recheck finds its claim gone → final
@@ -167,11 +178,21 @@ not end in a successful rename performs, as its final act — after any
 claim-deletion attempt, and regardless of which anomaly was observed — one
 read of the lock path's line 1.** Our claim token there ⇒ we HOLD the lock —
 proceed to the acquire read-back verification; otherwise the lane's normal
-outcome stands (re-poll / re-race). Positioned as the final act, the read is
-always conclusive: it runs after our own deletion attempt, and once we have
-*ourselves* verifiably unlinked our claim it can never subsequently be
-installed — so a miss is a true miss (and per-claim-attempt tokens, below,
-make a hit a true hit).
+outcome stands (re-poll / re-race). Positioned as the final act, the read
+runs after our own deletion attempt; a hit is a true hit (per-claim-attempt
+tokens, below). A miss is a true miss **only on exits that installed the
+claim or verifiably unlinked it** — once we have ourselves unlinked our
+claim (or verifiably watched it leave), it can never subsequently be
+installed. Round 4 found three exits that violate that premise by leaving
+the claim in place unverified — **recheck-unreadable**,
+**deletion-read-unreadable**, and **deletion-unlink-blocked-while-present**
+— where a suspended rival's rename can install our claim AFTER our final
+discovery read, manufacturing an unowned own-token lock (a ≤ STALE stall).
+Those exits therefore feed the **leaked-token memory** rule below, which
+turns the one-shot read into continuous discovery for exactly those lanes.
+The same family's dead-claimant case (the claimant dies mid-claim, so no
+discovery can run at all) is handled by the trap-time cleanup rule below
+for trappable exits, and inventoried as residual 5 for untrappable death.
 
 v3 instead *enumerated* the exits needing the read (recheck-gone/foreign,
 touch-target-gone, the step-2/3.3 fresh abort, rename-source-gone,
@@ -182,10 +203,49 @@ which a rival's rename can interleave with (round 3 exhibited a concrete
 orphan walk through 4(a)). The per-position mentions throughout this plan
 therefore remain only as *illustration* of where hits occur; the rule itself
 is position-blind. Cost: one extra read per abort path, all of which already
-read files. This rule is what makes "no unowned orphan" structural rather
-than per-lane: whichever claim file gets installed at the lock path, its
-token's owner takes SOME exit path, and the final discovery read on that path
-finds ownership; every other party reads a foreign token and backs off.
+read files. This rule plus the leaked-token memory is what makes "no unowned
+orphan **from a live process**" structural rather than per-lane: whichever
+claim file gets installed at the lock path, its token's live owner takes SOME
+exit path, and either the final discovery read on that path or the memory's
+per-poll check finds ownership; every other party reads a foreign token and
+backs off. Trappable exits clean up via the trap-time rule; only untrappable
+death leaves the inventoried bounded residual (residual 5).
+
+**Leaked-token memory (global rule; closes every live-process lane the
+one-shot read cannot).** Each acquire keeps an in-process list of **leaked
+attempt tokens**: tokens whose claim file was left in place without a
+verifiable unlink. Exactly three exits append to it — the step-3.1
+recheck-unreadable outcome, and the token-checked deletion's
+read-unreadable and unlink-blocked-while-present outcomes. While the list
+is non-empty, **every poll that observes a lock at the lock path also reads
+its line 1**; a LISTED token there ⇒ that leaked claim of ours was installed
+by a rival's rename ⇒ adopt that token as the hold token and proceed to the
+acquire read-back verification (HOLD). An entry is removed only when the
+leak resolves verifiably: a verified unlink of the claim, or an observation
+that the claim path is gone or foreign-tokened — the latter followed by one
+lock-path line-1 read (the one-shot discovery pattern: gone-from-`.next` may
+mean installed-at-lock) before the entry is dropped. Soundness: per-attempt
+token uniqueness (below) means each listed token names exactly one file ever
+written, and a token absent from both paths can never reappear. Cost: the
+list is almost always empty; the extra per-poll read happens only in the
+anomalous state. The discovery rule's one-shot final read stays (cheap,
+immediate); the memory turns it from one-shot into continuous for exactly
+the lanes where one-shot wasn't conclusive. Scope: the list lives for the
+duration of the acquire's wait loop; a waiter that exits (97, or dies) with
+entries pending leaves those claims to the staleness backstops — the same
+bounded class as residual 5.
+
+**Trap-time claim cleanup (global rule; trappable exits don't leak).** The
+existing EXIT/INT/TERM trap machinery (which today releases a held LOCK; the
+bash handlers are installed only once HELD, sh ~599–610) gains a
+claim-window mode covering the post-claim-create region: on a trappable exit
+while a claim attempt is in flight, the handler performs the token-checked
+claim deletion and then the final discovery read; on a discovery-HOLD inside
+the trap, adopt the hold and release per normal trap semantics — so a TERM'd
+claimant neither leaks its claim nor leaves an installed-but-unreleased
+lock. Explicitly: NO trap path runs lock-release semantics on a mere claim
+(no 98-classification — a claim is not a hold), and signal-time deletion
+still obeys the token-checked deletion rule like every other deletion path.
 
 **Per-claim-attempt tokens (global rule; makes the discovery premise sound).**
 The discovery rule rides on "own token at the lock ⇒ our claim was installed"
@@ -221,8 +281,11 @@ lock aliasing a later create attempt's read-back).
   lock path, its token's owner runs the final discovery read on whatever
   exit path it happens to take — the rule is position-blind, so no
   enumeration of positions is load-bearing — and everyone else reads a
-  foreign token and backs off — **no unowned orphan is possible**. That
-  answers round 1's wedge scenario structurally, not probabilistically.
+  foreign token and backs off — **no unowned orphan is possible from a live
+  process** (the leaked-token memory covers the exits whose one-shot read is
+  inconclusive; trappable exits clean up via the trap-time rule; untrappable
+  death is residual 5). That answers round 1's wedge scenario structurally,
+  not probabilistically.
 - **Destination wrong-type** (rename onto a directory fails) →
   `CLAIM-ABORT (rename-refused)`, token-checked claim deletion, damped
   warning, re-poll; the next poll's wrong-type guard classifies the object.
@@ -248,8 +311,9 @@ lock aliasing a later create attempt's read-back).
   variables (`nonlock_prev`, `_LOCK_NONLOCK_WARNED`). They must become
   per-path (lock vs. claim) — a shared flag would cross-suppress the warning
   or cross-confirm the two-poll state between the two paths.
-- A crashed claimant therefore delays only *steals* by ≤ the claim window;
-  normal acquisition on a free path is never blocked by a claim.
+- A crashed claimant (with the trap-time cleanup rule, only an UNTRAPPABLY
+  crashed one) therefore delays only *steals* by ≤ the claim window; normal
+  acquisition on a free path is never blocked by a claim.
 - Knob relation: worst-case recovery = `AGENT_LOCK_STALE_SECS` +
   `AGENT_LOCK_CLAIM_STALE_SECS` must stay < `AGENT_LOCK_MAX_WAIT` (defaults:
   300 + 60 < 420 ✓). Warn-once at startup when `MAX_WAIT ≤ STALE +
@@ -264,7 +328,7 @@ lock aliasing a later create attempt's read-back).
 
 | Crash point | Outcome |
 |-------------|---------|
-| After claim create, before rename | Claim ages out (≤60s); steals resume. |
+| After claim create, before rename | **Trappable exit** (EXIT/INT/TERM): the trap deletes the claim (token-checked) + runs the final discovery read; a discovery-HOLD is released per normal trap semantics — no leak, no CLAIM_STALE penalty. **Untrappable death** (SIGKILL/power): claim ages out (≤60s), steals resume; if a suspended rival installs it first → residual 5. |
 | Between claim create and content write | Empty claim file; the empty-orphan + staleness rules clear it. |
 | After rename-over | Stealer is now just a normal holder that crashed; lock staleness rules apply. No grave exists at any point. |
 
@@ -283,11 +347,13 @@ lock aliasing a later create attempt's read-back).
    (the touch does not defend this either) can still clear our claim and
    let a rival claim inside the recheck→rename gap. Every such two-claimant
    interleaving is **self-healing** per the ownership-discovery rule:
-   exactly one claim file ends up installed, its token's owner discovers
-   ownership on whatever exit path it takes, everyone else detects a
-   foreign token — no unowned orphan is possible; any displacement degrades
-   into the detected-98 lane. No infinite regress. (Decision: no recheck
-   margin — the discovery rule makes the gap-frequency question moot.)
+   exactly one claim file ends up installed, its token's live owner
+   discovers ownership on whatever exit path it takes (discovery read or
+   leaked-token memory), everyone else detects a foreign token — no unowned
+   orphan is possible from a live process (untrappable death is residual 5);
+   any displacement degrades into the detected-98 lane. No infinite regress.
+   (Decision: no recheck margin — the discovery rule makes the gap-frequency
+   question moot.)
 3. **Lease rule**: the installed lock's lease starts at the claim's
    step-3.2 touch (rename preserves mtime). A claimant suspended between
    touch and rename installs a correspondingly aged-mtime lock — the lease
@@ -301,7 +367,20 @@ lock aliasing a later create attempt's read-back).
    the claim protocol. A mixed-version tree (an old stealer doing mv-to-grave)
    degrades to detection (98) and can leave grave litter the new code does not
    sweep — upgrade both implementations together (one doc line).
-5. Existing residuals unrelated to stealing (release-time classification,
+5. **Untrappable death inside the claim window — deliberately accepted, NOT
+   prevented.** A claimant killed untrappably (SIGKILL, power loss) after
+   the claim create can leave a claim that a suspended rival's rename later
+   installs → an unowned fresh lock stalling waiters ≤ STALE, recovered by
+   normal staleness; **no false success anywhere** — nobody believes they
+   hold, nothing corrupts, the stall is the only cost. The same outcome
+   class covers leaked-token-memory entries still pending when their process
+   dies (or exits at 97). Why accepted: this is the same magnitude as the
+   tool's FUNDAMENTAL accepted cost — a crashed holder already stalls a full
+   STALE window — at far lower probability (death inside a ms-wide window
+   AND a suspended rival poised to install). The structural alternative that
+   would prevent it (capture-verify-install) was considered and REJECTED —
+   see Alternatives considered.
+6. Existing residuals unrelated to stealing (release-time classification,
    delete-blocked leftovers, FILETIME-zero floor) are unchanged.
 
 ### What gets removed (precise inventory)
@@ -372,6 +451,25 @@ test-inventory and golden-rule passages.)
   "refused" assertion is bash-only.
 - Keep strictly ASCII; keep 5.1-compatible syntax.
 
+### Both impls: claim-window traps, the hold helper, the memory
+
+- **Claim-window trap coverage**: today the handlers exist only for holds
+  (bash `_lock_on_exit` / `_lock_on_signal`, saved+installed only once HELD,
+  sh ~599–610; ps1 analog). They gain the claim-window mode of the trap-time
+  cleanup rule: install before the claim create — the handler is
+  token-checked, so a signal landing pre-create or post-resolve is a
+  harmless no-op — and restore the caller's traps when the attempt resolves
+  without a hold (the existing `_LOCK_SAVED_TRAP_*` save/restore mechanics,
+  sh ~319–323, extended with a claim-in-flight vs. held state distinction).
+- **Shared "claim the hold" helper**: setting `_LOCK_HELD`, saving +
+  installing the hold traps, adopting the attempt token as the hold token,
+  and the ACQUIRED log line live in ONE helper used by all three acquisition
+  paths — create read-back, steal rename-over, and discovery-HOLD — so
+  steal-acquired and discovery-acquired holds run the same HELD/trap-install
+  machinery as create-acquired ones (plan test 24 asserts the parity).
+- **Leaked-token memory**: a per-acquire in-process structure (bash array /
+  ps1 list), empty in the common case, cleared when the acquire returns.
+
 ### Probes (phase 1)
 
 - bash `mv` replace atomicity on NTFS (no-absent-window, atomic content flip).
@@ -399,7 +497,11 @@ race; the no-absent-window and lease-touch bonuses are lost).
 ### Logging (design, per house rules)
 
 To the existing lock log (same damping conventions):
-- `CLAIM <path> by <owner>` on claim create.
+- `CLAIM <path> tok=<attempt token> by <owner>` on claim create. The token
+  is required: per-claim-attempt tokens make the once-per-acquire WAITING
+  token line insufficient for reconstructing discovery-HOLDs, and the
+  unowned-orphan forensics (plan test 21) rides on it — a log reader can
+  identify an unowned lock's token as a leaked claim token.
 - `CLAIM-ABORT (<reason>)` — reasons enum:
   `fresh | gone | wrong-type | rename-refused | contested`.
 - `STOLE-BY-CLAIM <lockpath> ghost=<ghost line2> by <owner>` on the rename-over
@@ -468,6 +570,10 @@ Unit (`git-commit-lock.test.sh`):
      deletion's passing read and its unlink (the ENOENT lane).
    - **rename-source-gone**: A's rename lands between B's step-3.3
      re-verify and B's own rename.
+
+   Every discovery-HOLD outcome in this matrix additionally asserts the
+   discovered owner's `lock_release` returns **0** — no spurious 98 (an
+   implementation keeping a per-acquire token for release must fail this).
 10. **Delayed-claim lease**: claim aged close to CLAIM_STALE, then recovery →
     the installed lock's mtime is fresh (the step-3.2 touch), the holder gets
     a full lease.
@@ -489,6 +595,33 @@ Unit (`git-commit-lock.test.sh`):
     catches FileNotFound — a creating-touch implementation must fail the
     suite (static grep is acceptable, mirroring plan test 15's
     no-`File.Replace` check).
+
+(Plan tests 21–24 are unit tests too, numbered past the interop block —
+which keeps 17–20 — to avoid a second renumbering.)
+
+21. **Leaked-claim discovery**: force a leaked-claim exit — the
+    unreadable/undeletable-claim lane, via the suites' existing
+    no-delete-share handle helper pattern — then steer a rival install of
+    the leaked claim; assert the leaver discovers via the leaked-token
+    memory (HOLD, and `lock_release` returns 0). **Crashed-leaver variant**:
+    kill the leaver untrappably after the leak → assert the bounded-orphan
+    outcome (the unowned lock ages out; waiters recover at staleness; the
+    log's `CLAIM ... tok=` line identifies the unowned lock's token as a
+    claim token, for forensics).
+22. **Per-attempt token regression** (Codex): force an abandoned own-token
+    lock via a failed acquire read-back, then run a later claim attempt by
+    the same process — assert the old token is NOT treated as current (no
+    false discovery-HOLD), and that release verifies against the
+    per-attempt token (a reused-per-acquire-token implementation must fail
+    this test).
+23. **TERM-mid-claim**: claimant killed with TERM between claim create and
+    rename → the claim is deleted by the trap (or discovery-HOLD + released
+    per trap semantics); assert no claim leftover and no 60s ageout penalty
+    for the next stealer.
+24. **Steal-acquired-hold trap parity**: extend an existing TERM-release
+    test to a steal-acquired hold — TERM on a steal-acquired holder releases
+    cleanly, exactly as for a create-acquired hold (the shared
+    claim-the-hold helper; see Implementation notes).
 
 Interop (`git-commit-lock.interop.test.sh`):
 17. bash claimant vs ps1 claimant racing one ghost → one winner, both sides
@@ -541,6 +674,14 @@ All three suites green (REDUCED locally, FULL is CI's job), shellcheck
 - **`File.Replace` for the 5.1 lane**: rejected in round 1 — read-only
   destination throws; partial-failure states without a backup file. The
   unlink+fail-if-exists-Move ladder is safe under the claim (see notes).
+- **Capture-verify-install (two-rename compare-and-swap)** — for residual
+  5's untrappable-death lane: rename the claim to a private per-claimant
+  name, verify our own token there, only then rename into the lock. This
+  makes installing a FOREIGN claim impossible (closing the residual), but it
+  reintroduces crash-litter at private names and therefore an age-gated
+  sweep — the exact machinery class this redesign removes — to close a
+  residual that is already bounded, detected, false-success-free, and rarer
+  than the accepted crashed-holder stall. Rejected.
 - **Ticket queue** (`commit.lock.d/<ts>.<token>`, lowest non-stale ticket
   holds): no destructive steal at all, FIFO fairness — but a total wire-format
   rewrite, "lowest non-stale" must be evaluated identically across runtimes,
@@ -643,3 +784,34 @@ implementation.
   sh:589-598 / ps1:668-675; warning sh:300-307) + verify-cites-at-
   implementation-time caveat, suite-Tnn vs plan-test-nn disambiguation,
   residual-3 rival-rename lease clause, `13166e2` coordination.
+- **Round 4 (2026-06-11)**: fresh Claude (1 blocking + 3 non-blocking) +
+  Codex (3 blocking) — same defect family, independently converging; all
+  folded into v5. The defect: v4's conclusiveness argument ("a miss is a
+  true miss") requires the claimant to have installed OR verifiably
+  unlinked its claim, and three "leave it" exits violate that —
+  recheck-unreadable, deletion-read-unreadable, and
+  deletion-unlink-fails-while-present (an outcome the deletion rule had
+  not specified) — so a leftover claim can be installed by a suspended
+  rival's rename AFTER the leaver's final discovery read → unowned
+  own-token lock, ≤ STALE stall; same family, a claimant that DIES
+  mid-claim can have its claim installed with no discovery possible at
+  all. Dispositions: (1) **leaked-token memory** global rule — closes
+  every live-process lane (continuous per-poll discovery while the list
+  is non-empty; one-shot final read kept); (2) **trap-time claim cleanup**
+  — trappable exits delete the claim (token-checked) + run the final
+  discovery read, a discovery-HOLD releasing per normal trap semantics;
+  explicitly no lock-release/98-classification on a mere claim; (3)
+  **untrappable death accepted, NOT prevented** — inventoried as residual
+  5 (same magnitude as the fundamental crashed-holder stall, far lower
+  probability, no false success); the preventing alternative
+  (capture-verify-install, a two-rename compare-and-swap) rejected under
+  Alternatives because it reintroduces crash-litter + an age-gated sweep;
+  (4) the deletion rule's unlink-blocked-while-present outcome specified
+  (→ leaked, damped warning, re-poll); (5) tests: leaked-claim discovery
+  + crashed-leaver forensics (plan test 21), per-attempt-token regression
+  (22), TERM-mid-claim (23), steal-acquired-hold trap parity (24), and a
+  discovery-HOLD release-rc-0 assertion folded into the test-9 matrix;
+  (6) `CLAIM` log lines carry `tok=<attempt token>`; (7) "no unowned
+  orphan" claims re-scoped everywhere: structural for live processes,
+  trap-cleaned for trappable exits, bounded residual for untrappable
+  death.
