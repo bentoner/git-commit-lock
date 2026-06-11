@@ -1,6 +1,6 @@
 # Plan: claim-serialized stealing (claim-is-the-next-lock + atomic rename-over)
 
-Status: DRAFT v2 — round-1 findings folded; awaiting round-2 review.
+Status: DRAFT v3 — round-2 findings folded; awaiting round-3 review.
 
 ## Goal
 
@@ -67,21 +67,40 @@ content, plausible mtime ≥ floor, age > `AGENT_LOCK_STALE_SECS`):
       already judged stale — this closes the stale-claim TOCTOU that round-1
       review flagged (a cleared-then-renamed claim installing an unowned
       lock). Outcomes:
-      - **Foreign token** → a clearer removed ours and a rival claimed; leave
-        the file, re-poll.
+      - **Gone** → ownership-discovery read (global rule, below): our claim
+        may already have been installed as the lock by a rival's rename.
+        Not ours at the lock either → re-poll.
+      - **Foreign token** → ownership-discovery read first (ours may have
+        been installed as the lock *before* the rival claimed); otherwise a
+        clearer removed ours and a rival claimed: leave the file, re-poll.
       - **Ours but overaged** → assume contested (a clearer may be acting on
         it right now); delete our own claim (token-checked, below),
         `CLAIM-ABORT (contested)`, re-poll.
       - **Unreadable after the retry ladder** → leave it (it ages out),
         re-poll.
-   2. **Touch the claim** (refresh its mtime). Two purposes: it extends our
-      claim against clearers across the rename; and — because rename
-      preserves mtime — **the installed lock's staleness clock after the
-      rename IS the claim file's mtime**, so the touch makes the new holder's
-      lease start ~now. This fixes the aged-lease defect (a claim created up
-      to CLAIM_STALE ago would otherwise install a lock already that old);
-      the residual lease shortfall is bounded by the recheck→rename gap —
-      milliseconds.
+   2. **Touch the claim** (refresh its mtime) — **non-creating**: bash
+      `touch -c`, ps1 `[IO.File]::SetLastWriteTimeUtc` catching
+      FileNotFound. A creating touch would resurrect a vanished claim as a
+      fresh empty `${LOCK}.next` that blocks every rival claim until it
+      ages out (O_EXCL fails on it; clearers must wait out CLAIM_STALE) — a
+      self-inflicted steal outage — and it masks the gone-claim signal the
+      ownership-discovery rule keys on. Touch fails because the claim is
+      gone → ownership-discovery read, then re-poll.
+
+      Purpose of the touch: because rename preserves mtime, **the installed
+      lock's staleness clock after the rename IS the claim file's mtime**,
+      so the touch makes the new holder's lease start ~now. This fixes the
+      aged-lease defect (a claim created up to CLAIM_STALE ago would
+      otherwise install a lock already that old). Two accuracy caveats: the
+      touch does NOT defend the rename against a clearer whose staleness
+      read predates the touch — what actually bounds things is the
+      step-3.1 recheck (our claim is younger than CLAIM_STALE at recheck)
+      plus the ownership-discovery rule catching any leak. And a claimant
+      suspended between this touch and the rename still installs a
+      correspondingly aged-mtime lock — the lease shortfall is bounded by
+      the touch→rename gap (milliseconds when not suspended), not
+      guaranteed ~zero. (Decision: no recheck margin — keep the spec
+      simple; the discovery rule makes the gap-frequency question moot.)
    3. **Re-verify the lock** still stale (as step 2; unchanged).
    4. **Rename-over**: `mv ${LOCK}.next ${LOCK}` (ghost destroyed + our live
       lock installed in one operation). Then run the existing acquire
@@ -94,26 +113,51 @@ content, plausible mtime ≥ floor, age > `AGENT_LOCK_STALE_SECS`):
      now-absent path — that lane belongs to the normal create race and
      renaming there could clobber a rival's fresh create. Delete claim,
      re-race the normal create.
-   - (b) lock **fresh** (mtime renewed / different token): `CLAIM-ABORT
-     (fresh)`; delete claim, continue waiting.
+   - (b) lock **fresh** (mtime renewed / different token): ownership-
+     discovery read first — the "fresh" lock may be OUR OWN claim,
+     installed by a rival's rename; our token ⇒ we HOLD the lock (without
+     this branch we would abort on our own lock and orphan it). Otherwise
+     `CLAIM-ABORT (fresh)`; delete claim, continue waiting.
 
 **Token-checked claim deletion (global rule).** Every "delete our claim" path
 anywhere in this algorithm reads the claim first and unlinks **only if line 1
-is our token**. Foreign → leave it (it's a rival's live claim). Unreadable →
-leave it to age out. Never blind-unlink the claim path.
+is our token**. Foreign → run the ownership-discovery read (below; ours may
+already have been installed as the lock before the rival claimed), then leave
+the claim (it's a rival's live claim). Unreadable → leave it to age out.
+Never blind-unlink the claim path. (The deletion's own read→unlink gap can in
+principle unlink a rival's just-created claim — clearer and rival inside a
+microsecond window; benign: the rival's recheck finds its claim gone →
+ownership-discovery rule → it retries. Implementations must NOT add machinery
+for this.)
+
+**Ownership-discovery rule (global rule).** A rival's rename can install OUR
+claim file as the lock while we are anywhere past the claim create. So on
+EVERY post-claim-create exit path — claim gone or foreign at the step-3.1
+recheck; step-3.2 touch failure; a step-2/3.3 abort for a fresh or changed
+lock (step 4b); rename source-gone; a token-checked deletion finding a
+foreign claim — first read the lock path's line 1: **our own token ⇒ we HOLD
+the lock** — proceed to the acquire read-back verification; otherwise
+continue with that lane's normal outcome. Cost: one extra read per abort
+path, all of which already read files. This rule is what makes "no unowned
+orphan" structural rather than per-lane: whichever claim file gets installed
+at the lock path, its token's owner takes SOME exit path, and the discovery
+read on that path finds ownership; every other party reads a foreign token
+and backs off.
 
 #### Rename-failure lanes
 
-- **Source (claim) gone at rename** → read the LOCK path:
-  - It carries **our token** → a rival's rename installed our claim file as
-    the lock; token uniqueness makes this sound — **we HOLD the lock**;
-    proceed to the read-back verification.
-  - Foreign/absent → our claim was abandoned/cleared; re-poll.
+- **Source (claim) gone at rename** → the ownership-discovery rule (this
+  lane is simply one case of the global rule): our token at the lock path →
+  a rival's rename installed our claim file as the lock; token uniqueness
+  makes this sound — **we HOLD the lock**; proceed to the read-back
+  verification. Foreign/absent → our claim was abandoned/cleared; re-poll.
 
-  This lane makes the two-claimant interleaving **self-healing**: whichever
-  claim file gets installed at the lock path, its token's owner discovers
-  ownership (via the read-back or this lane) and everyone else reads a
-  foreign token and backs off — **no unowned orphan is possible**. That
+  Self-healing here is structural, not a property of this lane alone: per
+  the ownership-discovery rule, whichever claim file gets installed at the
+  lock path, its token's owner runs the discovery read on whatever exit
+  path it happens to take (recheck-gone, touch failure, fresh-lock abort,
+  this source-gone lane, or the read-back itself), and everyone else reads
+  a foreign token and backs off — **no unowned orphan is possible**. That
   answers round 1's wedge scenario structurally, not probabilistically.
 - **Destination wrong-type** (rename onto a directory fails) →
   `CLAIM-ABORT (rename-refused)`, token-checked claim deletion, damped
@@ -145,10 +189,11 @@ leave it to age out. Never blind-unlink the claim path.
 - Knob relation: worst-case recovery = `AGENT_LOCK_STALE_SECS` +
   `AGENT_LOCK_CLAIM_STALE_SECS` must stay < `AGENT_LOCK_MAX_WAIT` (defaults:
   300 + 60 < 420 ✓). Warn-once at startup when `MAX_WAIT ≤ STALE +
-  CLAIM_STALE`, but **only when MAX_WAIT was left at its default** — the same
-  explicitness gate as the existing STALE≥MAX_WAIT warning
-  (git-commit-lock.sh:296-304); a caller who set both knobs chose the
-  relationship deliberately. Consequence: tight-knob tests must set
+  CLAIM_STALE`, but **only when MAX_WAIT was left at its default** — a
+  caller who set both knobs chose the relationship deliberately. This new
+  warning **REPLACES** the existing `STALE ≥ MAX_WAIT` warning
+  (git-commit-lock.sh:296-304): it strictly subsumes it, under the same
+  left-default explicitness gate. Consequence: tight-knob tests must set
   `AGENT_LOCK_CLAIM_STALE_SECS` alongside the other knobs.
 
 ### Crash-lane inventory
@@ -168,16 +213,22 @@ leave it to age out. Never blind-unlink the claim path.
    is a few ms; it does contain forks (the mtime stat is a command
    substitution, `mv` is an exec), but it is strictly narrower than the
    pre-wave-1 race and the same class as wave 1's unrestorable residual.
-2. **recheck→rename gap**: the claim recheck (step 3.1) closes the stale-claim
-   TOCTOU down to the milliseconds between recheck and rename. Two-claimant
-   interleavings inside that gap are **self-healing** per the
-   rename-failure lane above: exactly one claim file ends up installed, its
-   token's owner discovers ownership, everyone else detects a foreign token —
-   no unowned orphan is possible; any displacement degrades into the
-   detected-98 lane. No infinite regress.
+2. **recheck→rename gap**: the step-3.1 recheck bounds what a clearer can
+   legitimately act on (at the recheck our claim is younger than
+   CLAIM_STALE) — but a clearer whose staleness read predates the recheck
+   (the touch does not defend this either) can still clear our claim and
+   let a rival claim inside the recheck→rename gap. Every such two-claimant
+   interleaving is **self-healing** per the ownership-discovery rule:
+   exactly one claim file ends up installed, its token's owner discovers
+   ownership on whatever exit path it takes, everyone else detects a
+   foreign token — no unowned orphan is possible; any displacement degrades
+   into the detected-98 lane. No infinite regress. (Decision: no recheck
+   margin — the discovery rule makes the gap-frequency question moot.)
 3. **Lease rule**: the installed lock's lease starts at the claim's
-   step-3.2 touch (rename preserves mtime), so the new holder always gets an
-   ~full stale window. The shortfall is bounded by gap (2).
+   step-3.2 touch (rename preserves mtime). A claimant suspended between
+   touch and rename installs a correspondingly aged-mtime lock — the lease
+   shortfall is bounded by the touch→rename gap (milliseconds when not
+   suspended), not "always ~full lease".
 4. **Version skew**: prevention holds only when *all* parties in a tree run
    the claim protocol. A mixed-version tree (an old stealer doing mv-to-grave)
    degrades to detection (98) and can leave grave litter the new code does not
@@ -229,7 +280,12 @@ leave it to age out. Never blind-unlink the claim path.
   *safe under the claim*: a rival waiter's create landing in that window
   merely wins the lock — our Move fails-if-exists → token-checked claim
   deletion, re-poll. A fairness loss (the claimant did the recovery work and
-  lost the lock), never a clobber.
+  lost the lock), never a clobber. Ladder sub-lanes: (a) the ghost unlink
+  finds the lock already gone (the live-slow holder released first) →
+  `CLAIM-ABORT (gone)` for symmetry with step 4(a); do NOT proceed to the
+  Move. (b) the ghost unlink is blocked by a no-delete-share handle → the
+  existing damped blocked-steal lane (token-checked claim deletion, damped
+  log, re-poll).
 - ps1-on-POSIX residual (extends the existing PORT-SPECIFIC notes): a
   FIFO/device/socket at the **claim** path stats as size 0 there and takes the
   empty-claim clear lane — damage capped at the one misconfigured inode,
@@ -241,14 +297,16 @@ leave it to age out. Never blind-unlink the claim path.
 
 - bash `mv` replace atomicity on NTFS (no-absent-window, atomic content flip).
 - pwsh 7 overwrite-`Move` atomicity, same assertions.
-- **Post-rename lock mtime freshness**: from both bash `mv` and pwsh 7
-  overwrite-Move, confirm rename preserves the claim's just-touched mtime
-  (the lease rule depends on it).
+- **Post-rename lock mtime freshness**: from bash `mv`, pwsh 7
+  overwrite-Move, AND the 5.1 `File.Move` leg, confirm rename preserves the
+  claim's just-touched mtime (the lease rule rides on it in all three
+  lanes).
 - **5.1 `File.Move` fail-if-exists atomicity** (exactly one of N concurrent
   Moves onto one destination wins).
-- **`touch` semantics on the claim from both runtimes** (bash `touch`, ps1
-  `[IO.File]::SetLastWriteTimeUtc` or equivalent): mtime visibly refreshed,
-  content untouched.
+- **`touch` semantics on the claim from both runtimes** (bash `touch -c`,
+  ps1 `[IO.File]::SetLastWriteTimeUtc` catching FileNotFound): mtime visibly
+  refreshed, content untouched, and **a missing target is NOT created** —
+  the no-create semantics the algorithm depends on.
 - (Dropped: all `File.Replace` probes.)
 
 Abort criteria: if rename-over is not reliably atomic-no-absent-window on NTFS
@@ -295,31 +353,45 @@ Unit (`git-commit-lock.test.sh`):
 7. Knob validation: `AGENT_LOCK_CLAIM_STALE_SECS` numeric checks; the
    `MAX_WAIT ≤ STALE + CLAIM_STALE` warning fires when MAX_WAIT is default and
    stays silent when MAX_WAIT was set explicitly.
-8. **Fault-injected stale-claim TOCTOU**: suspended claimant (backdated claim)
-   + a clearer + a rival claimant → assert the self-healing outcome: exactly
-   one final owner; everyone else detects foreign; no unowned lock; the
-   rename-fail→lock-token-recovery lane exercised.
-9. **Delayed-claim lease**: claim aged close to CLAIM_STALE, then recovery →
-   the installed lock's mtime is fresh (the step-3.2 touch), the holder gets a
-   full lease.
-10. **Step-4a abort-on-gone**: live-slow holder releases under a claimant →
+8. **Aged-claim contested abort**: suspended claimant (backdated own claim) →
+   the step-3.1 recheck finds it overaged → `CLAIM-ABORT (contested)`, NO
+   rename (mutation check: an implementation that proceeds on an overaged
+   claim must fail this).
+9. **Post-recheck claim substitution** (discovery-position matrix): a clearer
+   + a rival act AFTER the claimant's recheck passes; steer the rival's
+   claimant to EACH discovery position — recheck-gone, step-2-fresh,
+   rename-source-gone — asserting in every case exactly one final owner,
+   everyone else backs off, and no unowned lock.
+10. **Delayed-claim lease**: claim aged close to CLAIM_STALE, then recovery →
+    the installed lock's mtime is fresh (the step-3.2 touch), the holder gets
+    a full lease.
+11. **Step-4a abort-on-gone**: live-slow holder releases under a claimant →
     `CLAIM-ABORT (gone)`, NO install on the absent path (mutation check: an
     implementation that renames onto the absent path must fail this).
-11. **Claim mtime floor**: a sub-floor claim mtime is NOT cleared — treated as
+12. **Claim mtime floor**: a sub-floor claim mtime is NOT cleared — treated as
     just-created.
-12. **Per-path guard state**: a lock-path wrong-type warning must not suppress
+13. **Per-path guard state**: a lock-path wrong-type warning must not suppress
     a claim-path warning, and vice versa (warn-once and two-poll confirmation
     are independent per path).
+14. **Blocked-steal claim cleanup**: the deterministic blocked-steal test
+    gains an assertion that the claim is deleted immediately after the failed
+    rename — no 60s ageout penalty.
+15. **No-`File.Replace` static check**: assert `git-commit-lock.ps1` contains
+    no `File.Replace` (anti-regression for the round-1-rejected primitive).
 
 Interop (`git-commit-lock.interop.test.sh`):
-13. bash claimant vs ps1 claimant racing one ghost → one winner, both sides
+16. bash claimant vs ps1 claimant racing one ghost → one winner, both sides
     parse each other's claim files (wire format), loser waits correctly.
-14. Cross-impl claim-staleness agreement: each side clears the other's aged
+17. Cross-impl claim-staleness agreement: each side clears the other's aged
     claim.
-15. Adapted T16 (as the adapted T2b above, mixed runtimes).
-16. 5.1 lane: the **unlink+`File.Move` ladder** exercised under `powershell`
+18. Adapted T16 (as the adapted T2b above, mixed runtimes).
+19. 5.1 lane: the **unlink+`File.Move` ladder** exercised under `powershell`
     where available (skip-with-note elsewhere). The suite already has a 5.1
     smoke lane — interop Test 17, landed in `51e55a3` — hook into it.
+
+The 5.1 absent-window fairness case (a rival's create winning inside the
+unlink→Move window) is deliberately left untested — non-deterministic, and
+benign by design.
 
 Integration: unchanged scenario; the final no-leftover sweep gains `*.next`
 alongside the existing no-leftover-lock check.
@@ -328,8 +400,7 @@ Tight-knob tests across all suites set `AGENT_LOCK_CLAIM_STALE_SECS` alongside
 the existing knobs (the warning gate assumes coherent explicit settings).
 
 All three suites green (REDUCED locally, FULL is CI's job), shellcheck
-`-S warning` (or `-S info` once the parallel CI bump lands) + PSScriptAnalyzer
-clean.
+`-S info` (the CI gate since `51e55a3`) + PSScriptAnalyzer clean.
 
 ## Docs
 
@@ -377,9 +448,14 @@ Waves landed since this plan was first written; the implementation builds on
 them, not around them:
 - Interop suite now has **Test 7b** (ps1 exit verdicts) and **Test 17**
   (Windows PowerShell 5.1 smoke lane) from `51e55a3` — the 5.1 steal-ladder
-  test (item 16) hooks into Test 17's lane rather than duplicating detection.
+  test (item 19) hooks into Test 17's lane rather than duplicating detection.
 - Integration test uses **per-worker lock logs** from `0339dbe` — new
   assertions (e.g. the `*.next` no-leftover sweep) follow that structure.
+- **Wave C (read-ladder parity) landed as `d40616f`**: shared 8-attempt
+  20→320ms-capped retry schedule (≈1.26s) at release/read-back only;
+  sourced-outside-a-repo warns on stderr and creates no file; `--help` →
+  stdout/exit 0 in both impls; the doc's ladder definition updated. The
+  implementation builds on that tree state.
 
 ## Phases
 
@@ -406,3 +482,23 @@ implementation.
   guard, MAX_WAIT warning gate, attribution softening, CLAIM-ABORT enum,
   six test additions, precise removal inventory, version-skew note,
   coordination with `51e55a3`/`0339dbe`). All folded into v2.
+- **Round 2 (2026-06-11)**: fresh Claude (2 blocking + 6 non-blocking) +
+  Codex (0 blocking + 3 non-blocking); all folded into v3. Blocking family —
+  make self-healing structural: (1) v2 wired own-token discovery into only
+  the rename-source-gone lane, leaving three of the four positions a
+  claimant can occupy when a rival's rename installs its claim (recheck-gone,
+  step-2/3.3 fresh-abort, touch-target-gone) to orphan an own-token lock for
+  a full STALE window → the global ownership-discovery rule on every
+  post-claim-create exit path; (2) a creating `touch` would resurrect a
+  vanished claim as an empty `${LOCK}.next` blocking all steals and masking
+  the gone signal → non-creating touch (`touch -c` /
+  `SetLastWriteTimeUtc`+FileNotFound). Non-blocking: residual/lease wording
+  accuracy (recheck + discovery rule bound things, not the touch; lease
+  shortfall bounded by the touch→rename gap), deletion-gap note, 5.1 ladder
+  sub-lanes (unlink-finds-gone → `CLAIM-ABORT (gone)`; unlink-blocked →
+  damped blocked-steal lane) + 5.1 `File.Move` mtime-probe leg, test-plan
+  splits/additions (contested abort vs. discovery-position matrix,
+  blocked-steal cleanup assertion, no-`File.Replace` static check, untested
+  5.1 fairness note), stale shellcheck parenthetical dropped, MAX_WAIT
+  warning stated as replacing the STALE≥MAX_WAIT warning, wave-C
+  (`d40616f`) coordination.
