@@ -1,18 +1,8 @@
 # `git-commit-lock`: a mutex for committing from a shared working tree
 
-Design reference for the commit lock. The suggested agent operating rules live
-in the README ("Suggested agent instructions"); read that first. This file is
-the "why" and "how it works".
-
-## Scope: lock only, git by hand
-
-The lock is the **only** thing we automate. The git commands — what to stage,
-what to commit — are run manually by the agent, under the lock. We deliberately
-do **not** ship a commit wrapper: an earlier version did, and teaching it as
-*the* way to commit led an agent to treat the wrapper's per-file scope as the
-limit of the possible and escalate a one-line commit to the human. The lesson:
-the lock is a shared invariant worth packaging; a commit is local git that
-should stay flexible. Keep the automated surface minimal.
+Design reference for the commit lock — the "why" and the "how it works". The
+suggested agent operating rules live in the README ("Suggested agent
+instructions"); read that first.
 
 ## The problem
 
@@ -37,106 +27,64 @@ A git working tree has exactly one index (`.git/index`, or
 Worktrees solve this by giving each agent its own index — but sub-agents can't
 have worktrees, so we need a lock inside the shared tree.
 
+## Scope: lock only, git by hand
+
+The lock is the **only** thing we automate. The git commands — what to stage,
+what to commit — are run manually by the agent, under the lock. We deliberately
+do **not** ship a commit wrapper: an earlier version shipped one, and teaching
+it as *the* way to commit led agents to treat the wrapper's scope as the limit
+of what was possible. The lesson: the lock is a shared invariant worth
+packaging; a commit is local git that should stay flexible. Keep the automated
+surface minimal.
+
 ## How the lock works
 
-`flock(1)` is not reliably available here — Git for Windows ships none, and a
-Cygwin/MSYS2-installed one is invisible to .NET anyway (see [Why not
-`flock`?](#why-not-flock-or-another-os-lock-primitive) for the full story) —
-so the lock is built from primitives that are atomic on NTFS:
+The lock is a **file** — by default `<gitdir>/commit.lock` — whose existence
+means "someone is committing" and whose content names the holder. Acquiring,
+stealing, and releasing it are each built around a single filesystem operation
+(create-or-fail, rename, unlink) that is atomic on local POSIX filesystems
+and NTFS alike, so the bash implementation and the PowerShell port take the
+*same* lock with identical semantics, and a `.sh` holder and a `.ps1` holder
+in one tree serialise against each other.
 
-- **acquire** = create the lock **file** with an atomic create-or-fail open
-  (bash: a `noclobber` redirect, i.e. `O_CREAT|O_EXCL`; .NET:
-  `FileMode.CreateNew`), writing its content in the same open: line 1 is the
-  holder's unique token (theft detection — it must start `tok.`, which is
-  part of the wire format), line 2 an informational `pid=<pid> host=<host>`
-  owner line for the logs. While the file exists, nobody else can create it,
-  so an existing file is unambiguously the current holder's. Creation and
-  ownership metadata are one atomic-enough step: the token travels with the
-  file, and a crash between create and write just leaves an *empty file with
-  a valid mtime*, recovered by the normal staleness rule (a regression test
-  covers it). After winning, the acquirer reads the path back and must find
-  its own token; anything else after the read-retry ladder (foreign, empty,
-  gone) means it cannot prove it holds the path — it logs loudly and treats
-  the lock as NOT acquired. It never "repairs" a failed read-back by
-  rewriting the path: after a long suspension (sleep, stop-the-world) the
-  file may legitimately be a successor's live lock, and an overwrite would
-  corrupt it undetectably.
-- **steal** = `mv <lock> <grave>` — `rename(2)` is atomic, so exactly one
-  concurrent stealer wins; the rest get `ENOENT` and re-race the create. The
-  winner deletes the grave (one `rm -f` of a file; an age-gated sweep clears
-  any grave a crashed stealer left behind).
-
-**Staleness is judged by the lock file's own mtime** (stamped by the creating
-write). A lock older than `AGENT_LOCK_STALE_SECS` (default **300s / 5 min**)
-is presumed crashed and may be stolen, so one dead agent can't wedge the
-others.
-
-**The steal refuses anything that is not lock-shaped.** A directory at the
-lock path (a config typo, or a leftover lock from the old directory-based
-protocol), a symlink, a device, or a regular file whose content is neither
-empty nor `tok.`-prefixed is **never** stolen or deleted: a loud one-time
-config warning names the path, and waiters time out (97) until a human
-removes it. The tool never runs `rm -rf` and never deletes anything it cannot
-identify as a lock, so a typo'd `AGENT_LOCK_PATH` — pointing at `$HOME`, or
-at a real user file with ordinary content — is harmless. Two accepted
-residuals bound that claim, because the content test is exactly "empty, or
-line 1 starts `tok.`": a stale **empty** user file is indistinguishable from
-the crash orphan and IS stolen, and a stale user file whose first line
-happens to start `tok.` passes the wire test and IS stolen too —
-deliberately, since a fuller shape check would bind the wire format harder
-for near-zero added protection (see ACCEPTED RESIDUALS in
-`git-commit-lock.sh`). (bash also refuses the *create* on a
-non-regular path up front: `noclobber`'s exists⇒fail protection covers
-regular files only, and an open on an existing FIFO would block before any
-timeout logic runs.) One scoped exception: bash delivers this guarantee in
-full, but the **PowerShell port running on POSIX** — an unsupported, CI-only
-configuration — has no clean .NET type probe for FIFOs/devices/sockets, which
-stat there as size 0 and take the empty-orphan steal lane (renamed aside and
-grave-deleted, capping damage at the one misconfigured inode). That residual
-is documented in `git-commit-lock.ps1`'s PORT-SPECIFIC NOTES; on Windows the
-ps1 guard is complete.
-
-**Release** = compare the file's token to ours, then one unlink. A non-empty
-foreign token, or a gone file, means the lease was stolen → fail loudly with
-98 (acquire's read-back positively verified our token at the path, which is
-what grounds treating "gone" as theft). A file that still reads *empty* after
-the retry ladder is NOT definitive theft evidence — it can be a successor
-mid-create after a boundary steal, a window the probes show is real — so
-ownership is unverifiable: the file is left in place (it may be a nascent
-live lock; a true orphan ages into the staleness backstop) and release fails
-distinctly. On a token match the unlink is retried briefly: on Windows a
-foreign no-delete-share handle (an AV scanner, a naive reader) can block it,
-and — probed — the same handle class blocks a stealer's rename identically,
-so the path cannot be stolen-and-recreated while the delete keeps failing. If
-it keeps failing the lock is a **leftover**: release warns and returns 1, and
-waiters recover only once the stale window elapses AND the blocking handle
-closes.
-
-**Location.** The lock and its log default to the repo's git dir
-(`git rev-parse --absolute-git-dir`), e.g. `<repo>/.git/commit.lock` and
-`<repo>/.git/git-commit-lock.log`. Never tracked by git (no `.gitignore` needed in
-any repo), and correctly scoped: every worktree has its own git dir, so
-independent worktrees get independent locks, while all sub-agents sharing one
-checkout resolve the same git dir and share one lock.
-
-**One caveat on the mtime clock.** A just-created lock file can transiently
-report the Windows FILETIME zero (1601-01-01) to an observer in the window
-around creation — a ~400-year bogus "age" that would spuriously steal a
-*live, brand-new* lock and put two holders in the tree. This is not a
-dir-rename artifact of the old protocol: probing shows plain file creation
-(both bash- and pwsh-created) produces the same transient at roughly
-0.04–0.5% of readings. Both implementations therefore refuse to steal on any
-mtime below a sane floor (2000-01-01), treating a sub-floor reading as "just
-created — wait"; it settles in milliseconds.
+It is deliberately **not** an OS lock — no `flock`, no kernel mutex, no
+helper daemon (see [Why not
+`flock`?](#why-not-flock-or-another-os-lock-primitive)). Instead it is a
+**lease**: a lock older than the staleness window (default 5 minutes) is
+presumed crashed and may be stolen, so one dead or wedged agent can't wedge
+the rest, and a holder that loses the lease mid-hold finds out at release
+(exit 98) rather than silently claiming success. The full mechanics —
+acquire, steal, the never-steal guards, release, and the clock caveat — are
+in [The protocol in detail](#the-protocol-in-detail).
 
 ## Why not `flock` (or another OS lock primitive)?
 
 Kernel locks look like the obvious tool here — so why a hand-rolled
-filesystem lease? Because the hard requirement is **one lock that both
-implementations can take natively**: bash running under Git for Windows'
-MINGW64 environment, and PowerShell/.NET, contending on the *same* lock in the
-same repo, with the bash side also portable to macOS and Linux. No OS lock
-primitive survives that intersection:
+filesystem lease? Two reasons, either of which would have been decisive on
+its own: kernel locks can't recover a wedged holder, and no kernel primitive
+spans the runtimes that have to share this lock.
+
+**Kernel locks can't recover a wedged holder.** Automatic release-on-death
+is the kernel lock's great virtue (with caveats: Windows documents
+post-mortem unlocking as asynchronous, and an `flock` lives on the open file
+description, so an inherited descriptor in a child keeps it held). But there
+is no supported way to take a kernel lock away from a process that is alive
+and *stuck* — an agent hung on a credential prompt, a wedged hook, a dead
+network mount — short of killing the holder. For unattended agent fleets,
+hung-but-alive is at least as common as crashed, and a locking tool that lets
+one wedged agent silently halt an overnight multi-agent run is doing more
+harm than the race it prevents. The lease design recovers from both crash
+and wedge within the stale window, at the documented cost of being
+**fail-open** — a theft is detected (exit 98) rather than prevented. That
+trade is sensible here because the failure being guarded against is mild:
+two colliding committers almost always produce just a failed commit, or at
+worst a mixed-up commit.
+
+**No kernel primitive spans the runtimes.** The other hard requirement is
+**one lock that both implementations can take natively**: bash running under
+Git for Windows' MINGW64 environment, and PowerShell/.NET, contending on the
+*same* lock in the same repo, with the bash side also portable to macOS and
+Linux. No OS lock primitive survives that intersection:
 
 - **Availability.** Git for Windows deliberately excludes util-linux from its
   payload, so its bash has no `flock(1)` at all (MSYS2 proper offers one via
@@ -163,23 +111,13 @@ primitive survives that intersection:
   it deliberately: it turns two dependency-free scripts into an installed
   binary with command-wrapping semantics, which is a different (and heavier)
   project than "copy these scripts anywhere agents run".
-- **And kernel locks can't recover a wedged holder.** Automatic
-  release-on-death is the kernel lock's great virtue (with caveats: Windows
-  documents post-mortem unlocking as asynchronous, and an `flock` lives on
-  the open file description, so an inherited descriptor in a child keeps it
-  held). But there is no supported way to take a kernel lock away from a
-  process that is alive and *stuck* — an agent hung on a credential prompt, a
-  wedged hook, a dead network mount — short of killing it. For unattended
-  agent fleets, hung-but-alive is at least as common as crashed. The lease
-  design recovers from both within the stale window, at the documented cost
-  of being fail-open — a theft is detected (exit 98) rather than prevented.
 
 So the only locking primitive every runtime here observes identically is the
 **filesystem namespace** — atomic create and atomic rename — and that is what
-the lock is built from. The trade-off is owned in the sections above:
-staleness needs a clock heuristic, release needs theft detection, and a few
-narrow check-then-act races remain (detected, not silent — the implementation
-headers carry the full inventory).
+the lock is built from. The trade-off is owned in [The protocol in
+detail](#the-protocol-in-detail) below: staleness needs a clock heuristic,
+release needs theft detection, and a few narrow check-then-act races remain
+(detected, not silent — the implementation headers carry the full inventory).
 
 The filesystem primitives carry their own assumption, stated here explicitly:
 the repo must live on a **local filesystem with atomic create/rename and sane
@@ -187,18 +125,116 @@ mtimes** (NTFS, ext4, APFS, and kin). Repos on network or sync-backed storage
 — NFS, SMB shares, Dropbox/OneDrive-synced directories — are outside the
 design's guarantees.
 
+## The protocol in detail
+
+Both implementations follow the same protocol on the same wire format:
+
+- **acquire** = create the lock **file** with an atomic create-or-fail open
+  (bash: a `noclobber` redirect, i.e. `O_CREAT|O_EXCL`; .NET:
+  `FileMode.CreateNew`), writing its content in the same open: line 1 is the
+  holder's unique token (theft detection — it must start `tok.`, which is
+  part of the wire format), line 2 an informational `pid=<pid> host=<host>`
+  owner line for the logs. While the file exists, nobody else can create it,
+  so an existing file is unambiguously the current holder's.
+  - Creation and ownership metadata are one atomic-enough step: the token
+    travels with the file, and a crash between create and write just leaves
+    an *empty file with a valid mtime*, recovered by the normal staleness
+    rule (a regression test covers it).
+  - After winning, the acquirer reads the path back and must find its own
+    token; anything else after the read-retry ladder (a short sequence of
+    re-reads with escalating backoff) — foreign, empty, gone — means it
+    cannot prove it holds the path: it logs loudly and treats the lock as
+    NOT acquired. It never "repairs" a failed read-back by rewriting the
+    path: after a long suspension (sleep, stop-the-world) the file may
+    legitimately be a successor's live lock, and an overwrite would corrupt
+    it undetectably.
+- **steal** = `mv <lock> <grave>` — `rename(2)` is atomic, so exactly one
+  concurrent stealer wins; the rest get `ENOENT` and re-race the create. The
+  winner deletes the grave (one `rm -f` of a file; an age-gated sweep clears
+  any grave a crashed stealer left behind).
+
+**Staleness is judged by the lock file's own mtime** (stamped by the creating
+write). A lock older than `AGENT_LOCK_STALE_SECS` (default **300s / 5 min**)
+is presumed crashed and may be stolen, so one dead agent can't wedge the
+others.
+
+**The steal refuses anything that is not lock-shaped.** A directory at the
+lock path (a config typo, or a leftover lock from the old directory-based
+protocol), a symlink, a device, or a regular file whose content is neither
+empty nor `tok.`-prefixed is **never** stolen or deleted: a loud one-time
+config warning names the path, and waiters time out (97) until a human
+removes it. The tool never runs `rm -rf` and never deletes anything it cannot
+identify as a lock, so a typo'd `AGENT_LOCK_PATH` — pointing at `$HOME`, or
+at a real user file with ordinary content — is harmless.
+
+Two accepted residuals bound that claim, because the content test is exactly
+"empty, or line 1 starts `tok.`": a stale **empty** user file is
+indistinguishable from the crash orphan and IS stolen, and a stale user file
+whose first line happens to start `tok.` passes the wire test and IS stolen
+too — deliberately, since a fuller shape check would bind the wire format
+harder for near-zero added protection (see ACCEPTED RESIDUALS in
+`git-commit-lock.sh`).
+
+(bash also refuses the *create* on a non-regular path up front: `noclobber`'s
+exists⇒fail protection covers regular files only, and an open on an existing
+FIFO would block before any timeout logic runs.)
+
+One scoped exception: bash delivers this guarantee in full, but the
+**PowerShell port running on POSIX** — an unsupported, CI-only
+configuration — has no clean .NET type probe for FIFOs/devices/sockets, which
+stat there as size 0 and take the empty-orphan steal lane (renamed aside and
+grave-deleted, capping damage at the one misconfigured inode). That residual
+is documented in `git-commit-lock.ps1`'s PORT-SPECIFIC NOTES; on Windows the
+ps1 guard is complete.
+
+**Release** = compare the file's token to ours, then one unlink. A non-empty
+foreign token, or a gone file, means the lease was stolen → fail loudly with
+98 (acquire's read-back positively verified our token at the path, which is
+what grounds treating "gone" as theft). A file that still reads *empty* after
+the retry ladder is NOT definitive theft evidence — it can be a successor
+mid-create after a boundary steal (a steal that fires just as the stale
+window expires, racing the holder's release), a window the probes show is
+real — so ownership is unverifiable: the file is left in place (it may be
+a nascent live lock; a true orphan ages into the staleness backstop) and
+release fails distinctly. On a token match the unlink is retried briefly: on
+Windows a foreign no-delete-share handle (an AV scanner, a naive reader) can
+block it,
+and — probed — the same handle class blocks a stealer's rename identically,
+so the path cannot be stolen-and-recreated while the delete keeps failing. If
+it keeps failing the lock is a **leftover**: release warns and returns 1, and
+waiters recover only once the stale window elapses AND the blocking handle
+closes.
+
+**Location.** The lock and its log default to the repo's git dir
+(`git rev-parse --absolute-git-dir`), e.g. `<repo>/.git/commit.lock` and
+`<repo>/.git/git-commit-lock.log`. Never tracked by git (no `.gitignore` needed in
+any repo), and correctly scoped: every worktree has its own git dir, so
+independent worktrees get independent locks, while all sub-agents sharing one
+checkout resolve the same git dir and share one lock.
+
+**One caveat on the mtime clock.** A just-created lock file can transiently
+report the Windows FILETIME zero (1601-01-01) to an observer in the window
+around creation — a ~400-year bogus "age" that would spuriously steal a
+*live, brand-new* lock and put two holders in the tree. This is not a
+dir-rename artifact of the old protocol: probing on our NTFS test machine
+shows plain file creation (both bash- and pwsh-created) produces the same
+transient at roughly 0.04–0.5% of readings. Both implementations therefore
+refuse to steal on any mtime below a sane floor (2000-01-01), treating a
+sub-floor reading as "just created — wait"; it settles in milliseconds.
+
 ## The PowerShell port (`git-commit-lock.ps1`)
 
 Some agents (Codex on Windows, for example) run their commands in
-**PowerShell**, where a bare `bash` resolves to `C:\Windows\system32\bash.exe`
-— the **WSL** launcher. If your commits are signed by a Windows-side SSH agent,
-WSL's Linux git can't reach the signer (no private key in WSL; SSH-agent
-forwarding into WSL typically only fires in *interactive* shells, not an
-agent's `bash -c`), so a bash-wrapped commit fails to sign (`No private key
-found … failed to write commit object`). Agents that ship their own MINGW64
-Git-Bash, such as Claude Code, are unaffected. The port lets PowerShell-native
-agents take the same lock from PowerShell, where `git` resolves to
-Git-for-Windows and signs.
+**PowerShell**, where — depending on PATH order and what's installed — a bare
+`bash` can resolve to `C:\Windows\system32\bash.exe`, the **WSL** launcher,
+rather than a MINGW bash. On such machines, if your commits are signed by a
+Windows-side SSH agent, WSL's Linux git can't reach the signer (no private
+key in WSL; SSH-agent forwarding into WSL typically only fires in
+*interactive* shells, not an agent's `bash -c`), so a bash-wrapped commit
+fails to sign (`No private key found … failed to write commit object`).
+Agents that ship their own MINGW64 Git-Bash, such as Claude Code, are
+unaffected. The port lets PowerShell-native agents take the same lock from
+PowerShell, where `git` resolves to Git-for-Windows and signs.
 
 The port is **wire-compatible** with `git-commit-lock.sh`, so a `.ps1` holder and a
 `.sh` holder serialise against each other in one tree:
@@ -255,6 +291,27 @@ Source it (`source ~/.local/bin/git-commit-lock.sh`) for:
   exit code. The `run` CLI subcommand is this:
   `git-commit-lock.sh run -- <cmd...>`.
 
+The sourced API is what to reach for when a single wrapped command is awkward
+— say you want to review the staged diff before committing:
+
+```sh
+source ~/.local/bin/git-commit-lock.sh
+lock_acquire || exit 1
+git add -- path/you/changed
+git diff --cached        # check the staged commit is what you intend
+git commit -m "your message"
+lock_release
+```
+
+(In PowerShell, dot-source `git-commit-lock.ps1` and use `Lock-Acquire` /
+`Lock-Release` in a `try`/`finally`.) A quick check like that staged-diff
+review is fine under the lock; just keep the hold brief and prepare anything
+slow outside it — see [the golden
+rule](#the-golden-rule-hold-the-lock-only-to-commit). `lock_acquire`'s exit
+trap releases the lock on normal exit and on a handled INT/TERM; if the
+process is killed outright (SIGKILL, a crash, power loss), the trap can't
+run and the stale timeout recovers the lock instead.
+
 The `run` CLI's exit code is the wrapped command's, except for three reserved
 high codes: **96** usage error, **97** lock acquisition timed out (the command
 was never run), **98** lock stolen mid-hold (the command ran but was NOT
@@ -273,14 +330,17 @@ Config knobs (env, mainly for tests):
 
 ## The golden rule: hold the lock only to commit
 
-The lock must protect a *sub-second* critical section. Decide what to stage,
-build any patch, and resolve failures **outside** it. If a commit fails under
-the lock (e.g. a pre-commit hook rejects it), unstage your paths
+Keep the critical section small: decide what to stage, build any patch, and
+resolve failures **outside** the lock. A normal stage+commit holds the lock
+for seconds, and that is the healthy pattern; the actual contract is just to
+stay comfortably inside the staleness window (default 5 minutes). If a commit
+fails under the lock (e.g. a pre-commit hook rejects it), unstage your paths
 (`git reset -- <paths>`, which never touches the working tree) and
-`lock_release` **before** you investigate, then retry. Never acquire the lock
-and then read, build, or ask the user.
+`lock_release` **before** you investigate, then retry. Never start anything
+open-ended while holding the lock — an investigation, a build, or (worst,
+because it's unbounded) a wait on a human.
 
-This is enforced by a **fail-open lease, not a guarantee**. The lock file's
+The rule is backed by a **fail-open lease, not enforcement**. The lock file's
 mtime (the staleness clock) is stamped once at creation and never refreshed,
 so a hold longer than `AGENT_LOCK_STALE_SECS` can be stolen by a waiter
 mid-work — two holders would then coexist. We accept that (no background
@@ -326,8 +386,9 @@ ignores the clean index and stages the whole working-tree file.)
 
 ## Files
 
-In the repository (`install.sh` symlinks the **two scripts** — not the test
-suites — into `~/.local/bin/`):
+In the repository (`install.sh` installs the **two scripts** — not the test
+suites — into `~/.local/bin/`, as symlinks, or as copies where symlinks are
+unavailable):
 
 | File | Role |
 |------|------|
@@ -337,9 +398,9 @@ suites — into `~/.local/bin/`):
 | `git-commit-lock.interop.test.sh`     | cross-impl tests: pwsh + bash workers share one lock and serialise; run from MINGW/Git-Bash |
 | `git-commit-lock.integration.test.sh` | end-to-end: many concurrent workers make real commits into one shared repo; the history is audited for the tool's guarantees |
 
-## Verifying on a new machine
+## Tests
 
-From a clone of this repository (the suites are not installed to
+Run the suites from a clone of this repository (they are not installed to
 `~/.local/bin`):
 
 ```sh
@@ -349,10 +410,12 @@ bash git-commit-lock.integration.test.sh # end-to-end: concurrent real commits i
 ```
 
 Each suite prints a result summary line and exits 0 when everything passes.
-The heavy fan-out tests run at a REDUCED width by default; each suite prints
-a `fan-out mode:` line at the start and tags its result line with the mode,
-so check those say `FULL` when you ran `GCL_TEST_FULL=1` for the
-full-strength canary (CI does).
+All three use throwaway temp dirs and never touch the repo you launch them
+from. The heavy fan-out tests run at a REDUCED width by default, so a routine
+run doesn't lag a shared development machine; each suite prints a
+`fan-out mode:` line at the start and tags its result line with the mode, so
+check those say `FULL` when you ran `GCL_TEST_FULL=1` for the full-strength
+canary (CI does).
 
 `git-commit-lock.test.sh` covers the bash implementation: mutual exclusion
 under many concurrent workers (clean acquire/release path), stale-lock theft,
@@ -379,8 +442,8 @@ agree on the release classification (truncated ⇒ unverifiable, gone ⇒ 98);
 the ps1 never-steal guards get their own parity tests; and the blocked-release
 and blocked-steal lanes are exercised deterministically via a no-delete-share
 handle (Windows-only by nature — POSIX open handles never block
-unlink/rename, so those two skip with a note elsewhere). Run it from
-MINGW/Git-Bash (NOT WSL) so both sides agree on the `C:/…` lock path.
+unlink/rename, so those two skip with a note on non-Windows platforms). Run
+it from MINGW/Git-Bash (NOT WSL) so both sides agree on the `C:/…` lock path.
 
 `git-commit-lock.integration.test.sh` drives the real use case end-to-end:
 many concurrent workers stage and commit into one shared git repository under
@@ -388,6 +451,15 @@ the lock, exactly as the README instructs agents to, and the resulting history
 is audited for the guarantees this document claims — every commit lands,
 history stays linear, no commit sweeps up another worker's file, no
 `index.lock` races, no stolen leases, and a clean tree at the end.
+
+The same three suites run in CI on Linux, macOS, and Windows
+(`.github/workflows/tests.yml`), at full fan-out strength, alongside a
+shellcheck + PSScriptAnalyzer lint job. The POSIX legs exercise the
+PowerShell implementation purely as cross-implementation protocol
+verification — the port is *supported* on Windows only (see [The PowerShell
+port](#the-powershell-port-git-commit-lockps1)), but having two independent
+implementations contend on one lock probes the protocol from angles a
+single implementation never would.
 
 The suites spawn many short-lived processes (and pwsh startup is slow), so on
 a loaded machine they can take several minutes — allow a generous timeout
@@ -397,3 +469,7 @@ interop suite's exclusion test tolerates it (scoring by violations/steals,
 with a minimum-acquired floor so a collapsed fan-out cannot pass vacuously);
 the integration suite is deliberately strict per worker (every worker must
 launch and commit), and the unit suite's counts are exact.
+
+For debugging, all three suites copy their logs and work dirs to
+`$GCL_TEST_PRESERVE_DIR` when it is set, and keep the work dir on disk on any
+failure.

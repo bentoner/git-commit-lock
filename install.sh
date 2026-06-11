@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# install.sh — symlink git-commit-lock.{sh,ps1} into ~/.local/bin.
+# install.sh — install git-commit-lock.{sh,ps1} into ~/.local/bin.
 #
-# Idempotent: re-run any time (e.g. after moving the repo). Real Windows symlinks
-# need Developer Mode on, plus the MSYS flag below; on Linux plain `ln -s` makes
-# a real link. Logs each link it creates (old + new target).
+# Prefers a symlink; if symlinking fails (e.g. Windows without Developer Mode —
+# the MSYS flag below makes `ln -s` fail loudly there instead of silently
+# copying), falls back to copying the script, which works identically because
+# both scripts are self-contained. Idempotent: re-run any time (e.g. after
+# moving the repo, or to refresh copies after updating the clone). Logs each
+# file it installs (mode, old + new target).
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,8 +17,9 @@ if [ -e "$DEST" ] && [ ! -d "$DEST" ]; then
 fi
 mkdir -p "$DEST"
 
-export MSYS=winsymlinks:nativestrict   # real symlinks on Windows Git-Bash
+export MSYS=winsymlinks:nativestrict   # real symlinks on Windows Git-Bash (or fail, never copy)
 
+copied=0
 for f in git-commit-lock.sh git-commit-lock.ps1; do
     src="$REPO/$f"
     dst="$DEST/$f"
@@ -30,8 +34,15 @@ for f in git-commit-lock.sh git-commit-lock.ps1; do
     else
         prev='(none)'
     fi
-    ln -sf "$src" "$dst"
-    printf 'linked %s\n   was: %s\n   now: %s\n' "$dst" "$prev" "$src"
+    rm -f "$dst"   # clear any previous symlink or copy so both lanes start clean
+    if ln -s "$src" "$dst" 2>/dev/null; then
+        printf 'linked %s\n   was: %s\n   now: %s\n' "$dst" "$prev" "$src"
+    else
+        cp "$src" "$dst" || { echo "install.sh: could not link or copy $f into $DEST" >&2; exit 1; }
+        chmod a+x "$dst"
+        copied=1
+        printf 'copied %s (symlinks unavailable)\n   was: %s\n   now: copy of %s\n' "$dst" "$prev" "$src"
+    fi
 done
 
 case ":${PATH}:" in
@@ -40,3 +51,6 @@ case ":${PATH}:" in
 esac
 
 echo "git-commit-lock installed to $DEST."
+if [ "$copied" -eq 1 ]; then
+    echo "install.sh: NOTE — installed as copies, which don't track the repo; re-run install.sh after updating the clone." >&2
+fi
