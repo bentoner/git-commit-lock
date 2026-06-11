@@ -688,19 +688,21 @@ echo "== Test 15: ps1-side never-steal guards — dir, dangling symlink, non-loc
 # The ps1 guards use different APIs than bash (PSIsContainer, reparse
 # attributes, the catch-all CreateNew exception), so bash coverage proves
 # nothing about them. The wrong-type warning needs the SAME concrete type on
-# two consecutive polls (round-3 confirmation parity, 2026-06-11), so these
-# tests need at least three polls of headroom (0.1s polls in a 2s wait = ~20
-# here). (a) a DIRECTORY at the lock path: the CreateNew open
+# two consecutive polls (round-3 confirmation parity, 2026-06-11), so (a) and
+# (b) need at least three polls of headroom even under load (0.1s polls in a 4s wait = ~40
+# here); (c) is the age-gated CONTENT lane, which still warns on a single
+# observation. (a) a DIRECTORY at the lock path: the CreateNew open
 # throws UnauthorizedAccessException, which must degrade to the wait/warn
 # lane (97), never throw out of Lock-Acquire.
 LOCK="$WORK/psdir.lock"; LOG="$WORK/psdir.log"; : > "$LOG"
 mkdir -p "$LOCK/sub"; echo data > "$LOCK/sub/file"
-AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=2 \
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=4 \
   pwsh -NoProfile -File "$PS1WIN" run "exit 0" 2> "$WORK/psdir.err"; rc=$?
 [ "$rc" = 97 ] && ok "ps1: directory at lock path degrades to timeout 97 (open exception caught, not thrown)" \
                || bad "ps1: directory at lock path rc=$rc (want 97)"
 [ -f "$LOCK/sub/file" ] && ok "ps1: directory and its contents untouched" || bad "ps1 damaged the directory at the lock path!"
 grep -q "is not a lock file" "$WORK/psdir.err" && ok "ps1: loud config warning on stderr" || bad "ps1: no config warning for dir at lock path"
+grep -q "it is a directory" "$WORK/psdir.err" && ok "ps1: warning names the detected type (directory)" || bad "ps1: warning does not name the directory type"
 n="$(grep -c "is not a lock file" "$WORK/psdir.err")"
 [ "$n" = 1 ] && ok "ps1: config warning fired exactly once per process (got $n)" || bad "ps1: config warning fired $n times (want 1)"
 grep -q STOLE "$LOG" && bad "ps1 STOLE a directory" || ok "ps1: no steal attempted on a directory"
@@ -712,7 +714,7 @@ rm -rf "$LOCK"
 # Skipped where symlinks can't be created (default Git-Bash without Dev Mode).
 LOCK="$WORK/pslink.lock"; LOG="$WORK/pslink.log"; : > "$LOG"
 if env MSYS=winsymlinks:nativestrict ln -s "$WORK/no-such-target" "$LOCK" 2>/dev/null && [ -L "$LOCK" ]; then
-  AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=2 \
+  AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=4 \
     pwsh -NoProfile -File "$PS1WIN" run "exit 0" 2> "$WORK/pslink.err"; rc=$?
   [ "$rc" = 97 ] && ok "ps1: dangling symlink at lock path -> waiter timed out (97)" \
                  || bad "ps1: dangling symlink rc=$rc (want 97)"
@@ -721,6 +723,7 @@ if env MSYS=winsymlinks:nativestrict ln -s "$WORK/no-such-target" "$LOCK" 2>/dev
                                   || bad "ps1 created the link target — pre-create guard regression!"
   grep -q "is not a lock file" "$WORK/pslink.err" && ok "ps1: config warning names the symlink case" \
                                                   || bad "ps1: no config warning for symlink at lock path"
+  grep -q "it is a symlink" "$WORK/pslink.err" && ok "ps1: warning names the detected type (symlink)" || bad "ps1: warning does not name the symlink type"
   rm -f "$LOCK"
 else
   rm -f "$LOCK"

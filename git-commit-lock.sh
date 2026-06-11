@@ -686,9 +686,15 @@ lock_acquire() {
         # only ever held churned REGULAR files. Round 3 (2026-06-11) adds
         # TWO-CONSECUTIVE-POLL CONFIRMATION: warn only when the SAME
         # concrete type is observed on two consecutive blocked polls. A
-        # ghost transient cannot reproduce an identical misclassification
-        # across a full poll interval (it resolves in milliseconds), while
-        # a real misconfig object classifies identically forever — its
+        # ghost transient makes a same-type repeat across a full poll
+        # interval extremely unlikely (zero in hundreds of churn waiter-runs
+        # locally and in probes) though not impossible - two INDEPENDENT
+        # ghosts could land same-type on consecutive polls - and the one
+        # observed long-lived delete-pending state (60s behind an AV handle,
+        # see the unit suite T17d readiness note) reads as ENOENT/absent,
+        # which RESETS the confirmation. A real misconfig needs >=2 blocked
+        # polls before MAX_WAIT to warn (always true outside degenerate
+        # test configs). A real misconfig object classifies identically forever — its
         # once-per-process warning just arrives one poll later, and the
         # never-steal safety is unaffected either way (the guard never
         # steals non-locks regardless of warning state). Residual: an
