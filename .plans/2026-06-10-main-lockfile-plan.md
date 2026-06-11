@@ -318,6 +318,21 @@ protocol dies), or ship the reviewed dir protocol as-is.
 
 ## Recommendation: GO
 
+**Empirical clincher (2026-06-11, after the loop converged): the first CI
+matrix run caught a REAL mutual-exclusion failure in the dir protocol on
+macOS** — interop T1 violations=1 with steals=0, a pwsh holder's token
+replaced by a second pwsh "winner", plus a lost update in T6 (TODO #59 has
+the full evidence chain). Mechanism, probe-confirmed: .NET `Directory.Move`
+is `rename(2)` on Unix, and POSIX rename atomically replaces an **empty**
+destination directory — so every holder's empty-dir window (post-mkdir,
+pre-token-write) is hijackable by a concurrent ps1 acquirer. There is no
+clean dir-era fix (.NET has no atomic create-dir-or-fail, and the
+vulnerability is the destination's emptiness). The file protocol removes the
+vulnerable state by construction: O_EXCL/`CreateNew` fails on ANY existing
+file, and the token travels with the create. The macOS interop leg stays red
+until this plan lands — the dir protocol is unsound for pwsh on POSIX, not
+merely less elegant.
+
 The probes (below) confirmed every load-bearing claim of the file design and
 dissolved the suspected decisive con (Windows handle behaviour). What the
 switch buys:

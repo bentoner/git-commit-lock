@@ -627,3 +627,10 @@ Cross-plan sequencing: **CI lands first**; the lockfile plan
 (`.plans/2026-06-10-main-lockfile-plan.md`) then ports the on-disk protocol
 under the green matrix — its probes were Windows-only, so the matrix is
 exactly the verification that port lacks.
+
+Outcome of the first run (2026-06-11, run 27314216372): lint, ubuntu, and
+windows green end-to-end; **macos-15 interop RED with a genuine dir-protocol
+mutual-exclusion bug** (TODO #59 — `Directory.Move`/`rename(2)` replaces an
+empty destination dir on POSIX, so the ps1 acquire is not a gate there). The
+canary worked on its first flight. The macOS leg stays red until the
+lockfile port lands; do not mask it.

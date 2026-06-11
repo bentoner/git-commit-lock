@@ -38,6 +38,28 @@ see commits 9b36f42..840a4fd.
     8×25/poll-rate/gap, interop T1/T6 fan-out, stale-window waits, unit T9's
     remaining MAX_WAIT, the integration suite's real-commit costs.
 
+59. **[MAJOR — known, fix = the lockfile port] The dir-protocol ps1 acquire
+    is not an atomic gate on POSIX; macOS CI interop is expected-RED until
+    the lockfile plan lands.** Evidence: first CI run (27314216372,
+    macos-15): interop T1 violations=1 with steals=0 — lock log shows pwsh
+    pid 40976 ACQUIRED then "lock LOST (ours=tok.ps.40976… now=tok.ps.41001…)"
+    while pid 41001 acquired/released "normally"; T6 lost an update
+    (counter 11/12, acquired=12 released=11, worker rc=98). Mechanism,
+    probe-confirmed: .NET `Directory.Move` is `rename(2)` on Unix, and POSIX
+    rename ATOMICALLY REPLACES an empty destination directory — so any
+    holder's empty-dir window (post-mkdir / post-move, before the token
+    write) can be hijacked by a concurrent ps1 acquirer. Windows is immune
+    (MoveFile fails on an existing destination); bash-vs-bash is immune
+    (mkdir fails, EEXIST); ubuntu passed on timing only — same exposure.
+    No clean dir-era fix exists (.NET has no atomic create-dir-or-fail; the
+    vulnerability is the DESTINATION being empty, so staging content in the
+    source doesn't help). The file protocol eliminates the state by
+    construction: O_CREAT|O_EXCL / `File.Open(CreateNew)` fails on ANY
+    existing file, empty or not. Do not mask the failing tests — they are
+    correctly reporting a real defect. Artifact: test-logs-macos-15, run
+    27314216372 (expires 2026-06-24); copy in
+    .agent-testing/macos-artifact/ locally.
+
 58. **[MINOR]** Heavy fan-out tests run at full strength by default, and
     agents run the suites routinely during development on a live shared
     machine — unit T1's ~200 bash spawns (8×25) alone can lag the whole box
