@@ -238,7 +238,7 @@ echo "== Test 4: pwsh steals a STALE lock fabricated as bash's (old file mtime) 
 LOCK="$WORK/b4.lock"; LOG="$WORK/b4.log"; : > "$LOG"; MARK="$WORK/b4.mark"; printf '%s' before > "$MARK"
 fabricate_lock "$LOCK" "tok.sh.ghost.1" "pid=99999 host=ghost"
 backdate "$LOCK" 9999                           # ancient file mtime -> stale
-AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=2 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=20 \
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=2 AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=20 \
   pwsh -NoProfile -File "$PS1WIN" run "[IO.File]::WriteAllText('$MARK','after')"; rc=$?
 [ "$rc" = 0 ] && ok "pwsh run exited 0 after stealing bash's stale lock" || bad "pwsh run exited $rc"
 [ "$(cat "$MARK")" = after ] && ok "stale bash lock stolen, pwsh command ran" || bad "marker=$(cat "$MARK")"
@@ -265,7 +265,7 @@ if wait_for "$READY"; then
     *)        bad "expected a tok.ps.* token on line 1 of the orphan lock, got '$tok'" ;;
   esac
   backdate "$LOCK" 9999                           # age the orphan past any stale window
-  AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=2 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=20 \
+  AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=2 AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=20 \
     bash "$SH" run -- bash -c 'printf "%s" after > "$1"' _ "$MARK"; rc=$?
   [ "$rc" = 0 ] && ok "bash run exited 0 after stealing pwsh's stale lock" || bad "bash run exited $rc"
   [ "$(cat "$MARK")" = after ] && ok "stale pwsh lock stolen, bash command ran" || bad "marker=$(cat "$MARK")"
@@ -401,12 +401,12 @@ echo "== Test 8: a ROBBED holder exits 98 — pwsh victim/bash thief, then bash 
 # 98 (the reserved stolen-mid-hold code) while the thief exits 0.
 LOCK="$WORK/rob1.lock"; LOG="$WORK/rob1.log"; : > "$LOG"
 READY="$WORK/rob1.ready"; TDONE="$WORK/rob1.tdone"; rm -f "$READY" "$TDONE"
-AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=30 \
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=30 \
   pwsh -NoProfile -File "$PS1WIN" run "[IO.File]::WriteAllText('$READY','r'); while (-not (Test-Path -LiteralPath '$TDONE')) { Start-Sleep -Milliseconds 100 }" 2>/dev/null &
 vic=$!
 wait_for "$READY" || bad "T8a pwsh victim never signalled ready"
 # The thief polls until the victim's 1s lease goes stale, then steals.
-AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=30 \
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=30 \
   bash "$SH" run -- bash -c 'true'; thief_rc=$?
 touch "$TDONE"
 wait "$vic"; vic_rc=$?
@@ -416,11 +416,11 @@ grep -q "WARNING" "$LOG" && ok "theft WARNING logged" || bad "no theft WARNING i
 
 LOCK="$WORK/rob2.lock"; LOG="$WORK/rob2.log"; : > "$LOG"
 READY="$WORK/rob2.ready"; TDONE="$WORK/rob2.tdone"; rm -f "$READY" "$TDONE"
-AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=30 \
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=30 \
   bash "$SH" run -- bash -c ': > "$1"; until [ -e "$2" ]; do sleep 0.1; done' _ "$READY" "$TDONE" 2>/dev/null &
 vic=$!
 wait_for "$READY" || bad "T8b bash victim never signalled ready"
-AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=30 \
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=30 \
   pwsh -NoProfile -File "$PS1WIN" run "exit 0"; thief_rc=$?
 touch "$TDONE"
 wait "$vic"; vic_rc=$?
@@ -644,7 +644,7 @@ rm -f "$LOCK3"
 # the steal rename) AND the stale window elapsed — then a waiter steals it.
 touch "$BGO" 2>/dev/null; wait "$blk13" 2>/dev/null
 backdate "$LOCK" 9999 2>/dev/null
-AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=2 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=20 \
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=2 AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=20 \
   bash "$SH" run -- bash -c 'true'; rc=$?
 [ "$rc" = 0 ] && ok "leftover reclaimed once the handle closed + stale window elapsed (TODO #30 lane)" \
               || bad "leftover recovery rc=$rc (want 0)"
@@ -662,7 +662,7 @@ BREADY="$WORK/bs.bready"; BGO="$WORK/bs.bgo"; rm -f "$BREADY" "$BGO"
 hold_handle "$LOCK" "$BREADY" "$BGO" &
 blk14=$!
 if wait_for "$BREADY" 400; then
-  AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=2 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=60 \
+  AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=2 AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=60 \
     pwsh -NoProfile -File "$PS1WIN" run "[System.IO.File]::WriteAllText('$MARK', 'ran')" &
   stealer=$!
   wait_for_grep "WAITING for lock" "$LOG" || bad "T14 stealer never contended (no WAITING line)"
@@ -702,10 +702,10 @@ if wait_for "$BREADY" 400; then
   for impl in sh ps; do
     LOGI="$WORK/bs2-$impl.log"; : > "$LOGI"
     if [ "$impl" = sh ]; then
-      AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOGI" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=2 \
+      AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOGI" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=2 \
         bash "$SH" run -- bash -c 'true' 2>/dev/null &
     else
-      AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOGI" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=2 \
+      AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOGI" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=2 \
         pwsh -NoProfile -File "$PS1WIN" run "exit 0" 2>/dev/null &
     fi
     w14b=$!
@@ -805,33 +805,48 @@ grep -q "is not a lock file" "$WORK/psuser.err" && ok "ps1: config warning names
 grep -q STOLE "$LOG" && bad "ps1 STOLE the user file" || ok "ps1: no steal of the user file"
 rm -f "$LOCK"
 
-echo "== Test 16: crash recovery under CONTENTION, mixed impls — stragglers must not rob the recovery winner =="
+echo "== Test 16: crash recovery under CONTENTION, mixed impls — claim-serialized: zero displacement, zero 98s (plan test 19) =="
 # Cross-impl variant of the unit suite's Test 2b (which carries the full
-# rationale): 2 bash + 2 pwsh waiters race ONE crashed lock, so a straggler
-# of either implementation can displace the other implementation's fresh
-# recovery winner — the grave-token check + hard-link restore must hold
-# across the wire format. The interleaving is probabilistic, so the
-# assertions are outcome-shaped: every waiter must RUN its command and exit
-# 0 or a LOUD 98 (97s and silent losses fail), the final state must be
-# clean, and every displacement detection must conclude loudly (RESTORED or
-# restore-FAILED). Sync: waiters launch against a FRESH fabricated lock and
-# only once all four have logged WAITING is it backdated, so all judge
-# stale within one poll window despite pwsh's slow cold start.
+# rationale): 2 bash + 2 pwsh waiters race ONE crashed lock. Under the claim
+# protocol the straggler-robs-recovery-winner race is PREVENTED (the claim
+# serializes stealers across the wire format), not detected-and-repaired, so
+# the assertions are strict: every waiter exits 0 (zero spurious 98s — the
+# pre-claim implementation displaced the recovery winner near-certainly),
+# exactly ONE STOLE-BY-CLAIM, NO grave file ever exists (a background
+# sampler watches .dead.* throughout — the mutation discriminator against
+# the wave-1 implementation; the old "STOLE stale lock" line shape and the
+# STEAL-DISPLACED repair machinery must never appear), and the final state
+# is clean (no lock, no claim). Sync: waiters launch against a FRESH
+# fabricated lock and only once all four have logged WAITING is it
+# backdated, so all judge stale within one poll window despite pwsh's slow
+# cold start. STALE=3 + CLAIM_STALE=60 keep a loaded box from re-stealing
+# the winner's brief hold or ageing a live claim.
 LOCK="$WORK/recov.lock"
 fabricate_lock "$LOCK" "tok.ghost.recov.1" "pid=999 host=ghost"   # fresh mtime: not yet stale
 rm -f "$WORK"/recov.ran.* 2>/dev/null
+T16_GRAVESEEN="$WORK/recov.graveseen"; T16_SAMPSTOP="$WORK/recov.sampstop"
+rm -f "$T16_GRAVESEEN" "$T16_SAMPSTOP"
+(
+  while [ ! -e "$T16_SAMPSTOP" ]; do
+    for g in "$LOCK".dead.*; do
+      [ -e "$g" ] && : > "$T16_GRAVESEEN"
+    done
+    sleep 0.01
+  done
+) &
+t16_sampler=$!
 pids=()
 for i in 1 2; do
   : > "$WORK/recov-sh$i.log"   # per-waiter logs: concurrent appends to one log drop lines
   AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$WORK/recov-sh$i.log" AGENT_LOCK_STALE_SECS=3 \
-    AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=120 \
+    AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=120 \
     bash "$SH" run -- bash -c 'touch "$1"; sleep 0.1' _ "$WORK/recov.ran.sh$i" 2>/dev/null &
   pids+=($!)
 done
 for i in 1 2; do
   : > "$WORK/recov-ps$i.log"
   AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$WORK/recov-ps$i.log" AGENT_LOCK_STALE_SECS=3 \
-    AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=120 \
+    AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=120 \
     pwsh -NoProfile -File "$PS1WIN" run "[IO.File]::WriteAllText('$WORK/recov.ran.ps$i', 'x'); Start-Sleep -Milliseconds 100" 2>/dev/null &
   pids+=($!)
 done
@@ -845,32 +860,140 @@ for p in "${pids[@]}"; do
   wait "$p"; rc=$?
   case "$rc" in
     0)  ;;
-    98) n98=$((n98+1)) ;;        # loud fail-open redo: allowed, accounted below
-    *)  t16_fail=1; echo "  T16 waiter rc=$rc (want 0 or a loud 98)" ;;
+    98) n98=$((n98+1)); echo "  T16 waiter rc=98 — displacement under the claim protocol" ;;
+    *)  t16_fail=1; echo "  T16 waiter rc=$rc (want 0)" ;;
   esac
 done
+touch "$T16_SAMPSTOP"; wait "$t16_sampler" 2>/dev/null
 cat "$WORK"/recov-*.log > "$WORK/recov-all.log" 2>/dev/null || : > "$WORK/recov-all.log"
-nran="$(ls "$WORK"/recov.ran.* 2>/dev/null | wc -l | tr -d ' ')"
-nlost="$(grep -c "WARNING: lock LOST" "$WORK/recov-all.log")"
-ndisp="$(grep -c "STEAL-DISPLACED-LIVE" "$WORK/recov-all.log")"
-nrest="$(grep -c "RESTORED it via hard link" "$WORK/recov-all.log")"
-ndispfail="$(grep -c "restore FAILED" "$WORK/recov-all.log")"
+nran=0
+for f in "$WORK"/recov.ran.*; do [ -e "$f" ] && nran=$((nran+1)); done
+nstole="$(grep -c "STOLE-BY-CLAIM" "$WORK/recov-all.log")"
+nold="$(grep -c "STOLE stale lock" "$WORK/recov-all.log")"
+ndisp="$(grep -c "STEAL-DISPLACED" "$WORK/recov-all.log")"
 [ "$t16_fail" = 0 ] && [ "$t16_sync" = 1 ] \
-  && ok "2 bash + 2 pwsh waiters on one crashed lock: every exit 0 or a loud 98" \
+  && ok "2 bash + 2 pwsh waiters on one crashed lock: every waiter exited 0" \
   || bad "mixed crash-recovery exits wrong (see above)"
-[ "$nran" = 4 ] && ok "all 4 waiters ran their command (98 = ran-but-redo, never silent)" \
-                || bad "only $nran/4 waiter commands ran"
-[ "$nlost" -ge "$n98" ] && ok "every exit-98 backed by a logged LOST warning ($n98 exit-98s, $nlost warnings)" \
-                        || bad "$n98 exit-98s but only $nlost LOST warnings — silent robbery?"
-grep -q "STOLE stale lock (was held by pid=999 host=ghost)" "$WORK/recov-all.log" \
-  && ok "the crashed ghost was reclaimed cross-impl" || bad "ghost never stolen — crash recovery did not happen"
-[ "$ndisp" = $((nrest + ndispfail)) ] \
-  && ok "every detected displacement concluded loudly (detected=$ndisp restored=$nrest unrestorable=$ndispfail)" \
-  || bad "displacement accounting wrong: $ndisp detected != $nrest restored + $ndispfail restore-failed"
+[ "$n98" = 0 ] && ok "zero spurious 98s — the claim serialized recovery across implementations" \
+               || bad "$n98 waiter(s) exited 98 — displacement happened under the claim protocol"
+[ "$nran" = 4 ] && ok "all 4 waiter commands ran" || bad "only $nran/4 waiter commands ran"
+[ "$nstole" = 1 ] && ok "exactly ONE STOLE-BY-CLAIM (the claim serialized the cross-impl recovery)" \
+                  || bad "STOLE-BY-CLAIM x$nstole (want exactly 1)"
+grep -q "STOLE-BY-CLAIM.*ghost=pid=999 host=ghost" "$WORK/recov-all.log" \
+  && ok "the steal line attributes the crashed ghost cross-impl (wire-format line 2 parsed)" \
+  || bad "STOLE-BY-CLAIM does not carry the ghost's line-2 attribution"
+grep -q "CLAIM .*tok=tok\." "$WORK/recov-all.log" \
+  && ok "claim create logged with its per-attempt token (CLAIM ... tok=)" \
+  || bad "no CLAIM line with a token in the recovery logs"
+[ "$nold" = 0 ] && ok "old grave-steal line shape never logged" \
+                || bad "old 'STOLE stale lock' shape appeared x$nold — wave-1 steal lane still present"
+[ "$ndisp" = 0 ] && ok "zero STEAL-DISPLACED lines (repair machinery removed; prevention, not repair)" \
+                 || bad "STEAL-DISPLACED fired x$ndisp — displacement machinery still present?"
+[ -e "$T16_GRAVESEEN" ] && bad "a grave (.dead.*) existed during recovery — wave-1 machinery regression!" \
+                        || ok "no grave (.dead.*) ever existed during recovery (sampler)"
 [ -e "$LOCK" ] && bad "leftover crash-recovery lock" || ok "no leftover lock"
-t16_graves=0
-for d in "$LOCK".dead.*; do [ -e "$d" ] && t16_graves=$((t16_graves+1)); done
-[ "$t16_graves" = 0 ] && ok "no leftover graves" || bad "$t16_graves leftover grave(s)"
+[ -e "$LOCK.next" ] && bad "leftover claim after recovery" || ok "no leftover claim"
+
+echo "== Test 16b: bash claimant vs ps1 claimant racing ONE ghost — one claim winner, cross-impl wire parity (plan test 17) =="
+# The 1+1 distilled version of Test 16: one bash and one pwsh waiter race the
+# same ancient ghost. Exactly one wins the O_EXCL claim and steals
+# (STOLE-BY-CLAIM x1); the loser either loses the claim create (a young
+# rival claim — waits, never clears it) or loses the post-release create
+# race, and acquires normally afterwards. Both must exit 0 with balanced
+# logs and a clean final state.
+LOCK="$WORK/crace.lock"
+fabricate_lock "$LOCK" "tok.ghost.crace.1" "pid=998 host=ghost"   # fresh: not yet stale
+: > "$WORK/crace-sh.log"; : > "$WORK/crace-ps.log"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$WORK/crace-sh.log" AGENT_LOCK_STALE_SECS=3 \
+  AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=120 \
+  bash "$SH" run -- bash -c 'sleep 0.1' 2>/dev/null &
+p_sh=$!
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$WORK/crace-ps.log" AGENT_LOCK_STALE_SECS=3 \
+  AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=120 \
+  pwsh -NoProfile -File "$PS1WIN" run "Start-Sleep -Milliseconds 100" 2>/dev/null &
+p_ps=$!
+t16b_sync=1
+for f in "$WORK/crace-sh.log" "$WORK/crace-ps.log"; do
+  wait_for_grep "WAITING for lock" "$f" 60 || { t16b_sync=0; bad "T16b waiter never contended (no WAITING in ${f##*/})"; }
+done
+backdate "$LOCK" 9999
+wait "$p_sh"; rc_sh=$?
+wait "$p_ps"; rc_ps=$?
+cat "$WORK"/crace-*.log > "$WORK/crace-all.log"
+[ "$rc_sh" = 0 ] && [ "$rc_ps" = 0 ] && [ "$t16b_sync" = 1 ] \
+  && ok "bash and ps1 claimants both completed rc 0" \
+  || bad "claimant race exits: bash=$rc_sh ps=$rc_ps (want 0/0)"
+nstole="$(grep -c "STOLE-BY-CLAIM" "$WORK/crace-all.log")"
+[ "$nstole" = 1 ] && ok "exactly one claim winner stole the ghost" || bad "STOLE-BY-CLAIM x$nstole (want 1)"
+a="$(grep -c ACQUIRED "$WORK/crace-all.log")"; rl="$(grep -c RELEASED "$WORK/crace-all.log")"
+[ "$a" = 2 ] && [ "$rl" = 2 ] && ok "balanced ACQUIRED/RELEASED (2/2)" || bad "ACQUIRED=$a RELEASED=$rl (want 2/2)"
+[ "$(grep -c 'lock LOST' "$WORK/crace-all.log")" = 0 ] && ok "zero LOST warnings" || bad "LOST warnings during the claimant race"
+[ "$(grep -c 'CLAIM-STALE-CLEARED' "$WORK/crace-all.log")" = 0 ] \
+  && ok "the loser never cleared the winner's live claim (young claims are respected)" \
+  || bad "a live claim was cleared during the race"
+[ -e "$LOCK" ] && bad "leftover lock after the claimant race" || ok "no leftover lock"
+[ -e "$LOCK.next" ] && bad "leftover claim after the claimant race" || ok "no leftover claim"
+
+echo "== Test 16c: cross-impl claim staleness — each side clears the OTHER side's aged claim; young foreign claims are respected (plan test 18) =="
+# (a) bash clears an aged ps1-tokened claim, then completes the steal.
+LOCK="$WORK/cstale.lock"; LOG="$WORK/cstale.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.cstale" "pid=9 host=ghost"; backdate "$LOCK" 9999
+fabricate_lock "$LOCK.next" "tok.ps.99999.123.456.1" "pid=99999 host=crashed-ps"; backdate "$LOCK.next" 9999
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+  AGENT_LOCK_CLAIM_STALE_SECS=2 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=30 \
+  bash "$SH" run -- bash -c 'true' 2>/dev/null; rc=$?
+[ "$rc" = 0 ] && ok "bash recovered through a crashed ps1 claimant's claim (rc 0)" || bad "bash rc=$rc behind an aged ps1 claim"
+grep -q "CLAIM-STALE-CLEARED.*tok=tok\.ps\.99999" "$LOG" \
+  && ok "bash cleared the aged ps1 claim (CLAIM-STALE-CLEARED with the ps1 token)" \
+  || bad "bash did not clear the ps1 claim (no CLAIM-STALE-CLEARED with tok.ps.*)"
+grep -q "STOLE-BY-CLAIM" "$LOG" && ok "bash steal completed after the clear" || bad "no STOLE-BY-CLAIM after bash's clear"
+[ -e "$LOCK.next" ] && bad "claim leftover after bash's recovery" || ok "claim path clean after bash's recovery"
+# (b) ps1 clears an aged bash-tokened claim, then completes the steal.
+LOCK="$WORK/cstale2.lock"; LOG="$WORK/cstale2.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.cstale2" "pid=9 host=ghost"; backdate "$LOCK" 9999
+fabricate_lock "$LOCK.next" "tok.4242.31337.1700000000.3" "pid=4242 host=crashed-sh"; backdate "$LOCK.next" 9999
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+  AGENT_LOCK_CLAIM_STALE_SECS=2 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=30 \
+  pwsh -NoProfile -File "$PS1WIN" run "exit 0" 2>/dev/null; rc=$?
+[ "$rc" = 0 ] && ok "ps1 recovered through a crashed bash claimant's claim (rc 0)" || bad "ps1 rc=$rc behind an aged bash claim"
+grep -q "CLAIM-STALE-CLEARED.*tok=tok\.4242" "$LOG" \
+  && ok "ps1 cleared the aged bash claim (CLAIM-STALE-CLEARED with the bash token)" \
+  || bad "ps1 did not clear the bash claim (no CLAIM-STALE-CLEARED with tok.4242.*)"
+grep -q "STOLE-BY-CLAIM" "$LOG" && ok "ps1 steal completed after the clear" || bad "no STOLE-BY-CLAIM after ps1's clear"
+[ -e "$LOCK.next" ] && bad "claim leftover after ps1's recovery" || ok "claim path clean after ps1's recovery"
+# (c) YOUNG foreign claims are respected in both directions: the waiter must
+# neither clear the claim nor steal the lock; it waits to 97 and the claim
+# survives intact (the loser-waits-correctly half of the wire contract).
+LOCK="$WORK/cyoung.lock"; LOG="$WORK/cyoung.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.cyoung" "pid=9 host=ghost"; backdate "$LOCK" 9999
+fabricate_lock "$LOCK.next" "tok.ps.55555.1.1.1" "pid=55555 host=live-ps"   # fresh mtime: live claim
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+  AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=3 \
+  bash "$SH" run -- bash -c 'true' 2>/dev/null; rc=$?
+[ "$rc" = 97 ] && [ -f "$LOCK.next" ] && ! grep -q "CLAIM-STALE-CLEARED\|STOLE-BY-CLAIM" "$LOG" \
+  && ok "bash respected a young ps1 claim (97, claim intact, no clear/steal)" \
+  || bad "bash young-ps1-claim handling: rc=$rc intact=$([ -f "$LOCK.next" ] && echo yes || echo no)"
+rm -f "$LOCK" "$LOCK.next"
+LOCK="$WORK/cyoung2.lock"; LOG="$WORK/cyoung2.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.cyoung2" "pid=9 host=ghost"; backdate "$LOCK" 9999
+fabricate_lock "$LOCK.next" "tok.7777.1.1.1" "pid=7777 host=live-sh"        # fresh mtime: live claim
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+  AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=3 \
+  pwsh -NoProfile -File "$PS1WIN" run "exit 0" 2>/dev/null; rc=$?
+[ "$rc" = 97 ] && [ -f "$LOCK.next" ] && ! grep -q "CLAIM-STALE-CLEARED\|STOLE-BY-CLAIM" "$LOG" \
+  && ok "ps1 respected a young bash claim (97, claim intact, no clear/steal)" \
+  || bad "ps1 young-bash-claim handling: rc=$rc intact=$([ -f "$LOCK.next" ] && echo yes || echo no)"
+rm -f "$LOCK" "$LOCK.next"
+
+echo "== Test 16d: static checks — no File.Replace in the ps1 port (plan test 15) =="
+# File.Replace was REJECTED in design review (round 1): it throws on a
+# read-only destination and has partial-failure states when called without a
+# backup file. The 5.1 lane must stay unlink + fail-if-exists Move.
+if grep -qE 'File\]?::Replace' "$DIR/git-commit-lock.ps1"; then
+  bad "git-commit-lock.ps1 calls File.Replace — the round-1-rejected primitive is back"
+else
+  ok "git-commit-lock.ps1 contains no File.Replace call"
+fi
 
 if command -v powershell >/dev/null 2>&1; then
 echo "== Test 17: Windows PowerShell 5.1 smoke lane — the ps1 must run, not just parse, on the in-box engine =="
@@ -915,8 +1038,24 @@ got="$(tr '\n' ',' < "$ORDER")"
 grep -q STOLE "$LOG" && bad "5.1 wrongly STOLE a live bash lock" || ok "5.1 did not steal the live bash lock"
 grep -q "ACQUIRED.*tok=tok\.ps\." "$LOG" && ok "5.1 acquisition logged with the shared wire-format token" || bad "no tok.ps.* ACQUIRED entry from the 5.1 waiter"
 [ -e "$LOCK" ] && bad "lock left held after the 5.1 lane" || ok "no leftover lock after the 5.1 lane"
+# 5.1 STEAL LADDER (plan test 20): .NET Framework has no 3-arg overwrite
+# Move, so ANY 5.1 steal exercises the unlink + fail-if-exists Move ladder.
+# A 5.1 waiter recovers an ancient ghost: rc 0, one STOLE-BY-CLAIM, clean
+# final state (no lock, no claim).
+LOCK51="$WORK/ps51steal.lock"; LOG51="$WORK/ps51steal.log"; : > "$LOG51"
+fabricate_lock "$LOCK51" "tok.sh.ghost51" "pid=5151 host=ghost"
+backdate "$LOCK51" 9999
+AGENT_LOCK_PATH="$LOCK51" AGENT_LOCK_LOG="$LOG51" AGENT_LOCK_STALE_SECS=2 \
+  AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=30 \
+  powershell -NoProfile -File "$PS1WIN" run "exit 0"; rc=$?
+[ "$rc" = 0 ] && ok "5.1: stale ghost recovered through the unlink+Move ladder (rc 0)" || bad "5.1 steal-ladder rc=$rc (want 0)"
+grep -q "STOLE-BY-CLAIM" "$LOG51" && ok "5.1: STOLE-BY-CLAIM logged (claim protocol, not the old steal)" || bad "5.1: no STOLE-BY-CLAIM entry"
+grep -q "CLAIM .*tok=tok\.ps\." "$LOG51" && ok "5.1: claim create logged with its per-attempt token" || bad "5.1: no CLAIM line with a tok.ps.* token"
+[ -e "$LOCK51" ] && bad "5.1: leftover lock after the steal ladder" || ok "5.1: no leftover lock"
+[ -e "$LOCK51.next" ] && bad "5.1: leftover claim after the steal ladder" || ok "5.1: no leftover claim"
 else
   echo "== Test 17 SKIPPED: Windows PowerShell 5.1 (powershell) not on PATH — POSIX leg; the Windows CI leg covers it =="
+  echo "note: the 5.1 unlink+Move steal-ladder leg (plan test 20) is part of this lane and is covered by the Windows CI leg"
 fi
 
 echo

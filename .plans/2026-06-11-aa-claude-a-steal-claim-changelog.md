@@ -251,3 +251,128 @@ Where each plan rule landed:
 **Abort criteria check**: rename-over IS atomic-no-absent-window when it
 succeeds and the installed mtime IS the claim's fresh mtime on both engines'
 lanes — no abort; proceeding with the rename-over design.
+
+### Implementation (`git-commit-lock.ps1`)
+
+Where each plan rule landed (ps1:line anchors at commit time):
+- Claim object + wire format: `$script:LockClaimPath` set at acquire start
+  (ps1:1300 area); claim created via the parameterized
+  `Lock-TryCreateFile -Path -Token` (ps1:650) — the same
+  write-through-creation-handle as the lock. Claim-path PRE-CREATE type
+  guard inline in the steal lane with per-path two-poll state
+  (`$claimNonlockPrev`) and per-path warn-once (`Lock-WarnNonLockClaim`,
+  ps1:495).
+- Per-attempt tokens: `Lock-NewToken` (ps1:678; pid + Get-Random + epoch +
+  in-process `$script:LockSeq`); fresh token before every create attempt AND
+  every claim attempt; `Lock-TakeHold` (ps1:699) adopts the winning attempt
+  token as the hold token AND registers the Exiting backstop — the shared
+  claim-the-hold helper for all three acquisition paths.
+- Steal install sequence: `Lock-StealInstall` (ps1:971; steps 2 -> 3.1
+  recheck -> 3.2 non-creating `SetLastWriteTimeUtc` touch with the
+  FileNotFoundException gone signal (inner-exception walk) -> 3.3 re-verify
+  -> 3.4 rename-over + read-back). Re-verify helper `Lock-VerifyStale`
+  (ps1:850; stale/gone/fresh/wrongtype; empty judged by STAT per the
+  ps1-on-POSIX FIFO rule; unreadable mtime/content => fresh).
+- Token-checked deletion: `Lock-ClaimDelete` (ps1:813; deleted / gone /
+  foreign / leaked-unreadable / leaked-blocked; File.Delete silent-on-missing
+  folds the ENOENT lane into `deleted`, same reasoning as bash's rm -f;
+  present-but-EMPTY classifies foreign).
+- Ownership discovery: `Lock-Discover` (ps1:714; full ladder) as the final
+  act of every post-claim-create exit in `Lock-StealInstall`.
+- Leaked-token memory: `$script:LockLeaked` array + Lock-LeakedAdd/Member/
+  Drop (ps1:726-749); per-poll listed-token check in the acquire loop
+  (1-attempt short read); release branch with boundary re-read + bounded
+  retry + `RELEASE-CLEANED-LEAKED-CLAIM` + verdict 'stolen'/98; arc-end
+  best-effort `Lock-LeakedResolvePass` (ps1:751) at release (all verdict
+  paths), the 97 exit, and the acquire cleanup's no-hold path; the
+  stale-claim clearing lane resolves an own-leaked entry gated on one lock
+  read (`Lock-ClaimStaleCheck`, ps1:1150).
+- Trap equivalent: try/finally inside `Lock-Acquire` keyed on
+  `$script:LockClaimToken` + a `$resolved` normal-return flag;
+  `Lock-ClaimTrapCleanup` (ps1:1215) does the token-checked deletion with
+  ONE bounded retry + final discovery; a discovery-HOLD there is released
+  INLINE (token-checked lock delete + RELEASED log) because the caller's
+  try/finally never sees a hold taken mid-unwind; no 98 on a mere claim.
+  Cleanup paths use .NET-only primitives ([Threading.Thread]::Sleep in
+  Lock-ReadTok/Lock-ClaimDelete) — cmdlets can throw
+  PipelineStoppedException inside a stopping pipeline's finally.
+- Claim staleness: `Lock-ClaimStaleCheck` (mtime floor honoured; shape =
+  empty-by-stat or tok.-prefixed; `CLAIM-STALE-CLEARED` log) when the claim
+  O_EXCL create loses. Knob `AGENT_LOCK_CLAIM_STALE_SECS` (default 60,
+  validated int). The `MAX_WAIT <= STALE + CLAIM_STALE` warning REPLACES the
+  `STALE >= MAX_WAIT` warning, same left-default gate.
+- Rename-over: `Lock-RenameOver` (ps1:920) — once-per-process 3-arg-overload
+  probe (`$script:LockMove3`); pwsh 7 = atomic overwrite Move; 5.1 = the
+  unlink + fail-if-exists Move ladder with the plan's sub-lanes
+  ('dest-gone' -> CLAIM-ABORT (gone) without the Move; 'blocked' -> damped
+  blocked-steal lane; 'lost' -> rival won the absent window, claim deleted,
+  re-poll). NO dir guard needed: .NET Move refuses a directory destination
+  natively (probe P5/Q3). Verdicts: ok / src-gone / dest-gone / lost /
+  wrong-type / blocked.
+- Logging: byte-compatible line SHAPES with bash (CLAIM/CLAIM-ABORT(reason)/
+  STOLE-BY-CLAIM/CLAIM-STALE-CLEARED/RELEASE-CLEANED-LEAKED-CLAIM/
+  LEAKED-CLAIM/DISCOVERY-HOLD/STALE-> stealing (claim-serialized)/steal
+  FAILED), with ASCII '-' where bash free-text uses an em-dash (the ps1 is
+  ASCII-only; the greppable prefixes and key=value fields are identical).
+  WAITING line drops the token (per-attempt tokens; CLAIM lines carry them).
+  One ps1-only line: "steal lost the 5.1 unlink->Move window" (no bash
+  counterpart lane).
+- Removals: grave steal + grave-token compare + `STEAL-DISPLACED-LIVE` +
+  hard-link restore + RESTORE-GRACE read-back loop + `Lock-SweepLitter` +
+  the per-acquire token assignment + the `STALE >= MAX_WAIT` warning.
+  Header rewritten: claim wire format, rename-over lanes, the
+  non-POSIX-rename deferral residual (Q4), claim-path POSIX residual, trap
+  equivalent, probe records P1-P6/Q1-Q5; hard-link probe notes superseded.
+
+### Implementation decisions within plan latitude (ps1; recorded)
+
+- The trap-time discovery-HOLD is released INLINE in `Lock-ClaimTrapCleanup`
+  rather than via Lock-TakeHold + Lock-Release: the unwind path must not
+  call cmdlets (Register-EngineEvent, Start-Sleep) and the caller's
+  try/finally can never release a hold taken mid-unwind. Same observable
+  semantics (claim resolved, lock released, no 98).
+- `Lock-ClaimState` reads the claim with the full ladder via the same
+  open-based Lock-ReadTok as bash's _lock_read_tok (consistent with the
+  only-ladder-where-verdicts-hang convention); the empty-by-stat refinement
+  applies to the staleness/verify lanes exactly where bash's [ -s ] does.
+- The 5.1 'lost' lane (rival's create won the unlink->Move window) routes
+  claim-delete -> log -> discovery -> re-poll: the plan names "token-checked
+  claim deletion, re-poll"; the discovery read is the global
+  unconditional-final-act rule applied to this exit too.
+- The pwsh 7 blocked lane absorbs the Q4 deferral residual (any rival read
+  handle on the dest fails .NET's classic rename): documented in the header
+  as an accepted port-specific residual, NOT worked around with a 5.1-style
+  ladder on pwsh 7 — that would reintroduce the absent window the plan says
+  the pwsh 7 lane does not have.
+
+### Interop suite (`git-commit-lock.interop.test.sh`)
+
+- Suite Test 16 ADAPTED (plan test 19): claim-serialized mixed-impl recovery
+  — every waiter rc 0 (zero spurious 98s, was "0 or a loud 98"), exactly one
+  STOLE-BY-CLAIM with cross-impl ghost attribution, CLAIM tok= line shape,
+  old "STOLE stale lock" shape and STEAL-DISPLACED machinery asserted ABSENT,
+  background .dead.* grave sampler (mutation discriminator), no leftover
+  lock/claim.
+- NEW Test 16b (plan test 17): bash claimant vs ps1 claimant racing one
+  ghost — both rc 0, exactly one STOLE-BY-CLAIM, balanced 2/2
+  ACQUIRED/RELEASED, zero LOST, zero CLAIM-STALE-CLEARED (young claims
+  respected), clean final state.
+- NEW Test 16c (plan test 18): cross-impl claim staleness — bash clears an
+  aged tok.ps.* claim and completes the steal; ps1 clears an aged bash-token
+  claim likewise; PLUS young-claim respect in both directions (97, claim
+  intact, no clear/steal).
+- NEW Test 16d (plan test 15): static check — no `File.Replace` in the ps1.
+- Suite Test 17 (5.1 lane) EXTENDED (plan test 20): a 5.1 waiter recovers an
+  ancient ghost — rc 0, STOLE-BY-CLAIM, CLAIM tok=tok.ps.*, no leftovers;
+  5.1 has no 3-arg Move overload, so this exercises the unlink+Move ladder
+  by construction. Skip note extended for the POSIX legs.
+- Tight-knob steal tests (T4, T5, T8a/b, T13d, T14, T14b) now set
+  `AGENT_LOCK_CLAIM_STALE_SECS=60` alongside the existing knobs.
+- Wire-reality sweep: all `grep STOLE` assertions still match
+  (STOLE-BY-CLAIM contains STOLE); T4's `holder=` STALE-line field and
+  T5/T10/T17's tok.ps.* token greps unchanged by the port.
+
+### Integration suite (`git-commit-lock.integration.test.sh`)
+
+- Final no-leftover sweep (3h) also asserts no `*.next` and no `*.next.*`
+  leftovers beside the lock (the plan's Coordination note).

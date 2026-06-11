@@ -286,8 +286,17 @@ st="$(git -C "$REPO" status --porcelain)"
 [ -z "$st" ] && ok "working tree clean at end" \
              || { bad "working tree not clean:"; echo "$st" | sed 's/^/  /'; }
 
-# 3h. No leftover lock file.
+# 3h. No leftover lock file — and no leftover CLAIM file (the steal
+# protocol's ${LOCK}.next, plus any *.next.* variants defensively): a clean
+# end state must include the claim path the 2026-06-11/12 claim-serialized
+# steal protocol introduced.
 [ -e "$LOCKFILE" ] && bad "leftover lock file: $LOCKFILE" || ok "no leftover lock file"
+n_next=0
+for c in "$LOCKFILE".next "$LOCKFILE".next.*; do
+  [ -e "$c" ] && { n_next=$((n_next+1)); echo "  leftover claim object: $c"; }
+done
+[ "$n_next" = 0 ] && ok "no leftover claim files (*.next / *.next.*)" \
+                  || bad "$n_next leftover claim file(s) beside the lock"
 
 echo
 echo "==== INTEGRATION RESULT: $PASS passed, $FAIL failed (fan-out: $GCL_MODE) ===="
