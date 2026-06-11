@@ -386,8 +386,9 @@ ignores the clean index and stages the whole working-tree file.)
 
 ## Files
 
-In the repository (`install.sh` symlinks the **two scripts** — not the test
-suites — into `~/.local/bin/`):
+In the repository (`install.sh` installs the **two scripts** — not the test
+suites — into `~/.local/bin/`, as symlinks, or as copies where symlinks are
+unavailable):
 
 | File | Role |
 |------|------|
@@ -409,10 +410,12 @@ bash git-commit-lock.integration.test.sh # end-to-end: concurrent real commits i
 ```
 
 Each suite prints a result summary line and exits 0 when everything passes.
-The heavy fan-out tests run at a REDUCED width by default; each suite prints
-a `fan-out mode:` line at the start and tags its result line with the mode,
-so check those say `FULL` when you ran `GCL_TEST_FULL=1` for the
-full-strength canary (CI does).
+All three use throwaway temp dirs and never touch the repo you launch them
+from. The heavy fan-out tests run at a REDUCED width by default, so a routine
+run doesn't lag a shared development machine; each suite prints a
+`fan-out mode:` line at the start and tags its result line with the mode, so
+check those say `FULL` when you ran `GCL_TEST_FULL=1` for the full-strength
+canary (CI does).
 
 `git-commit-lock.test.sh` covers the bash implementation: mutual exclusion
 under many concurrent workers (clean acquire/release path), stale-lock theft,
@@ -449,6 +452,15 @@ is audited for the guarantees this document claims — every commit lands,
 history stays linear, no commit sweeps up another worker's file, no
 `index.lock` races, no stolen leases, and a clean tree at the end.
 
+The same three suites run in CI on Linux, macOS, and Windows
+(`.github/workflows/tests.yml`), at full fan-out strength, alongside a
+shellcheck + PSScriptAnalyzer lint job. The POSIX legs exercise the
+PowerShell implementation purely as cross-implementation protocol
+verification — the port is *supported* on Windows only (see [The PowerShell
+port](#the-powershell-port-git-commit-lockps1)), but having two independent
+implementations contend on one lock probes the protocol from angles a
+single implementation never would.
+
 The suites spawn many short-lived processes (and pwsh startup is slow), so on
 a loaded machine they can take several minutes — allow a generous timeout
 rather than assuming a hang. A worker occasionally failing to *launch* under
@@ -457,3 +469,7 @@ interop suite's exclusion test tolerates it (scoring by violations/steals,
 with a minimum-acquired floor so a collapsed fan-out cannot pass vacuously);
 the integration suite is deliberately strict per worker (every worker must
 launch and commit), and the unit suite's counts are exact.
+
+For debugging, all three suites copy their logs and work dirs to
+`$GCL_TEST_PRESERVE_DIR` when it is set, and keep the work dir on disk on any
+failure.

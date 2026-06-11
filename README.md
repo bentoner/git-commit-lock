@@ -25,12 +25,10 @@ gives every top-level agent its own worktree ends up with each fan-out of
 subagents sharing one tree.
 
 Committing from that shared tree is often exactly what you want. A session
-might fan out a dozen subagents doing uncoupled work in parallel — drafting
-plans for several features at once, fixing independent review findings,
-updating docs file-by-file — and when each one commits its own change as it
-finishes, the history records how the work evolved, instead of arriving as one
-squashed blob at the end. `git-commit-lock` exists to make those concurrent
-commits safe.
+might fan out a dozen subagents doing uncoupled work in parallel, and when
+each one commits its own change as it finishes, the history records how the
+work evolved, instead of arriving as one squashed blob at the end.
+`git-commit-lock` exists to make those concurrent commits safe.
 
 Typical setups:
 
@@ -56,18 +54,19 @@ or use separate checkouts (see
 
 The lock is a file in the repo's git dir (`.git/commit.lock`), created with an
 atomic create-or-fail open (`O_CREAT|O_EXCL` / `FileMode.CreateNew`) — atomic
-on POSIX filesystems and NTFS alike, with no dependency on `flock` — whose
-content is the holder's unique token. Every worktree has its own git dir, so
-independent worktrees get independent locks, while all agents sharing one
-checkout contend on the same lock. A lock held longer than 5 minutes
-(configurable) is presumed crashed and can be stolen by a waiter, so a dead
-agent can't wedge the others; a holder that loses the lock mid-hold finds out
-at release (exit code 98) rather than silently claiming success. Full design
-and rationale — including why `flock` and other OS lock primitives don't fit
-this cross-runtime setting:
-
-update sentence per changes made to main doc
-
+on local POSIX filesystems and NTFS alike, with no dependency on `flock` —
+whose content is the holder's unique token. Every worktree has its own git
+dir, so independent worktrees get independent locks, while all agents sharing
+one checkout contend on the same lock. The lock is deliberately a stealable
+**lease**, not a kernel lock: in unattended agent fleets a hung-but-alive
+holder is at least as common as a crashed one, and a lock that can't be taken
+from a stuck holder halts the whole run — while a rare collision costs little
+more than a failed commit. So a lock held longer than 5 minutes (configurable)
+is presumed abandoned and can be stolen by a waiter, and a holder that loses
+the lock mid-hold finds out at release (exit code 98) rather than silently
+claiming success. Full design and rationale — why a stealable lease beats
+`flock` and other kernel locks here, and why no OS lock primitive spans
+bash-on-MINGW64 and PowerShell/.NET anyway:
 [`docs/git-commit-lock.md`](docs/git-commit-lock.md).
 
 Two wire-compatible implementations share one lock file and protocol, so a
@@ -85,42 +84,12 @@ against each other on all three OSes — not as platform support, but because
 two independent implementations hammering one lock is cheap adversarial
 verification of the protocol.
 
-## Install
-
-Requirements:
-
-- Git, and bash for `git-commit-lock.sh`. On Windows use Git Bash/MSYS2 bash,
-  not WSL bash — an install done from WSL is only visible inside WSL.
-- PowerShell 7+ (`pwsh`), only for `git-commit-lock.ps1` and the interop tests.
-- `~/.local/bin` on `PATH` if you want the installed command names to resolve
-  (the installer warns if it isn't).
-
-After cloning this repository, run the installer:
-
-```sh
-cd git-commit-lock
-bash install.sh
-```
-
-This symlinks `git-commit-lock.sh` and `git-commit-lock.ps1` into
-`~/.local/bin/` and is idempotent — re-run any time, e.g. after moving the
-repo. On Windows, real symlinks require Developer Mode; if symlinks are
-unavailable, skip the installer and invoke the scripts by path from the clone
-(e.g. `path/to/git-commit-lock/git-commit-lock.sh`). 
-
-it would be better to copy on symlink fail right? Let's take advantage of having built self-contained scripts.
-
-Installing is only a
-convenience so every checkout can use the same command names.
-
 ## Suggested agent instructions
-
-let's move this above install section. the install instructions are instructions for agents; this one is also
-for humans to the extent the humans don't let their agents edit their user context.
 
 Agents only benefit from the lock if their instructions tell them to use it.
 Copy this into the instruction context (`AGENTS.md`, `CLAUDE.md`, Cursor
-rules, etc.) for agents that may share one checkout:
+rules, etc.) for agents that may share one checkout (the `~/.local/bin`
+paths assume the installer has run — see [Install](#install) below):
 
 ````markdown
 ## Shared checkouts: commit lock
@@ -170,6 +139,34 @@ someone else's WIP.
 Details, the sourced API, and the full exit-code table: see the
 git-commit-lock README and `docs/git-commit-lock.md` in its repository.
 ````
+
+## Install
+
+Requirements:
+
+- Git, and bash for `git-commit-lock.sh`. On Windows use Git Bash/MSYS2 bash,
+  not WSL bash — an install done from WSL is only visible inside WSL.
+- PowerShell 7+ (`pwsh`), only for `git-commit-lock.ps1` and the interop tests.
+- `~/.local/bin` on `PATH` if you want the installed command names to resolve
+  (the installer warns if it isn't).
+
+After cloning this repository, run the installer:
+
+```sh
+cd git-commit-lock
+bash install.sh
+```
+
+This installs `git-commit-lock.sh` and `git-commit-lock.ps1` into
+`~/.local/bin/` — as symlinks where possible, falling back to copies where
+symlinks are unavailable (on Windows, real symlinks require Developer Mode;
+both scripts are self-contained, so a copy works identically). It is
+idempotent — re-run any time, e.g. after moving the repo. One caveat on the
+copy fallback: a copy doesn't track the clone, so re-run `install.sh` after
+pulling updates (the installer prints a reminder whenever it copies).
+Installing is only a convenience so every checkout can use the same command
+names; invoking the scripts by path from the clone
+(e.g. `path/to/git-commit-lock/git-commit-lock.sh`) works just as well.
 
 ## Usage
 
@@ -230,9 +227,18 @@ See
 [`docs/git-commit-lock.md`](docs/git-commit-lock.md) for the `AGENT_LOCK_*` config
 knobs and how staleness and stealing work.
 
-## Alternatives and related tools
+## Tests
 
-make this the final section
+Three suites — bash unit, bash + PowerShell interop, and an end-to-end
+integration run of concurrent real commits — cover the tool, and CI runs
+them on Linux, macOS, and Windows. How to run them and what each covers:
+[`docs/git-commit-lock.md#tests`](docs/git-commit-lock.md#tests).
+
+## Licence
+
+[MIT](LICENSE).
+
+## Alternatives and related tools
 
 If each agent can have its own checkout or index, or you need to coordinate
 *edits* rather than commits, other tools fit better — alone or alongside the
@@ -256,38 +262,6 @@ lock:
 - Cloud PR agents such as [GitHub Copilot cloud agent][copilot-cloud] and
   [Jules][jules] clone into isolated environments and return branch/PR-shaped
   work, avoiding the shared checkout entirely.
-
-## Running the tests
-
-delete - ensure coverage in and reference main doc instead.
-
-```sh
-bash git-commit-lock.test.sh             # bash implementation
-bash git-commit-lock.interop.test.sh     # bash + PowerShell interop (skips if pwsh is absent)
-bash git-commit-lock.integration.test.sh # end-to-end: concurrent real commits into one repo (pwsh half skips if absent)
-```
-
-All three suites print a summary line and exit 0 when everything passes.
-They use throwaway temp dirs and never touch the repo you launch them from.
-On Windows, run the interop suite from Git Bash/MSYS2 bash, **not** WSL bash,
-so the bash and PowerShell sides resolve the same `C:/...` lock path.
-
-The heavy fan-out tests default to a REDUCED width so a routine run doesn't
-lag a shared development machine; set `GCL_TEST_FULL=1` for the full-strength
-concurrency canary (CI sets it). Each suite prints which mode ran and tags
-its result line with it, so a reduced pass can't masquerade as the full one.
-
-The same three suites run in CI on Linux, macOS, and Windows
-(`.github/workflows/tests.yml`), alongside a shellcheck + PSScriptAnalyzer
-lint job. The POSIX legs exercise the PowerShell implementation purely as
-cross-implementation protocol verification (it is only *supported* on
-Windows — see above). All three suites copy their logs and work dirs to
-`$GCL_TEST_PRESERVE_DIR` when it is set, and keep the work dir on disk on any
-failure.
-
-## Licence
-
-[MIT](LICENSE).
 
 [git-worktree]: https://git-scm.com/docs/git-worktree
 [claude-worktrees]: https://code.claude.com/docs/en/worktrees
