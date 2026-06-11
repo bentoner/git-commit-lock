@@ -540,17 +540,24 @@ AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" \
 
 echo "== Test 17: NON-FILE at the lock path — never stolen, loud one-time config warning, waiters reach 97 =="
 # (a) a directory (a config typo like AGENT_LOCK_PATH=\$HOME, or a leftover
-# old-protocol dir lock). The per-poll type guard fires regardless of age.
+# old-protocol dir lock). The per-poll type guard fires regardless of age —
+# but only after the SAME concrete type is seen on two consecutive polls
+# (round-3 anti-ghost confirmation, 2026-06-11), so these tests need
+# MAX_WAIT/POLL to give at least three polls of headroom EVEN UNDER LOAD —
+# a loaded box can spend ~0.5s per iteration, so MAX_WAIT=1 once flaked with
+# zero guard evaluations completing (0.1s polls in a
+# 3s wait = ~30 nominal here).
 LOCK="$WORK/nonfile.lock"; LOG="$WORK/nonfile.log"; : > "$LOG"
 mkdir -p "$LOCK/sub"; echo data > "$LOCK/sub/file"
 AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
-  AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=1 \
+  AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=3 \
   bash "$LIB" run -- bash -c 'true' 2> "$WORK/t17a.err"; rc=$?
 [ "$rc" = 97 ] && ok "directory at lock path: waiter timed out (97), command never ran" \
                || bad "directory at lock path: rc=$rc (want 97)"
 [ -f "$LOCK/sub/file" ] && ok "directory and its contents untouched (never stolen/deleted)" \
                         || bad "directory at lock path was damaged!"
 grep -q "is not a lock file" "$WORK/t17a.err" && ok "loud config warning on stderr" || bad "no config warning for dir at lock path"
+grep -q "it is a directory" "$WORK/t17a.err" && ok "warning names the detected type (directory)" || bad "warning does not name the directory type"
 n="$(grep -c "is not a lock file" "$WORK/t17a.err")"
 [ "$n" = 1 ] && ok "config warning fired exactly once per process (got $n)" || bad "config warning fired $n times (want 1)"
 grep -q STOLE "$LOG" && bad "non-file was STOLEN" || ok "no steal attempted on a directory"
@@ -561,13 +568,14 @@ rm -rf "$LOCK"
 LOCK="$WORK/symlink.lock"; LOG="$WORK/symlink.log"; : > "$LOG"
 if env MSYS=winsymlinks:nativestrict ln -s "$WORK/no-such-target" "$LOCK" 2>/dev/null && [ -L "$LOCK" ]; then
   AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
-    AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=1 \
+    AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=3 \
     bash "$LIB" run -- bash -c 'true' 2> "$WORK/t17b.err"; rc=$?
   [ "$rc" = 97 ] && ok "dangling symlink at lock path: waiter timed out (97)" \
                  || bad "dangling symlink: rc=$rc (want 97)"
   [ -L "$LOCK" ] && ok "symlink untouched" || bad "symlink was removed/replaced"
   grep -q "is not a lock file" "$WORK/t17b.err" && ok "config warning names the symlink case" \
                                                 || bad "no config warning for symlink at lock path"
+  grep -q "it is a symlink" "$WORK/t17b.err" && ok "warning names the detected type (symlink)" || bad "warning does not name the symlink type"
   rm -f "$LOCK"
 else
   rm -f "$LOCK"
@@ -580,7 +588,7 @@ fi
 LOCK="$WORK/fifo.lock"; LOG="$WORK/fifo.log"; : > "$LOG"
 if command -v mkfifo >/dev/null 2>&1 && mkfifo "$LOCK" 2>/dev/null && [ -p "$LOCK" ]; then
   AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
-    AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=1 \
+    AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=3 \
     bash "$LIB" run -- bash -c 'true' 2> "$WORK/t17c.err" &
   p17=$!
   hung=0
@@ -597,6 +605,7 @@ if command -v mkfifo >/dev/null 2>&1 && mkfifo "$LOCK" 2>/dev/null && [ -p "$LOC
                    || bad "FIFO at lock path: rc=$rc (want 97)"
     grep -q "is not a lock file" "$WORK/t17c.err" && ok "config warning for FIFO at lock path" \
                                                   || bad "no config warning for FIFO"
+    grep -q "it is a FIFO" "$WORK/t17c.err" && ok "warning names the detected type (FIFO)" || bad "warning does not name the FIFO type"
   fi
   [ "$hung" = 0 ] && { [ -p "$LOCK" ] && ok "FIFO untouched" || bad "FIFO was removed/replaced"; }
   rm -f "$LOCK"
@@ -611,10 +620,13 @@ echo "== Test 17d: REGRESSION — create/delete churn at the lock path must NOT 
 # them — or a Windows delete-pending ghost (the unlink queues behind a rival
 # reader's transient handle; attribute stats fail while a bare -e still
 # reports existence, for up to ~ms) — made a normal contended poll warn
-# "is not a regular file": a loud config-warning false alarm under plain
+# a non-lock warning: a loud config-warning false alarm under plain
 # contention (round-2 review, 2026-06-11; the ghost defeats an immediate
-# re-probe, which is why the guard now classifies CONCRETE wrong types
-# only). A single-process churner create/deletes the lock file rapidly (the
+# re-probe, which is why the guard classifies CONCRETE wrong types only —
+# and, after CI run 27325971668 caught a ghost transiently matching one of
+# the concrete stats on windows-2025, additionally requires the SAME type
+# on two consecutive polls before warning). A single-process churner
+# create/deletes the lock file rapidly (the
 # absent window is one back-to-back delete->create gap, far too narrow for
 # a waiter to slip its create into) while 3 rounds x 4 parallel short
 # waiters poll through thousands of unlink transitions. ANY non-lock warning

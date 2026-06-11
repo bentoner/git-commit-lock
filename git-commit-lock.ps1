@@ -588,6 +588,11 @@ function Lock-Acquire {
     # the log growth stays bounded however long the squat lasts (mirrors
     # git-commit-lock.sh).
     $stealFailLast = 0
+    # Two-consecutive-poll confirmation state for the wrong-type guard below
+    # (parity with git-commit-lock.sh's round-3 hardening): the concrete
+    # classification observed on the PREVIOUS blocked poll, reset to '' when
+    # a poll sees the path absent or a plain regular file.
+    $nonlockPrev = ''
 
     while ($true) {
         # PRE-CREATE TYPE GUARD (load-bearing on Windows, not just bash
@@ -645,8 +650,35 @@ function Lock-Acquire {
         $item = script:Lock-GetPathItem
         if ($null -ne $item) {
             if (-not (script:Lock-IsPlainFile $item)) {
-                script:Lock-WarnNonLock 'it is not a regular file'
+                # WRONG-TYPE CONFIRMATION (parity with git-commit-lock.sh's
+                # round-3 hardening, 2026-06-11, CI run 27325971668): warn
+                # only when the SAME concrete type is observed on two
+                # consecutive blocked polls. This side has no observed
+                # misfire - the classification is one Get-Item snapshot, and
+                # a delete-pending ghost makes Get-Item throw (-> $null ->
+                # normal contention) - but the impls stay in lock-step and
+                # the cost is a few lines. A real misconfig object classifies
+                # identically forever, so its once-per-process warning just
+                # arrives one poll later; the never-steal safety is
+                # unaffected either way (the guard never steals non-locks
+                # regardless of warning state). ReparsePoint is tested FIRST
+                # so a directory symlink/junction is named as the link it is
+                # (same order as bash's -L-first). Lock-IsPlainFile can only
+                # reject a reparse point or a container, so the
+                # classification here is exhaustive; the empty fall-through
+                # mirrors bash's no-concrete-type lane defensively.
+                $nonlockCur = ''
+                if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    $nonlockCur = 'a symlink'
+                } elseif ($item.PSIsContainer) {
+                    $nonlockCur = 'a directory'
+                }
+                if ($nonlockCur -and $nonlockCur -eq $nonlockPrev) {
+                    script:Lock-WarnNonLock "it is $nonlockCur"
+                }
+                $nonlockPrev = $nonlockCur
             } else {
+                $nonlockPrev = ''   # regular file: any prior wrong-type observation is moot
                 # A regular file: a live lock, a stale one, or a crash orphan.
                 # Steal if the FILE's mtime is older than the stale window -
                 # but only on a PLAUSIBLE mtime (>= 2000-01-01): a sub-floor
@@ -792,8 +824,11 @@ function Lock-Acquire {
                     }
                 }
             }
+        } else {
+            # path absent: normal contention - the next iteration re-races
+            # the create. Also resets the wrong-type confirmation state.
+            $nonlockPrev = ''
         }
-        # (path absent: normal contention - the next iteration re-races the create)
 
         # A live holder has it (or a never-steal object squats it) - wait,
         # unless we have waited too long.
