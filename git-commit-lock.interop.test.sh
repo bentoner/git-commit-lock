@@ -633,17 +633,34 @@ BREADY="$WORK/bs2.bready"; BGO="$WORK/bs2.bgo"; rm -f "$BREADY" "$BGO"
 hold_handle "$LOCK" "$BREADY" "$BGO" &
 blk14b=$!
 if wait_for "$BREADY" 400; then
+  # Each waiter runs in the BACKGROUND with a bounded reap (T17c's pattern):
+  # the regression this test guards is a busy-spin that never reaches the
+  # MAX_WAIT check, so a foreground `run` would HANG the suite instead of
+  # failing it. If the waiter outlives its generous budget it is failed and
+  # hard-killed by ITS exact pid (never by name).
   for impl in sh ps; do
     LOGI="$WORK/bs2-$impl.log"; : > "$LOGI"
     if [ "$impl" = sh ]; then
       AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOGI" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=2 \
-        bash "$SH" run -- bash -c 'true' 2>/dev/null; rc=$?
+        bash "$SH" run -- bash -c 'true' 2>/dev/null &
     else
       AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOGI" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=2 \
-        pwsh -NoProfile -File "$PS1WIN" run "exit 0" 2>/dev/null; rc=$?
+        pwsh -NoProfile -File "$PS1WIN" run "exit 0" 2>/dev/null &
     fi
-    [ "$rc" = 97 ] && ok "$impl waiter hit MAX_WAIT (97) while the squatter blocked the steal" \
-                   || bad "$impl waiter rc=$rc (want 97 — blocked-steal lane bypassed MAX_WAIT?)"
+    w14b=$!
+    # Budget: MAX_WAIT=2 plus pwsh cold-start/load headroom (30s of 0.1s
+    # polls) — generous enough that only a true never-returns spin overruns.
+    hung=1
+    for _ in $(seq 1 300); do kill -0 "$w14b" 2>/dev/null || { hung=0; break; }; sleep 0.1; done
+    if [ "$hung" = 1 ]; then
+      bad "$impl waiter still running long past MAX_WAIT — busy-spin regression (blocked-steal lane bypassed the timeout); killing it"
+      kill -9 "$w14b" 2>/dev/null          # exact PID we spawned; nothing else
+      wait "$w14b" 2>/dev/null
+    else
+      wait "$w14b"; rc=$?
+      [ "$rc" = 97 ] && ok "$impl waiter hit MAX_WAIT (97) while the squatter blocked the steal" \
+                     || bad "$impl waiter rc=$rc (want 97 — blocked-steal lane bypassed MAX_WAIT?)"
+    fi
     nst="$(grep -c 'STALE (' "$LOGI")"
     nfail="$(grep -c 'steal FAILED' "$LOGI")"
     # ~20 stale-eligible polls in 2s at 0.1s; damped to first + once per 1s
