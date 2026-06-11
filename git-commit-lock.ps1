@@ -89,7 +89,8 @@
 #   96  usage / configuration error: bad arguments, more than one command
 #       argument, an empty or unparseable command, or `run` outside a git repo
 #       with AGENT_LOCK_PATH unset. The lock was NEVER acquired and the command
-#       NEVER ran.
+#       NEVER ran. An explicit --help/-h/-? is NOT an error: usage goes to
+#       stdout, exit 0.
 #   97  timed out waiting for the lock (AGENT_LOCK_MAX_WAIT). The command
 #       NEVER ran.
 #   98  the lock was STOLEN mid-hold (held past the stale window while a
@@ -427,12 +428,21 @@ function script:Lock-PathMtime {
 #                       empty-after-retries lane: BOTH impls route this state
 #                       to the conservative unverifiable verdict, never to
 #                       "stolen".
-# Retries with escalating backoff (20ms..320ms): under heavy contention a read
-# can transiently hit a sharing violation or the empty window, and crying
+# Retries with escalating backoff: under heavy contention a read can
+# transiently hit a sharing violation or the empty window, and crying
 # "stolen" on that would be false. A REAL steal renames the file away, so a
 # successful read then returns a DIFFERENT token (still a mismatch) - retrying
 # never hides a genuine theft. The FileStream opens with ReadWrite|Delete
 # sharing so this read can never block a rival's steal/release (probe D2).
+#
+# SHARED RETRY SCHEDULE (keep in lock-step with git-commit-lock.sh's
+# _lock_cur_token): up to 8 read attempts with inter-attempt sleeps of
+# 20/40/80/160/320/320/320 ms - ~1.26s total budget, enough to ride out a
+# sub-second transient (e.g. an AV scanner's no-delete-share open). No sleep
+# follows the FINAL attempt (it would only delay the verdict). The full
+# ladder runs only where a verdict hangs on the read - release verification
+# and the acquire read-back - never inside the acquire poll loop, so a
+# healthy lock costs one attempt and the poll cadence is unaffected.
 function script:Lock-ReadCurToken {
     param([int]$MaxTries = 8)
     Set-StrictMode -Off
@@ -460,7 +470,7 @@ function script:Lock-ReadCurToken {
             # the file is genuinely gone.
             if (-not (Test-Path -LiteralPath $script:LockPath)) { return @{ Status = 'gone'; Token = '' } }
         }
-        Start-Sleep -Milliseconds $delay
+        if ($i -lt ($MaxTries - 1)) { Start-Sleep -Milliseconds $delay }
         if ($delay -lt 320) { $delay = $delay * 2 }
     }
     if (Test-Path -LiteralPath $script:LockPath) { return @{ Status = 'unreadable'; Token = '' } }
@@ -1114,6 +1124,24 @@ if ($MyInvocation.InvocationName -ne '.') {
         'exit codes: command''s own; 96 usage error; 97 lock wait timed out (command never ran);',
         '            98 lock stolen mid-hold (command ran but was NOT serialised - redo)'
     )
+    # Explicit help as the FIRST argument is an answered question: usage on
+    # STDOUT, exit 0. Genuine usage errors (no args, unknown subcommand) keep
+    # stderr + 96. Two binder quirks (probed, pwsh 7.5 + 5.1): a token
+    # starting '-' never binds to the positional $Action - the engine routes
+    # it to $Rest (ValueFromRemainingArguments) - so the check looks at BOTH;
+    # and a bare -? usually never reaches the script at all (both engines
+    # intercept it as the common help parameter: auto-syntax to stdout, exit
+    # 0), but a quoted/positional delivery (e.g. & path '-?') does arrive and
+    # gets the same stdout/0 convention here.
+    $gclHelpArg = $Action
+    if (-not $gclHelpArg) {
+        $gclRestArr = @(@($Rest) | Where-Object { $null -ne $_ })
+        if ($gclRestArr.Count -gt 0) { $gclHelpArg = [string]$gclRestArr[0] }
+    }
+    if ($gclHelpArg -eq '--help' -or $gclHelpArg -eq '-h' -or $gclHelpArg -eq '-?') {
+        foreach ($l in $script:LockUsage) { Write-Output $l }
+        exit 0
+    }
     switch ($Action) {
         'run' {
             # $Rest is $null (not an empty array) when no args follow: @($null)

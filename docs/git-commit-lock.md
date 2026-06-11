@@ -141,8 +141,10 @@ Both implementations follow the same protocol on the same wire format:
     an *empty file with a valid mtime*, recovered by the normal staleness
     rule (a regression test covers it).
   - After winning, the acquirer reads the path back and must find its own
-    token; anything else after the read-retry ladder (a short sequence of
-    re-reads with escalating backoff) — foreign, empty, gone — means it
+    token; anything else after the read-retry ladder (up to 8 re-reads with
+    escalating 20→320 ms backoff, ~1.3 s total budget — the same schedule in
+    both implementations, enough to ride out a sub-second transient such as
+    an AV scanner's handle) — foreign, empty, gone — means it
     cannot prove it holds the path: it logs loudly and treats the lock as
     NOT acquired. It never "repairs" a failed read-back by rewriting the
     path: after a long suspension (sleep, stop-the-world) the file may
@@ -255,9 +257,11 @@ The port is **wire-compatible** with `git-commit-lock.sh`, so a `.ps1` holder an
   All reads of the lock file use an explicit `FileStream` with
   `ReadWrite|Delete` sharing (not `ReadAllText`, whose `FileShare.Read`
   handle would — probed — block another party's steal-rename or
-  release-unlink for the duration). The release-time token read retries with
-  escalating backoff to ride out transient Windows sharing violations and the
-  create→write content gap.
+  release-unlink for the duration). The release-time and acquire-read-back
+  token reads retry on the shared escalating-backoff schedule (see the
+  acquire section above) to ride out transient Windows sharing violations
+  and the create→write content gap — bash runs the identical schedule, so
+  the two implementations return the same verdict for the same transient.
 
 Usage:
 

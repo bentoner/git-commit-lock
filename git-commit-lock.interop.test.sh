@@ -372,6 +372,27 @@ AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_MAX_WAIT=20 \
               || bad "limitation pin: rc=$rc (want 0 — has the final-statement contract changed?)"
 [ -e "$LOCK" ] && bad "lock left held after the F2 verdict runs" || ok "no leftover lock after the F2 verdict runs"
 
+echo "== Test 7c: ps1 CLI help/usage convention — explicit help -> stdout + exit 0; usage errors -> stderr + 96 (F6d) =="
+# (bash's side of the same convention is pinned in the unit suite, Test 7.)
+for h in --help -h; do
+  pwsh -NoProfile -File "$PS1WIN" "$h" > "$WORK/t7c.out" 2> "$WORK/t7c.err"; rc=$?
+  [ "$rc" = 0 ] && grep -q '^usage:' "$WORK/t7c.out" && [ ! -s "$WORK/t7c.err" ] \
+    && ok "ps1 $h -> usage on stdout, exit 0, stderr empty" \
+    || bad "ps1 $h rc=$rc (want 0) stdout-usage=$(grep -c '^usage:' "$WORK/t7c.out") stderr=$(head -c 60 "$WORK/t7c.err")"
+done
+# -? is intercepted by the ENGINE as the common help parameter before it can
+# reach the script (auto-generated syntax on stdout; probed pwsh 7.5 + 5.1),
+# so only the convention's exit code is pinned here; the script handles a
+# positionally-delivered '-?' identically to --help.
+pwsh -NoProfile -File "$PS1WIN" '-?' >/dev/null 2>&1; rc=$?
+[ "$rc" = 0 ] && ok "ps1 -? exits 0 (engine help interception)" || bad "ps1 -? rc=$rc (want 0)"
+pwsh -NoProfile -File "$PS1WIN" > "$WORK/t7c-noargs.out" 2> "$WORK/t7c-noargs.err"; rc=$?
+[ "$rc" = 96 ] && grep -q '^usage:' "$WORK/t7c-noargs.err" && [ ! -s "$WORK/t7c-noargs.out" ] \
+  && ok "ps1 no args -> 96 with usage on stderr, stdout empty" \
+  || bad "ps1 no-args rc=$rc (want 96) stderr-usage=$(grep -c '^usage:' "$WORK/t7c-noargs.err")"
+pwsh -NoProfile -File "$PS1WIN" frobnicate >/dev/null 2>&1; rc=$?
+[ "$rc" = 96 ] && ok "ps1 unknown subcommand -> 96" || bad "ps1 unknown subcommand rc=$rc (want 96)"
+
 echo "== Test 8: a ROBBED holder exits 98 — pwsh victim/bash thief, then bash victim/pwsh thief =="
 # Fail-open ceiling, cross-impl: the victim holds past its 1s stale window
 # UNTIL THE THIEF IS DONE (marker, not a fixed sleep — a fixed hold once let a
@@ -803,6 +824,10 @@ AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_MAX_WAIT=30 \
 AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_MAX_WAIT=30 \
   powershell -NoProfile -File "$PS1WIN" run "Get-Item -LiteralPath '$WORK/no-such-file-ps51'" 2> "$WORK/ps51.err"; rc=$?
 [ "$rc" = 1 ] && ok "5.1: failing cmdlet -> exit 1 (F2 verdict holds on 5.1)" || bad "5.1: failing cmdlet rc=$rc (want 1)"
+powershell -NoProfile -File "$PS1WIN" --help > "$WORK/ps51.help.out" 2> "$WORK/ps51.help.err"; rc=$?
+[ "$rc" = 0 ] && grep -q '^usage:' "$WORK/ps51.help.out" \
+  && ok "5.1: --help -> usage on stdout, exit 0 (F6d convention holds on 5.1)" \
+  || bad "5.1: --help rc=$rc (want 0) stdout-usage=$(grep -c '^usage:' "$WORK/ps51.help.out")"
 grep -q "without a native exit code" "$WORK/ps51.err" \
   && ok "5.1: the no-native-exit-code note reaches stderr" \
   || bad "5.1: missing the no-native-exit-code note"

@@ -215,7 +215,7 @@ high codes that report the lock's own outcomes:
 
 | Exit code | Meaning |
 |-----------|---------|
-| 96 | usage error — bad arguments, or `run` outside a git repo with `AGENT_LOCK_PATH` unset; the command was never run |
+| 96 | usage error — bad arguments, or `run` outside a git repo with `AGENT_LOCK_PATH` unset; the command was never run. (An explicit `--help`/`-h` is not an error: usage on stdout, exit 0.) |
 | 97 | lock acquisition timed out (`AGENT_LOCK_MAX_WAIT`, default 7 minutes) — the command was never run |
 | 98 | lock stolen mid-hold — the command ran but was NOT serialised; verify with `git log` and redo it under the lock |
 

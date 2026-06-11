@@ -250,11 +250,23 @@ wait "$h6"
 [ -e "$GITDIR/commit.lock" ] && bad "default lock file left behind after release" || ok "default lock file removed on release"
 [ -f "$GITDIR/git-commit-lock.log" ] && ok "lock log created in git dir ($GITDIR)" || bad "no log in git dir"
 
-echo "== Test 7: CLI usage errors exit 96 =="
+echo "== Test 7: CLI usage errors exit 96 (stderr); explicit --help/-h exits 0 (stdout) =="
 bash "$LIB" >/dev/null 2>&1;            [ "$?" = 96 ] && ok "no args -> 96" || bad "no args rc=$? (want 96)"
-bash "$LIB" frobnicate >/dev/null 2>&1; [ "$?" = 96 ] && ok "unknown subcommand -> 96" || bad "unknown subcommand rc=$? (want 96)"
+bash "$LIB" frobnicate > "$WORK/t7.err.out" 2> "$WORK/t7.err.err"
+[ "$?" = 96 ] && ok "unknown subcommand -> 96" || bad "unknown subcommand rc=$? (want 96)"
+grep -q '^usage:' "$WORK/t7.err.err" && [ ! -s "$WORK/t7.err.out" ] \
+  && ok "usage-error text goes to stderr, stdout stays empty" \
+  || bad "usage-error stream routing wrong (stdout: $(head -c 60 "$WORK/t7.err.out"))"
 bash "$LIB" run >/dev/null 2>&1;        [ "$?" = 96 ] && ok "run with no command -> 96" || bad "run with no command rc=$? (want 96)"
 bash "$LIB" run -- >/dev/null 2>&1;     [ "$?" = 96 ] && ok "run -- with no command -> 96" || bad "run -- rc=$? (want 96)"
+# Explicit help is an answered question, not a usage error (F6d): usage on
+# STDOUT, exit 0, nothing on stderr.
+for h in --help -h; do
+  bash "$LIB" "$h" > "$WORK/t7.help.out" 2> "$WORK/t7.help.err"; rc=$?
+  [ "$rc" = 0 ] && grep -q '^usage:' "$WORK/t7.help.out" && [ ! -s "$WORK/t7.help.err" ] \
+    && ok "$h -> usage on stdout, exit 0, stderr empty" \
+    || bad "$h rc=$rc (want 0) stdout-usage=$(grep -c '^usage:' "$WORK/t7.help.out") stderr=$(head -c 60 "$WORK/t7.help.err")"
+done
 
 echo "== Test 8: acquire timeout exits 97 and the command NEVER runs =="
 LOCK="$WORK/tmo.lock"; LOG="$WORK/tmo.log"; : > "$LOG"; READY="$WORK/t8.ready"; DONE8="$WORK/t8.done"
@@ -469,6 +481,21 @@ grep -q "AGENT_LOCK_PATH" "$WORK/t14.err" && ok "refusal message mentions AGENT_
     bash "$LIB" run -- bash -c 'true' ) 2>/dev/null; rc=$?
 [ "$rc" = 0 ] && ok "explicit AGENT_LOCK_PATH works outside a repo" || bad "explicit AGENT_LOCK_PATH outside repo rc=$rc"
 
+echo "== Test 14b: SOURCING outside a repo warns on stderr and creates NO files (F6a) =="
+# Sourcing keeps the CWD fallback (it must never explode), but the warning
+# goes to STDERR — pre-fix it went only to the lock log, which as a side
+# effect CREATED ./git-commit-lock.log in whatever random directory the
+# caller was in (ps1's dot-source lane always warned on stderr; parity).
+NRS="$WORK/norepo-src"; mkdir -p "$NRS"
+( cd "$NRS" && env GIT_CEILING_DIRECTORIES="$WORK" bash -c 'source "$1"' _ "$LIB" ) 2> "$WORK/t14b.err"; rc=$?
+[ "$rc" = 0 ] && ok "sourcing outside a repo succeeds (rc 0)" || bad "sourcing outside a repo rc=$rc (want 0)"
+grep -q "not inside a git repository" "$WORK/t14b.err" \
+  && ok "CWD-fallback warning lands on stderr" \
+  || bad "no CWD-fallback warning on stderr ($(head -c 80 "$WORK/t14b.err"))"
+leftovers="$(ls -A "$NRS" 2>/dev/null)"
+[ -z "$leftovers" ] && ok "sourcing left the CWD clean (no log or lock file created)" \
+                    || bad "sourcing outside a repo created files in the CWD: $leftovers"
+
 echo "== Test 15: AGED .dead.* file graves are swept at acquire; fresh or non-file ones survive =="
 # The sweep is age-gated (mirrors the ps1 port): only graves older than the
 # stale window (default 300s here) are collected — kept from the dir era to
@@ -537,6 +564,37 @@ AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" \
   bash "$LIB" run -- bash -c 'rm -f "$AGENT_LOCK_PATH"' 2>/dev/null; rc=$?
 [ "$rc" = 98 ] && ok "run reports 98 (overrides a successful command) when the lock file is gone" \
                || bad "run gone-at-release rc=$rc (want 98)"
+
+echo "== Test 16c: release rides out a TRANSIENT empty read (escalating retry ladder — ps1 parity, F4) =="
+# A sub-second window in which the lock file reads EMPTY (stand-in for an AV
+# scanner's blocking handle, or a probe-F create->write gap that resolves)
+# must NOT produce the unverifiable verdict: the read-retry ladder (shared
+# 20..320ms escalating schedule, ~1.26s budget — see _lock_cur_token) keeps
+# re-reading until the token reappears, then releases cleanly. Pre-F4 bash's
+# ladder was 5x20ms (~0.1s): the same 0.4s transient returned rc 2 here
+# while ps1 rode it out — observably different verdicts from one on-disk
+# event. Deterministic: the holder itself truncates its lock file and a
+# background helper restores the original content 0.4s later, squarely
+# inside the ladder's budget (attempt 6 lands at ~0.62s) and far past the
+# old one.
+LOCK="$WORK/transient.lock"; LOG="$WORK/transient.log"; : > "$LOG"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" bash -c '
+  source "$1" || exit 70
+  lock_acquire || exit 72
+  content="$(cat "$2")" || exit 73        # token + owner lines
+  : > "$2"                                # transient: the token vanishes...
+  ( sleep 0.4; printf "%s\n" "$content" > "$2" ) &   # ...and reappears
+  lock_release; rc=$?
+  wait
+  exit "$rc"
+' _ "$LIB" "$LOCK" 2> "$WORK/t16c.err"; rc=$?
+[ "$rc" = 0 ] && ok "release rode out a 0.4s empty transient (rc 0, not unverifiable-2)" \
+              || bad "transient-empty release rc=$rc (want 0 — read-retry ladder too short?)"
+[ -e "$LOCK" ] && bad "lock file left behind after riding out the transient" \
+               || ok "lock file removed after riding out the transient"
+grep -q "EMPTY/unreadable at release" "$WORK/t16c.err" \
+  && bad "spurious unverifiable warning despite the token reappearing" \
+  || ok "no unverifiable warning for the ridden-out transient"
 
 echo "== Test 17: NON-FILE at the lock path — never stolen, loud one-time config warning, waiters reach 97 =="
 # (a) a directory (a config typo like AGENT_LOCK_PATH=\$HOME, or a leftover

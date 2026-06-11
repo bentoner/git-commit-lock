@@ -58,7 +58,9 @@
 #       transiently report FILETIME zero (1601) to an observer on Windows;
 #       sub-floor means "unsettled, wait", never "ancient, steal";
 #     * the empty/unreadable READ RETRIES: the create->write gap of a rival is
-#       observable (probe F), so token reads retry briefly before classifying.
+#       observable (probe F), so token reads retry with escalating backoff
+#       before classifying (the shared schedule lives at _lock_cur_token and
+#       the ps1 port's Lock-ReadCurToken — keep them in lock-step).
 #
 # ACQUIRE VERIFICATION (never repair by overwriting)
 #   After winning the create, the acquirer re-reads line 1 from the path and
@@ -164,7 +166,8 @@
 #   `run` exits with the wrapped command's own exit code, EXCEPT three
 #   reserved high codes:
 #     96  usage error (bad/missing arguments, or `run` outside a git repo with
-#         no AGENT_LOCK_PATH override) — the command was NEVER run
+#         no AGENT_LOCK_PATH override) — the command was NEVER run. An
+#         explicit `--help`/`-h` is NOT an error: usage on stdout, exit 0.
 #     97  timed out waiting for the lock — the command was NEVER run
 #     98  lock stolen mid-hold — the command RAN but was NOT serialised;
 #         treat the work as failed and redo it under the lock
@@ -303,10 +306,13 @@ _lock_log()  {
 }
 
 # Sourced outside a git repo without an explicit AGENT_LOCK_PATH: keep the CWD
-# fallback (sourcing must never explode) but leave a trace that the lock is
-# probably NOT protecting what the caller thinks it is.
+# fallback (sourcing must never explode) but say so on STDERR — not via
+# _lock_log, which would CREATE $PWD/git-commit-lock.log in whatever random
+# directory the caller happened to be in (the warning is about the location
+# being wrong; leaving a file there compounds the problem). Mirrors the ps1
+# port's dot-source warning: stderr only, no file created.
 if [ -z "$_LOCK_GITDIR" ] && [ "$_LOCK_PATH_EXPLICIT" = 0 ] && [ "${BASH_SOURCE[0]}" != "${0}" ]; then
-  _lock_log "WARNING: not inside a git repository; lock location falls back to CWD ($_LOCK_BASE) — set AGENT_LOCK_PATH explicitly if that is not intended"
+  echo "git-commit-lock: WARNING — not inside a git repository; defaulting the lock to $_LOCK_BASE/commit.lock (CWD). Set AGENT_LOCK_PATH to control this." >&2
 fi
 
 # Loud, once-per-process config warning for a non-lock object at the lock
@@ -369,15 +375,28 @@ _lock_path_mtime() {
 }
 
 # Token currently recorded in the lock file — line 1, whoever holds it now —
-# or empty. Brief retry while the read comes back empty but the file still
-# exists: the rival create->write gap is observable (probe F: the file can
-# exist with no content yet), and on Windows a concurrent scan can
-# transiently fail the open (sharing violation); treating one misread as
-# "stolen" would be a false alarm with a destructive remedy ("redo your
-# commit"). An empty result with the file still present is classified at
-# release as UNVERIFIABLE ownership (rc 2), never as proven theft.
-_lock_cur_token() {
-  local t="" i=0
+# or empty. Retries with ESCALATING backoff while the read comes back empty
+# but the file still exists: the rival create->write gap is observable (probe
+# F: the file can exist with no content yet), and on Windows a concurrent
+# scanner can transiently fail the open (sharing violation) for hundreds of
+# milliseconds; treating one misread as "stolen" would be a false alarm with
+# a destructive remedy ("redo your commit"). An empty result with the file
+# still present is classified at release as UNVERIFIABLE ownership (rc 2),
+# never as proven theft. Retrying never hides a genuine theft: a real steal
+# renames the file away, so a later successful read returns a DIFFERENT
+# token (still a mismatch).
+#
+# SHARED RETRY SCHEDULE (keep in lock-step with the ps1 port's
+# Lock-ReadCurToken): up to 8 read attempts with inter-attempt sleeps of
+# 20/40/80/160/320/320/320 ms — ~1.26s total budget, enough to ride out a
+# sub-second transient (e.g. an AV scanner's no-delete-share open). The full
+# ladder runs ONLY where a verdict hangs on the read — release verification
+# and the acquire read-back — never inside the acquire poll loop (the steal
+# content guard and grave check have their own short reads), so a healthy
+# lock costs one attempt and the poll cadence is unaffected.
+_lock_cur_token() {  # $1 = max read attempts (default 8 = the full ladder)
+  local t="" i=0 max="${1:-8}"
+  set -- 0.02 0.04 0.08 0.16 0.32 0.32 0.32   # the shared backoff schedule
   while :; do
     t=""
     # NB: 2>/dev/null BEFORE the input redirect — a failed open's error
@@ -387,8 +406,8 @@ _lock_cur_token() {
     t="${t%"${t##*[![:space:]]}"}"   # strip trailing CR/whitespace (CRLF tolerance)
     [ -n "$t" ] && break
     [ -e "$AGENT_LOCK_PATH" ] || break   # file gone: genuinely no token
-    i=$((i+1)); [ "$i" -ge 5 ] && break
-    sleep 0.02
+    i=$((i+1)); [ "$i" -ge "$max" ] && break
+    sleep "${1:-0.32}"; [ "$#" -gt 0 ] && shift
   done
   printf '%s' "$t"
 }
@@ -842,16 +861,23 @@ lock_run() {
 
 # --- CLI (only when executed directly, not when sourced) --------------------
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  # Usage text goes to STDOUT: an explicit --help/-h is an answered question
+  # (stdout, exit 0); genuine usage errors redirect it to stderr at the call
+  # site and exit 96.
   _lock_usage() {
-    echo "usage: git-commit-lock.sh run -- <command...>" >&2
-    echo "   or: source git-commit-lock.sh; lock_acquire; <git...>; lock_release" >&2
-    echo "exit codes: the command's own, or 96 usage error / 97 lock timeout (command not run) / 98 lock stolen mid-hold (redo the work)" >&2
+    echo "usage: git-commit-lock.sh run -- <command...>"
+    echo "   or: source git-commit-lock.sh; lock_acquire; <git...>; lock_release"
+    echo "exit codes: the command's own, or 96 usage error / 97 lock timeout (command not run) / 98 lock stolen mid-hold (redo the work)"
   }
   cmd="${1:-}"; shift || true
   case "$cmd" in
+    --help|-h)
+      _lock_usage
+      exit 0
+      ;;
     run)
       [ "${1:-}" = "--" ] && shift
-      [ "$#" -gt 0 ] || { _lock_usage; exit 96; }
+      [ "$#" -gt 0 ] || { _lock_usage >&2; exit 96; }
       # Outside any git repo a defaulted lock would silently scope to the CWD
       # and serialise against NOBODY committing to a repo — refuse instead.
       if [ -z "$_LOCK_GITDIR" ] && [ "$_LOCK_PATH_EXPLICIT" = 0 ]; then
@@ -861,7 +887,7 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
       lock_run "$@"
       ;;
     *)
-      _lock_usage
+      _lock_usage >&2
       exit 96
       ;;
   esac
