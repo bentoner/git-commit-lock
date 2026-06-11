@@ -995,6 +995,161 @@ else
   ok "git-commit-lock.ps1 contains no File.Replace call"
 fi
 
+echo "== Test 16e: ps1 arc-end pass keeps INCONCLUSIVE entries; trap-time discovery-HOLD releases per normal release semantics (review wave, blocking 1+2) =="
+# Driven directly via a dot-sourcing pwsh driver — the ps1 side's
+# unit-equivalent steering mechanism (the lib skips its CLI when
+# dot-sourced). Part 1: the arc-end resolution pass's entry-drop is gated
+# on a CONCLUSIVE lock read (different readable token / definitively
+# absent); a lock PRESENT but unreadable (here: EMPTY — the same
+# classification Lock-ReadTok gives a sharing-violation open) must keep the
+# entry pending. Part 2: a trap-time discovery-HOLD (claim gone, our token
+# installed at the lock) releases through the normal release rules —
+# boundary re-read + bounded retries — and logs an honest RELEASED.
+DRV16E="$WORK/d16e.ps1"
+cat > "$DRV16E" <<'PSEOF'
+param([string]$Lib)
+$ErrorActionPreference = 'Stop'
+. $Lib
+$script:LockClaimPath = "$script:LockPath.next"
+# Part 1: arc-end three-way.
+$L = 'tok.ps.leak.16e.1'
+$script:LockLeaked = @($L)
+[System.IO.File]::WriteAllText($script:LockClaimPath, "tok.ps.rival.16e`npid=7 host=rival`n")
+[System.IO.File]::WriteAllText($script:LockPath, '')
+Lock-LeakedResolvePass
+if (-not (Lock-LeakedMember $L)) { exit 71 }      # inconclusive: must SURVIVE
+[System.IO.File]::WriteAllText($script:LockPath, "tok.ps.other.16e`npid=8 host=other`n")
+Lock-LeakedResolvePass
+if (Lock-LeakedMember $L) { exit 72 }             # conclusive: must DROP
+[System.IO.File]::Delete($script:LockClaimPath)
+[System.IO.File]::Delete($script:LockPath)
+# Part 2: trap-time discovery-HOLD, happy path.
+$T = 'tok.ps.trap.16e.2'
+$script:LockClaimToken = $T
+[System.IO.File]::WriteAllText($script:LockPath, "$T`npid=1 host=me`n")
+Lock-ClaimTrapCleanup
+if ([System.IO.File]::Exists($script:LockPath)) { exit 73 }   # must be released
+exit 0
+PSEOF
+LOCK="$WORK/ps16e.lock"; LOG="$WORK/ps16e.log"; : > "$LOG"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" \
+  pwsh -NoProfile -File "$DRV16E" -Lib "$PS1WIN" 2> "$WORK/ps16e.err"; rc=$?
+case "$rc" in
+  0)  ok "ps1 arc-end three-way + trap-time happy-path release behaved (driver rc 0)" ;;
+  71) bad "ps1 arc-end pass DROPPED an entry on an inconclusive (present-but-unreadable) lock read" ;;
+  72) bad "ps1 arc-end pass kept an entry despite a conclusive different-token lock read" ;;
+  73) bad "ps1 trap-time discovery-HOLD did not release the installed lock" ;;
+  *)  bad "ps1 16e driver rc=$rc (stderr: $(head -2 "$WORK/ps16e.err" 2>/dev/null | tr '\n' ' '))" ;;
+esac
+grep -q "DISCOVERY-HOLD.*tok=tok.ps.trap.16e.2" "$LOG" && ok "trap-time discovery-HOLD logged" \
+                                                       || bad "no trap-time DISCOVERY-HOLD log line"
+grep -q "RELEASED .*tok=tok.ps.trap.16e.2.*trap-time discovery-HOLD" "$LOG" \
+  && ok "honest RELEASED logged for the trap-time release" \
+  || bad "no trap-time RELEASED log line"
+grep -q "resolved tok=tok.ps.leak.16e.1" "$LOG" && ok "conclusive arc-end resolution logged" \
+                                                || bad "no arc-end resolution log line"
+rm -f "$LOCK" "$LOCK.next"
+# Part 3 (Windows-only): a BLOCKED delete at the trap-time release must log
+# the LEFTOVER warning, never a false RELEASED (needs a no-delete-share
+# handle; on POSIX open handles never block unlink).
+if [ "$GCL_WINDOWS" = 1 ]; then
+  DRV16E3="$WORK/d16e3.ps1"
+  cat > "$DRV16E3" <<'PSEOF'
+param([string]$Lib)
+$ErrorActionPreference = 'Stop'
+. $Lib
+$script:LockClaimPath = "$script:LockPath.next"
+$T = 'tok.ps.trap.16e.3'
+$script:LockClaimToken = $T
+Lock-ClaimTrapCleanup
+if (-not [System.IO.File]::Exists($script:LockPath)) { exit 71 }   # must be LEFT
+exit 0
+PSEOF
+  LOCK="$WORK/ps16e3.lock"; LOG="$WORK/ps16e3.log"; : > "$LOG"
+  printf '%s\n%s\n' "tok.ps.trap.16e.3" "pid=1 host=me" > "$LOCK"   # rival installed our claim
+  HR="$WORK/16e3.hready"; HG="$WORK/16e3.hgo"; rm -f "$HR" "$HG"
+  hold_handle "$LOCK" "$HR" "$HG" &
+  h16e3=$!
+  if wait_for "$HR"; then
+    AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" \
+      pwsh -NoProfile -File "$DRV16E3" -Lib "$PS1WIN" 2> "$WORK/ps16e3.err"; rc=$?
+    [ "$rc" = 0 ] && ok "blocked trap-time release left the lock in place (driver rc 0)" \
+                  || bad "ps1 16e blocked-release driver rc=$rc"
+    grep -q "trap-time release FAILED.*LEFTOVER.*tok=tok.ps.trap.16e.3" "$LOG" \
+      && ok "blocked delete logged the honest LEFTOVER warning" \
+      || bad "no trap-time LEFTOVER warning for the blocked delete"
+    grep -q "RELEASED .*tok=tok.ps.trap.16e.3" "$LOG" \
+      && bad "FALSE RELEASED logged despite the blocked delete" \
+      || ok "no false RELEASED on the blocked trap-time release"
+  else
+    bad "16e3 handle holder never signalled ready"
+  fi
+  touch "$HG"; wait "$h16e3" 2>/dev/null
+  rm -f "$LOCK" "$LOCK.next"
+else
+  echo "note: the blocked trap-time release leg is Windows-only by construction (POSIX open handles never block unlink); the happy-path leg above pins the honest-log contract"
+fi
+
+echo "== Test 16f: ps1 claim-gone-at-touch — the SetLastWriteTimeUtc FileNotFound gone signal fires; no resurrection (plan test 9's ps1 touch lane) =="
+# The unit suite's discovery-position matrix (T25) covers bash's
+# touch-gone lane; this is the ps1 counterpart: the claim passes the
+# step-3.1 recheck, vanishes before the step-3.2 touch (steered via the
+# overage probe between them), and the FileNotFoundException catch must
+# classify GONE — discovery read, no resurrection, ghost untouched. A
+# missed gone signal would instead fall through to the rename and log
+# "claim (source) gone at rename" (asserted absent).
+if [ "$GCL_WINDOWS" = 1 ]; then
+  DRV16F="$WORK/d16f.ps1"
+  cat > "$DRV16F" <<'PSEOF'
+param([string]$Lib)
+$ErrorActionPreference = 'Stop'
+. $Lib
+$script:LockClaimPath = "$script:LockPath.next"
+[System.IO.File]::WriteAllText($script:LockPath, "tok.ghost.16f`npid=9 host=ghost`n")
+[System.IO.File]::SetLastWriteTimeUtc($script:LockPath, [datetime]::UtcNow.AddSeconds(-9999))
+$T = Lock-NewToken
+if (-not (Lock-TryCreateFile -Path $script:LockClaimPath -Token $T)) { exit 70 }
+$script:LockClaimToken = $T
+# Steer: the overage probe (Lock-StatMtime on the claim, called BETWEEN the
+# recheck and the touch) deletes the claim - present at the recheck, gone
+# at the touch.
+function script:Lock-StatMtime([string]$Path) {
+    if ($Path -eq $script:LockClaimPath) {
+        try { [System.IO.File]::Delete($Path) } catch { }
+    }
+    return $null
+}
+$r = Lock-StealInstall $T
+if ($r) { exit 71 }                                               # no hold possible
+if ([System.IO.File]::Exists($script:LockClaimPath)) { exit 72 }  # no resurrection
+$fs = [System.IO.File]::Open($script:LockPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+try { $sr = New-Object System.IO.StreamReader($fs); $l1 = $sr.ReadLine() } finally { $fs.Dispose() }
+if ($l1.TrimEnd() -ne 'tok.ghost.16f') { exit 73 }                # ghost untouched
+exit 0
+PSEOF
+  LOCK="$WORK/ps16f.lock"; LOG="$WORK/ps16f.log"; : > "$LOG"
+  AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" \
+    pwsh -NoProfile -File "$DRV16F" -Lib "$PS1WIN" 2> "$WORK/ps16f.err"; rc=$?
+  case "$rc" in
+    0)  ok "ps1 touch-gone lane: no hold, no resurrection, ghost untouched (driver rc 0)" ;;
+    70) bad "16f setup: claim create failed" ;;
+    71) bad "16f: a hold was taken despite the vanished claim" ;;
+    72) bad "16f: the touch RESURRECTED the vanished claim (creating touch!)" ;;
+    73) bad "16f: the ghost lock was modified" ;;
+    *)  bad "ps1 16f driver rc=$rc (stderr: $(head -2 "$WORK/ps16f.err" 2>/dev/null | tr '\n' ' '))" ;;
+  esac
+  grep -q "claim gone at touch" "$LOG" && ok "the FileNotFound gone signal classified the touch-gone lane" \
+                                       || bad "no 'claim gone at touch' log line — the gone signal did not fire"
+  grep -q "claim (source) gone at rename" "$LOG" \
+    && bad "the gone signal was MISSED (caught only by the rename's src-gone fallback)" \
+    || ok "the rename's src-gone fallback never had to fire"
+  grep -q "STOLE-BY-CLAIM" "$LOG" && bad "16f: a steal completed despite the vanished claim" \
+                                  || ok "16f: no steal install on the vanished claim"
+  rm -f "$LOCK" "$LOCK.next"
+else
+  echo "== Test 16f SKIPPED: claim-gone-at-touch steering uses Windows pwsh (POSIX legs cover the protocol via the bash matrix; the ps1 gone-catch is probed Q1) =="
+fi
+
 if command -v powershell >/dev/null 2>&1; then
 echo "== Test 17: Windows PowerShell 5.1 smoke lane — the ps1 must run, not just parse, on the in-box engine =="
 # Everything above runs the port under pwsh (7+). 5.1 ships in every Windows

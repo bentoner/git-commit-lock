@@ -1343,12 +1343,17 @@ echo "== Test 29: BLOCKED steal rename — claim deleted IMMEDIATELY, no CLAIM_S
 # The rename is forced to fail-with-the-lock-still-present (a shadowed mv —
 # the no-delete-share squat, deterministically). The claimant must delete its
 # own claim at once and re-poll: with CLAIM_STALE=600, a leftover claim would
-# block every later attempt (exactly one CLAIM line); immediate deletion
-# yields a fresh CLAIM line per attempt.
+# block every later attempt (exactly one CLAIM line — which is what kills a
+# leftover-claim implementation below); immediate deletion yields a fresh
+# CLAIM line per attempt. MAX_WAIT=6 (not 3) is timing HEADROOM for the
+# >=2-CLAIM-lines discriminator under machine load — at 0.2s polls a loaded
+# box could otherwise fit only one attempt before the timeout (flaked in
+# review runs); the discriminator is unaffected (a leftover claim blocks
+# attempt 2 however long the window is).
 LOCK="$WORK/blocked.lock"; LOG="$WORK/blocked.log"; : > "$LOG"
 fabricate_lock "$LOCK" "tok.ghost.t29" "pid=9 host=ghost"; backdate "$LOCK" 9999
 AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
-  AGENT_LOCK_CLAIM_STALE_SECS=600 AGENT_LOCK_POLL_SECS=0.2 AGENT_LOCK_MAX_WAIT=3 \
+  AGENT_LOCK_CLAIM_STALE_SECS=600 AGENT_LOCK_POLL_SECS=0.2 AGENT_LOCK_MAX_WAIT=6 \
   bash -c '
     source "$1" || exit 70
     mv() { case "$*" in *".next"*) return 1;; esac; command mv "$@"; }
@@ -1637,8 +1642,11 @@ AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
   bash -c "$T33_INNER" _ "$LIB" 2>/dev/null &
 w33=$!
 wait_for_file "$T33R" 30 || bad "T33a claimant never reached its claim touch"
-kill -TERM "$w33" 2>/dev/null
-sleep 0.1
+# ONE TERM only (review wave, finding 5): a second TERM can re-enter the
+# handler mid-deletion and abandon the cleanup (the on-disk outcome is then
+# the documented best-effort case, but it flakes the no-leftover
+# discriminator below — observed once under load). A single TERM keeps the
+# discriminator sharp: the trap MUST delete the claim.
 kill -TERM "$w33" 2>/dev/null
 touch "$T33G"
 wait "$w33"; rc=$?
@@ -1751,8 +1759,9 @@ w34=$!
 wait_for_file "$READY" 30 || bad "T34 steal-holder never signalled ready"
 grep -q "STOLE-BY-CLAIM" "$LOG" && ok "the hold under TERM test is steal-acquired (STOLE-BY-CLAIM)" \
                                 || bad "holder did not acquire via steal — parity test vacuous"
-kill -TERM "$w34" 2>/dev/null
-sleep 0.1
+# ONE TERM only (same rationale as T33a): a second TERM can re-enter the
+# handler mid-lock_release and abandon the unlink, flaking the
+# released-on-TERM discriminator.
 kill -TERM "$w34" 2>/dev/null
 touch "$GO34"
 wait "$w34"; rc=$?
@@ -1853,6 +1862,65 @@ esac
 grep -q "RELEASE-CLEANED-LEAKED-CLAIM" "$LOG" && bad "boundary variant wrongly logged a leaked-claim cleanup" \
                                               || ok "no cleanup line when the re-read backed off"
 rm -f "$LOCK" "$LOCK.next" "$WORK/t35b.succ"
+
+echo "== Test 36: arc-end resolution pass — an INCONCLUSIVE lock read keeps the entry pending; conclusive ones drop it (review wave, blocking-1) =="
+# The pass's entry-drop is gated on one lock-path read. That read resolves
+# the entry ONLY when it is conclusive: a DIFFERENT readable token, or the
+# path definitively absent. A lock PRESENT but unreadable/empty proves
+# nothing — the leaked token may be installed under it — so the entry must
+# SURVIVE, and a later acquire must still be able to adopt the token.
+# Driven directly: the harness manufactures the memory state and calls the
+# pass; "unreadable" is an EMPTY lock file (the read ladder's blank-read
+# lane — the same classification a sharing-violation open takes).
+LOCK="$WORK/arcend.lock"; LOG="$WORK/arcend.log"; : > "$LOG"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=300 \
+  AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=10 \
+  bash -c '
+    source "$1" || exit 70
+    _LOCK_CLAIM_PATH="$AGENT_LOCK_PATH.next"
+    # (1) INCONCLUSIVE: claim observation foreign, lock present-but-EMPTY.
+    L="tok.leak.t36.1.1"
+    _LOCK_LEAKED="$L"
+    printf "%s\n%s\n" "tok.rival.t36" "pid=7 host=rival" > "$_LOCK_CLAIM_PATH"
+    : > "$AGENT_LOCK_PATH"
+    _lock_leaked_resolve_pass
+    case " $_LOCK_LEAKED " in *" $L "*) ;; *) exit 71;; esac   # must SURVIVE
+    # ...and a later poll/acquire still adopts: the unreadable lock turns
+    # out to be our installed leak (content lands), and lock_acquire adopts
+    # it via the leaked-token memory (then releases rc 0).
+    printf "%s\n%s\n" "$L" "pid=1 host=leak" > "$AGENT_LOCK_PATH"
+    command rm -f -- "$_LOCK_CLAIM_PATH"
+    lock_acquire || exit 72
+    lock_release || exit 73
+    # (2) CONCLUSIVE different token at the lock -> the entry must DROP.
+    L2="tok.leak.t36.2.2"
+    _LOCK_LEAKED="$L2"
+    printf "%s\n%s\n" "tok.rival.t36" "pid=7 host=rival" > "$_LOCK_CLAIM_PATH"
+    printf "%s\n%s\n" "tok.other.t36" "pid=8 host=other" > "$AGENT_LOCK_PATH"
+    _lock_leaked_resolve_pass
+    case " $_LOCK_LEAKED " in *" $L2 "*) exit 74;; esac        # must DROP
+    # (3) CONCLUSIVE definitively-absent lock (claim gone too) -> DROP.
+    L3="tok.leak.t36.3.3"
+    _LOCK_LEAKED="$L3"
+    command rm -f -- "$_LOCK_CLAIM_PATH" "$AGENT_LOCK_PATH"
+    _lock_leaked_resolve_pass
+    case " $_LOCK_LEAKED " in *" $L3 "*) exit 75;; esac        # must DROP
+    exit 0
+  ' _ "$LIB" 2>/dev/null; rc=$?
+case "$rc" in
+  0)  ok "inconclusive lock read kept the entry; conclusive reads (different token / absent) dropped theirs" ;;
+  71) bad "entry DROPPED on an inconclusive (present-but-unreadable) lock read — an installed leak would go unwatched" ;;
+  72) bad "later acquire failed to adopt the kept entry's installed token (entry lost?)" ;;
+  73) bad "release after the adoption failed" ;;
+  74) bad "entry kept despite a conclusive different-token lock read" ;;
+  75) bad "entry kept despite a definitively absent lock path" ;;
+  *)  bad "arc-end three-way harness rc=$rc" ;;
+esac
+grep -q "DISCOVERY-HOLD (leaked-token memory)" "$LOG" && ok "the surviving entry was adopted by the later acquire" \
+                                                      || bad "no leaked-memory adoption after the inconclusive keep"
+grep -q "resolved tok=tok.leak.t36.2" "$LOG" && ok "conclusive resolution logged for the dropped entry" \
+                                             || bad "no resolution log line for the conclusive drop"
+rm -f "$LOCK" "$LOCK.next"
 
 # NOTES (deliberately untested here):
 # * lock_release's LEFTOVER lane (the unlink blocked persistently) needs a

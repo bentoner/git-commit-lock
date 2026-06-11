@@ -457,3 +457,113 @@ Cross-checks: all internal anchors resolve against the (unchanged)
 headings; no new line exceeds ~78 cols (remaining long lines are
 pre-existing code/table/URL lines); the docs' numbers verified against the
 code defaults (60/300/420; exit 96/97/98).
+
+## Phase 5 — round-1 implementation review fix wave (2026-06-12)
+
+Round-1 implementation review (fresh Claude + Codex): 3 blocking + 5
+non-blocking findings, all dispositions approved. What changed:
+
+### Blocking 1 — arc-end resolution pass dropped entries on an
+INCONCLUSIVE lock read
+
+The entry-drop in the arc-end pass was gated on `lock-line-1 != token`,
+which conflated "different token / definitively absent" (conclusive:
+drop is sound) with "present but unreadable/empty" (inconclusive: the
+leaked token may be installed UNDER the unreadable lock — dropping
+orphans it unwatched). Fix: a three-way lock read in both impls —
+- bash: new `_lock_leaked_lock_resolved` (empty read + explicit
+  existence check separates gone from unreadable, following the file's
+  empty-read conventions); used by `_lock_leaked_resolve_pass` (both
+  branches) AND by the same-gate site in `_lock_claim_stale_check`
+  (same defect class, same fix).
+- ps1: new `Lock-LeakedLockResolved` riding `Lock-ReadTok`'s existing
+  ok/gone/unreadable status; used by `Lock-LeakedResolvePass` (both
+  branches) and `Lock-ClaimStaleCheck`.
+- Headers updated: the leaked-token-memory rule now states the
+  conclusiveness requirement for the entry-drop lock read.
+- Tests: unit **Test 36** (inconclusive-keep via an EMPTY lock — the
+  same classification a sharing-violation read takes — then a later
+  acquire ADOPTS the kept entry and releases rc 0; plus
+  drop-on-different-token and drop-on-definitively-absent legs; kills
+  the pre-fix implementation via the adoption leg, which times out when
+  the entry was dropped). Interop **Test 16e part 1** is the ps1
+  mirror (keep + drop), driven by a dot-sourcing pwsh driver — the ps1
+  side's unit-equivalent steering mechanism, first used here.
+- Empirically demonstrated pre-commit (probe + suite): inconclusive
+  read keeps the entry, the later poll adopts it, release rc 0.
+
+### Blocking 2 — ps1 trap-time discovery-HOLD released with one blind
+delete + unconditional RELEASED
+
+`Lock-ClaimTrapCleanup`'s discovery-HOLD branch did a 1-try boundary
+read, a single unguarded `File.Delete`, and then logged `RELEASED`
+unconditionally — a blocked delete produced a false RELEASED and no
+LEFTOVER warning (bash routes the same lane through full
+`lock_release`). Fix: the inline release now mirrors the normal release
+path with .NET-only primitives (the unwind constraint stands): full-
+ladder boundary re-read; ours -> bounded 5x20ms delete retries, honest
+`RELEASED` only when the path is actually free, else the LEFTOVER
+warning (log + stderr); boundary `unreadable` -> ownership-unverifiable
+warning, file left; gone/foreign -> displaced note, path left to the
+successor (no 98 verdict — the unwind has no caller to return one to).
+Tests: interop **Test 16e part 2** (happy path: honest RELEASED) and
+**part 3** (Windows-only: a no-delete-share handle on the lock ->
+LEFTOVER warning asserted present, RELEASED asserted ABSENT;
+skip-with-note on POSIX where handles never block unlink). There was no
+pre-existing ps1 leg pinning this lane (unit T33/T34 are bash-only).
+
+### Blocking 3 — docs overclaimed "the recovering waiter keeps the lock"
+
+README "How it works" and the docs golden-rule recovery paragraph now
+carry the 5.1 fairness-loss caveat the port section already described
+(unlink-then-move window; a rival create can win the recovered path;
+the claimant backs off cleanly — never a clobber). README clause kept
+lighter than the doc's, per the disposition.
+
+### Non-blocking
+
+4. **T29 timing headroom**: `MAX_WAIT` 3 -> 6 (POLL stays 0.2). The
+   >=2-CLAIM-lines discriminator had zero margin under load (flaked in
+   review runs). Discriminator verified intact: a leftover-claim
+   implementation still logs exactly ONE claim line (the leftover
+   blocks every later attempt regardless of window length) and fails
+   the `-ge 2` assertion.
+5. **T33a double-TERM flake**: single TERM now (the second TERM could
+   re-enter the handler mid-deletion and abandon cleanup — on-disk
+   outcome documented-best-effort, but it flaked the no-leftover
+   discriminator). Chose single-TERM over accept-either-outcome to keep
+   the discriminator sharp. Applied to **T34** too (same hazard on its
+   released-on-TERM discriminator: a re-entrant handler can abandon
+   lock_release's unlink). T33b/T33c keep their double TERM — their
+   assertions (foreign claim survives / claim left behind) are
+   insensitive to re-entry.
+6. **ps1 touch-gone leg**: interop **Test 16f** (Windows,
+   skip-with-note elsewhere) steers claim-gone-at-touch for a ps1
+   claimant via the dot-source driver (the overage probe between the
+   step-3.1 recheck and the step-3.2 touch deletes the claim): asserts
+   the FileNotFound gone signal fires ("claim gone at touch" logged),
+   the rename's src-gone fallback did NOT have to catch it, no
+   resurrection, ghost untouched, no hold. Note: the lane's log line is
+   "claim gone at touch ...; discovery read" (per the spec/bash
+   parity), not a CLAIM-ABORT enum line — the finding's "CLAIM-ABORT
+   logged" wording was loose; asserted the real line.
+7. **ENOSPC mid-create residual**: one header line in BOTH impls next
+   to the mid-create-signal micro-exception (bash trap-time rule
+   paragraph; ps1 trap-equivalent bullet): a create failing after line
+   1 reached disk leaves an own-token claim the process doesn't know it
+   wrote — same bounded residual-5 class.
+
+### Verification (this wave; counts read back from the logs)
+
+- Unit FULL (`GCL_TEST_FULL=1`): **213 passed, 0 failed**, exit 0
+  (`.agent-testing/unit-full-fixwave1.log`; 210 before + Test 36's 3).
+- Interop REDUCED: **141 passed, 0 failed**, exit 0
+  (`.agent-testing/interop-reduced-fixwave1.log`; 130 before + 16e's 7
+  incl. the Windows blocked-release leg + 16f's 4 — all RAN, none
+  skipped, on this Windows box).
+- `shellcheck -S info` clean on git-commit-lock.sh + both suites;
+  `Invoke-ScriptAnalyzer -Severity Warning,Error` clean on the ps1;
+  ps1 parse-checked on pwsh 7 AND 5.1; ASCII-only re-verified.
+- Integration suite NOT run: nothing it exercises changed (the fixes
+  are anomaly-lane semantics, tests, headers and docs; the protocol's
+  happy paths are untouched).

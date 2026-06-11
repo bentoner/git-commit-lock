@@ -464,7 +464,12 @@ serializes exactly this: stealers must first win the claim file, the
 claimant re-verifies that the lock is *still* stale while holding the
 claim, and the install is one atomic rename-over — so the recovering
 waiter keeps the lock it recovered, and a straggler finds either a rival's
-claim (it waits) or a fresh lock (it aborts). The narrow residual
+claim (it waits) or a fresh lock (it aborts). (One engine caveat: the
+Windows PowerShell 5.1 lane installs by unlink-then-move rather than one
+atomic rename, so a rival's create can win the recovered path inside that
+window and the claimant backs off cleanly — the fairness loss described in
+[the PowerShell port](#the-powershell-port-git-commit-lockps1), never a
+clobber.) The narrow residual
 interleavings that remain (e.g. a live-slow holder releasing in the
 instant between the claimant's final re-verify and its rename, with a
 waiter's create landing in that same instant — the implementation headers

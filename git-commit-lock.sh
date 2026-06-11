@@ -150,9 +150,12 @@
 #   release classifies as the stolen-mid-hold 98 (our actual hold WAS
 #   displaced). Entries drop only on verifiable resolution (adoption, a
 #   verified unlink, or a gone/foreign claim observation followed by one
-#   lock read); release and the 97 exit run one best-effort resolution pass
-#   over pending entries; entries still pending when the arc ends are
-#   residual-5 class (see KNOWN RESIDUAL RACES).
+#   lock read — and that lock read must be CONCLUSIVE: a different readable
+#   token or a definitively absent path; our token there, or a lock present
+#   but unreadable/empty, keeps the entry pending); release and the 97 exit
+#   run one best-effort resolution pass over pending entries; entries still
+#   pending when the arc ends are residual-5 class (see KNOWN RESIDUAL
+#   RACES).
 #
 #   TRAP-TIME CLAIM CLEANUP (global rule; best-effort): the EXIT/INT/TERM
 #   handlers are installed at acquire START (not at hold) and carry a
@@ -166,7 +169,10 @@
 #   runs lock-release semantics (98) on a mere claim — a claim is not a
 #   hold. A signal landing mid-claim-create can leave an empty/torn claim
 #   the token-checked deletion correctly refuses: it ages out <=
-#   CLAIM_STALE (a steals-only delay).
+#   CLAIM_STALE (a steals-only delay). Same class: a claim create failing
+#   AFTER line 1 reached disk (e.g. ENOSPC mid-write) leaves an own-token
+#   claim the process doesn't know it wrote — the same bounded residual-5
+#   outcome if a rival's rename ever installs it.
 #
 #   PER-ATTEMPT TOKENS (global rule): a fresh token is generated for EVERY
 #   create and claim attempt — never once per acquire. The winning attempt's
@@ -707,17 +713,42 @@ _lock_leaked_drop() {  # $1 = token
   done
   _LOCK_LEAKED="$out"
 }
+# Is leaked token $1 verifiably RESOLVED at the lock path? Used after the
+# claim-side resolution (a verified unlink, or a gone/foreign observation)
+# to decide whether the entry may DROP. Three-way, because _lock_read_tok
+# returns empty for BOTH "gone" and "present-but-unreadable/empty" — the
+# existence check after an empty read is what separates them:
+#   * a DIFFERENT readable token, or the path definitively absent -> the
+#     leaked token sits at NEITHER path and can never reappear: resolved
+#     (rc 0, the caller drops the entry);
+#   * OUR token there -> installed by a rival's rename: NOT resolved (the
+#     entry stays pending; the owner's next acquire can adopt it);
+#   * present but unreadable/empty after the read -> INCONCLUSIVE: the read
+#     proves nothing about whose token is installed, so the entry MUST stay
+#     pending (dropping here could orphan an installed own-token lock with
+#     nothing left watching for it).
+_lock_leaked_lock_resolved() {  # $1 = leaked token -> 0 iff resolved
+  local lk; lk="$(_lock_read_tok "$AGENT_LOCK_PATH" 1)"
+  if [ -n "$lk" ]; then
+    [ "$lk" != "$1" ]
+    return
+  fi
+  ! [ -e "$AGENT_LOCK_PATH" ] && ! [ -L "$AGENT_LOCK_PATH" ]
+}
+
 # Arc-end best-effort resolution pass (run at release and at the 97 exit):
 # for each pending entry, one token-checked look at the CLAIM file — the
 # blocking handle may have closed by now. A verified unlink, or a
 # gone/foreign observation, resolves the entry — each followed by one
 # lock-path line-1 read before the drop (gone-from-.next may mean
 # installed-at-lock; an entry whose token sits at the LOCK path stays
-# pending: the owner's next acquire can adopt it). Any failure leaves the
-# entry pending — no waiting, no retry loops.
+# pending: the owner's next acquire can adopt it; a lock that is present
+# but unreadable at that read is INCONCLUSIVE and also keeps the entry —
+# see _lock_leaked_lock_resolved). Any failure leaves the entry pending —
+# no waiting, no retry loops.
 _lock_leaked_resolve_pass() {
   [ -n "$_LOCK_LEAKED" ] || return 0
-  local t ct lk
+  local t ct
   # shellcheck disable=SC2086  # deliberate word-split of the token list
   for t in $_LOCK_LEAKED; do
     ct="$(_lock_read_tok "$_LOCK_CLAIM_PATH" 1)"
@@ -725,23 +756,23 @@ _lock_leaked_resolve_pass() {
       # Still ours at the claim path: try the unlink (token-checked, single
       # best-effort attempt).
       if rm -f -- "$_LOCK_CLAIM_PATH" 2>/dev/null && ! [ -e "$_LOCK_CLAIM_PATH" ]; then
-        lk="$(_lock_read_tok "$AGENT_LOCK_PATH" 1)"
-        if [ "$lk" != "$t" ]; then
+        if _lock_leaked_lock_resolved "$t"; then
           _lock_leaked_drop "$t"
           _lock_log "leaked-token memory: resolved tok=$t (claim unlinked at arc end)"
         fi
       fi
     elif [ -n "$ct" ] || { ! [ -e "$_LOCK_CLAIM_PATH" ] && ! [ -L "$_LOCK_CLAIM_PATH" ]; }; then
       # Foreign-tokened, or verifiably gone: the leak is resolved UNLESS the
-      # token was installed at the lock path meanwhile.
-      lk="$(_lock_read_tok "$AGENT_LOCK_PATH" 1)"
-      if [ "$lk" != "$t" ]; then
+      # token was installed at the lock path meanwhile, or the lock read is
+      # inconclusive (present but unreadable).
+      if _lock_leaked_lock_resolved "$t"; then
         _lock_leaked_drop "$t"
         _lock_log "leaked-token memory: resolved tok=$t (claim gone/foreign at arc end)"
       fi
     fi
-    # present-but-empty/unreadable, blocked unlink, or token-at-lock: leave
-    # the entry pending (residual-5 class once the process exits).
+    # present-but-empty/unreadable claim, blocked unlink, token-at-lock, or
+    # an inconclusive lock read: leave the entry pending (residual-5 class
+    # once the process exits).
   done
 }
 
@@ -1196,7 +1227,7 @@ _lock_steal_install() {  # $1 = this claim attempt's token
 # successful clear logs CLAIM-STALE-CLEARED; the next poll re-races the
 # claim create. A young claim means a live steal is in progress: just wait.
 _lock_claim_stale_check() {
-  local cm cage l1="" rdrc=0 shaped=0 lk
+  local cm cage l1="" rdrc=0 shaped=0
   cm="$(_lock_stat_mtime "$_LOCK_CLAIM_PATH")"
   [ -n "$cm" ] || return 0                          # vanished/unreadable mtime: re-poll
   [ "$cm" -gt 946684800 ] 2>/dev/null || return 0   # sub-floor: unsettled, never clear
@@ -1223,10 +1254,11 @@ _lock_claim_stale_check() {
     _lock_log "CLAIM-STALE-CLEARED $_LOCK_CLAIM_PATH age=${cage}s tok=${l1:-<empty>}"
     # If the cleared token was one of OUR leaked entries, this unlink is a
     # verified resolution — gated on one lock-path read (a rival's rename
-    # can slip into our read->unlink gap and install it).
+    # can slip into our read->unlink gap and install it; an INCONCLUSIVE
+    # read — lock present but unreadable — also keeps the entry, see
+    # _lock_leaked_lock_resolved).
     if [ -n "$l1" ] && _lock_leaked_member "$l1"; then
-      lk="$(_lock_read_tok "$AGENT_LOCK_PATH" 1)"
-      if [ "$lk" != "$l1" ]; then
+      if _lock_leaked_lock_resolved "$l1"; then
         _lock_leaked_drop "$l1"
         _lock_log "leaked-token memory: resolved tok=$l1 (stale claim cleared)"
       fi

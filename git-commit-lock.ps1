@@ -130,14 +130,19 @@
 #     executes finally blocks on Ctrl+C/pipeline-stop and on terminating
 #     errors, the engine's nearest "trappable exit" - which runs the
 #     token-checked claim deletion (one bounded retry) + the final discovery
-#     read, releasing a discovery-HOLD inline (no 98 semantics on a mere
-#     claim; a hard kill is the untrappable lane, residual 5); and (b) the
+#     read, releasing a discovery-HOLD inline per the NORMAL release rules
+#     (boundary re-read, bounded delete retries, honest LEFTOVER warning -
+#     never a false RELEASED; no 98 semantics on a mere claim; a hard kill
+#     is the untrappable lane, residual 5); and (b) the
 #     existing best-effort PowerShell.Exiting backstop for a HELD lock
 #     (registered by the shared take-hold helper, so steal- and
 #     discovery-acquired holds get it exactly like create-acquired ones).
 #     The cleanup path sticks to .NET primitives ([Threading.Thread]::Sleep,
 #     [IO.File]) because cmdlet invocation inside a stopping pipeline's
-#     finally can throw PipelineStoppedException.
+#     finally can throw PipelineStoppedException. Same residual-5 class as a
+#     mid-create signal (see the bash header's trap-time rule): a claim
+#     create failing AFTER line 1 reached disk (e.g. ENOSPC mid-write)
+#     leaves an own-token claim the process doesn't know it wrote.
 #   * Future option, this side only (recorded per the plan; NOT implemented):
 #     handle-based ops (open with delete sharing, fstat the mtime / read the
 #     token / delete via FILE_DISPOSITION on that one handle) could close the
@@ -740,14 +745,34 @@ function script:Lock-LeakedDrop([string]$Token) {
     Set-StrictMode -Off
     $script:LockLeaked = @(@($script:LockLeaked) | Where-Object { $_ -ne $Token })
 }
+# Is the leaked token verifiably RESOLVED at the lock path? Used after the
+# claim-side resolution (a verified unlink, or a gone/foreign observation)
+# to decide whether the entry may DROP. Three-way (mirrors bash's
+# _lock_leaked_lock_resolved, riding Lock-ReadTok's status):
+#   * 'ok' with a DIFFERENT token, or 'gone' -> the leaked token sits at
+#     NEITHER path and can never reappear: resolved ($true, caller drops);
+#   * 'ok' with OUR token -> installed by a rival's rename: NOT resolved
+#     (pending; the owner's next acquire can adopt it);
+#   * 'unreadable' (present but no token after the read) -> INCONCLUSIVE:
+#     the read proves nothing about whose token is installed, so the entry
+#     MUST stay pending (dropping here could orphan an installed own-token
+#     lock with nothing left watching for it).
+function script:Lock-LeakedLockResolved([string]$Token) {
+    Set-StrictMode -Off
+    $lk = script:Lock-ReadTok -Path $script:LockPath -MaxTries 1
+    if ($lk.Status -eq 'ok' -and $lk.Token) { return ($lk.Token -ne $Token) }
+    return ($lk.Status -eq 'gone')
+}
 # Arc-end best-effort resolution pass (run at release, at the 97 exit, and in
 # the acquire cleanup's no-hold path): for each pending entry, one
 # token-checked look at the CLAIM file - the blocking handle may have closed
 # by now. A verified unlink, or a gone/foreign observation, resolves the
 # entry - each followed by one lock-path line-1 read before the drop
 # (gone-from-.next may mean installed-at-lock; an entry whose token sits at
-# the LOCK path stays pending: the owner's next acquire can adopt it). Any
-# failure leaves the entry pending - no waiting, no retry loops.
+# the LOCK path stays pending: the owner's next acquire can adopt it; a lock
+# present but unreadable at that read is INCONCLUSIVE and also keeps the
+# entry - see Lock-LeakedLockResolved). Any failure leaves the entry pending
+# - no waiting, no retry loops.
 function script:Lock-LeakedResolvePass {
     Set-StrictMode -Off
     if (@($script:LockLeaked).Count -eq 0) { return }
@@ -759,23 +784,23 @@ function script:Lock-LeakedResolvePass {
             $gone = $false
             try { [System.IO.File]::Delete($script:LockClaimPath); $gone = $true } catch { $gone = $false }
             if ($gone -and $null -eq (script:Lock-GetItemAt $script:LockClaimPath)) {
-                $lk = script:Lock-ReadTok -Path $script:LockPath -MaxTries 1
-                if (-not ($lk.Status -eq 'ok' -and $lk.Token -eq $t)) {
+                if (script:Lock-LeakedLockResolved $t) {
                     script:Lock-LeakedDrop $t
                     script:Lock-Log "leaked-token memory: resolved tok=$t (claim unlinked at arc end)"
                 }
             }
         } elseif (($cr.Status -eq 'ok' -and $cr.Token) -or ($cr.Status -eq 'gone' -and $null -eq (script:Lock-GetItemAt $script:LockClaimPath))) {
             # Foreign-tokened, or verifiably gone: the leak is resolved UNLESS
-            # the token was installed at the lock path meanwhile.
-            $lk = script:Lock-ReadTok -Path $script:LockPath -MaxTries 1
-            if (-not ($lk.Status -eq 'ok' -and $lk.Token -eq $t)) {
+            # the token was installed at the lock path meanwhile, or the lock
+            # read is inconclusive (present but unreadable).
+            if (script:Lock-LeakedLockResolved $t) {
                 script:Lock-LeakedDrop $t
                 script:Lock-Log "leaked-token memory: resolved tok=$t (claim gone/foreign at arc end)"
             }
         }
-        # present-but-empty/unreadable, blocked unlink, or token-at-lock:
-        # leave the entry pending (residual-5 class once the process exits).
+        # present-but-empty/unreadable claim, blocked unlink, token-at-lock,
+        # or an inconclusive lock read: leave the entry pending (residual-5
+        # class once the process exits).
     }
 }
 
@@ -1190,10 +1215,11 @@ function script:Lock-ClaimStaleCheck {
         script:Lock-Log "CLAIM-STALE-CLEARED $script:LockClaimPath age=${cage}s tok=$disp"
         # If the cleared token was one of OUR leaked entries, this unlink is
         # a verified resolution - gated on one lock-path read (a rival's
-        # rename can slip into our read->unlink gap and install it).
+        # rename can slip into our read->unlink gap and install it; an
+        # INCONCLUSIVE read - lock present but unreadable - also keeps the
+        # entry, see Lock-LeakedLockResolved).
         if ($l1 -and (script:Lock-LeakedMember $l1)) {
-            $lk = script:Lock-ReadTok -Path $script:LockPath -MaxTries 1
-            if (-not ($lk.Status -eq 'ok' -and $lk.Token -eq $l1)) {
+            if (script:Lock-LeakedLockResolved $l1) {
                 script:Lock-LeakedDrop $l1
                 script:Lock-Log "leaked-token memory: resolved tok=$l1 (stale claim cleared)"
             }
@@ -1207,11 +1233,14 @@ function script:Lock-ClaimStaleCheck {
 # equivalent of a trappable exit; a hard kill is the untrappable lane,
 # residual 5). Token-checked deletion with ONE bounded retry (an exiting
 # cleanup cannot wait out a blockage), then the final discovery read; a
-# discovery-HOLD here is released inline per normal trap semantics (the
+# discovery-HOLD here is released inline per NORMAL release semantics (the
 # caller's try/finally never sees the hold, so nobody else would release
-# it). NO lock-release semantics (98) ever run on a mere claim. .NET-only
-# primitives where possible: cmdlet invocation inside a stopping pipeline's
-# finally can throw PipelineStoppedException.
+# it) - mirroring bash, where the trap routes a discovery-HOLD through full
+# lock_release: boundary re-read immediately before the unlink, bounded
+# delete retries, and an honest LEFTOVER warning when the delete stays
+# blocked - never a false RELEASED. NO lock-release semantics (98) ever run
+# on a mere claim. .NET-only primitives where possible: cmdlet invocation
+# inside a stopping pipeline's finally can throw PipelineStoppedException.
 function script:Lock-ClaimTrapCleanup {
     Set-StrictMode -Off
     if (-not $script:LockClaimToken) { return }
@@ -1223,15 +1252,44 @@ function script:Lock-ClaimTrapCleanup {
     }
     # Final discovery read - inline, WITHOUT Lock-TakeHold (no backstop
     # registration mid-unwind): our token at the lock means a rival installed
-    # our claim; release it right here (token-checked delete + log).
+    # our claim; release it right here, per the normal release path's rules.
     $rb = script:Lock-ReadTok -Path $script:LockPath -MaxTries 8
     if ($rb.Status -eq 'ok' -and $rb.Token -eq $tok) {
         script:Lock-Log "DISCOVERY-HOLD: our claim (tok=$tok) was installed at the lock path by a rival's rename - taking the hold"
-        $re = script:Lock-ReadTok -Path $script:LockPath -MaxTries 1
+        # Boundary re-read immediately before the unlink (full ladder, the
+        # same width as Lock-Release's - same verdicts from the same
+        # evidence).
+        $re = script:Lock-ReadTok -Path $script:LockPath -MaxTries 8
         if ($re.Status -eq 'ok' -and $re.Token -eq $tok) {
-            try { [System.IO.File]::Delete($script:LockPath) } catch { }
+            # Still ours: unlink with the ours-path bounded retry; on
+            # persistent failure warn LEFTOVER honestly instead of logging a
+            # release that did not happen.
+            $deleted = $false
+            for ($i = 0; $i -lt 5; $i++) {
+                try { [System.IO.File]::Delete($script:LockPath); $deleted = $true; break }
+                catch { [System.Threading.Thread]::Sleep(20) }
+            }
+            if (-not $deleted -and $null -ne (script:Lock-GetItemAt $script:LockPath)) {
+                script:Lock-Log "WARNING: trap-time release FAILED - could not delete the discovery-HOLD lock after 5 attempts; LEFTOVER (tok=$tok). Waiters are blocked until the $($script:LockStale)s stale window elapses AND the blocking handle closes."
+                [Console]::Error.WriteLine("git-commit-lock: WARNING - could not remove the lock file ($script:LockPath) during acquire unwind; it is left behind and will block waiters until the $($script:LockStale)s stale window expires and whatever holds it open lets go")
+            } else {
+                # Deleted - or vanished while the delete kept failing, which
+                # is equally released (File.Delete's silent-on-missing lane).
+                script:Lock-Log "RELEASED ($script:LockMe tok=$tok) (trap-time discovery-HOLD released during acquire unwind)"
+            }
+        } elseif ($re.Status -eq 'unreadable') {
+            # Present but unreadable/empty at the boundary: ownership
+            # unverifiable - never delete what might be a successor's nascent
+            # lock; leave it (the staleness backstop recovers a true orphan).
+            script:Lock-Log "WARNING: trap-time discovery-HOLD lock present but EMPTY/unreadable at the boundary re-read; ownership unverifiable - leaving it in place. (tok=$tok)"
+        } else {
+            # Gone, or a foreign token: displaced between the discovery read
+            # and the boundary re-read - a successor owns the path now; do
+            # not touch it. (No 98 verdict surfaces here: the unwind has no
+            # caller to return one to; the displacement is the successor's
+            # detected lane.)
+            script:Lock-Log "trap-time discovery-HOLD displaced before its release (tok=$tok); leaving the path to its successor"
         }
-        script:Lock-Log "RELEASED ($script:LockMe tok=$tok) (trap-time discovery-HOLD released during acquire unwind)"
     }
 }
 
