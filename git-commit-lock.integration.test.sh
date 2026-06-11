@@ -22,7 +22,7 @@
 # never masquerade as the full one.
 #
 # On failure the work dir (scratch repo, per-worker stdout/stderr/rc captures,
-# lock log) is PRESERVED (path printed) for post-mortem; set
+# per-worker lock logs) is PRESERVED (path printed) for post-mortem; set
 # GCL_TEST_PRESERVE_DIR=<dir> to additionally copy everything there regardless
 # of outcome (used by CI) — same semantics as the unit suite.
 #
@@ -110,7 +110,16 @@ git -C "$REPO" commit -q --allow-empty -m "initial (empty)" \
 
 GITDIR="$(git -C "$REPO" rev-parse --absolute-git-dir)"
 LOCKFILE="$GITDIR/commit.lock"          # both impls' default lock location
-LLOG="$GITDIR/git-commit-lock.log"      # both impls' default lock log
+# PER-WORKER lock logs (pattern: interop suite T1): concurrent appends to ONE
+# shared log are silently swallowed by both impls' guarded log writes (a
+# transient sharing violation drops the line), so each worker gets its own
+# AGENT_LOCK_LOG and check 3f sums counts over the concatenation. Only the LOG
+# path is per-worker — the LOCK itself stays shared at the default
+# <gitdir>/commit.lock, so all workers still contend on one lock. The logs
+# live under $WORK so they land in $GCL_TEST_PRESERVE_DIR / the preserved
+# post-mortem dir like every other artifact.
+LLOGD="$WORK/lock-logs"; mkdir -p "$LLOGD"
+LLOGALL="$WORK/lock-all.log"            # concatenation, built in Test 3
 
 # --- workers -----------------------------------------------------------------
 # Each worker owns one id; file f-<id>.txt, commit message "integration <id>".
@@ -124,7 +133,7 @@ bash_worker() {  # $1=id
   (
     cd "$REPO" || { echo "cd failed" > "$OUTD/$id.err"; echo 99 > "$OUTD/$id.rc"; exit 99; }
     printf 'content for %s\n' "$id" > "$f"
-    env "${LK_ENV[@]}" bash "$LIB" run -- bash -c \
+    env "${LK_ENV[@]}" AGENT_LOCK_LOG="$LLOGD/$id.log" bash "$LIB" run -- bash -c \
       'git add -- "$1" && git commit -m "$2"' _ "$f" "integration $id" \
       > "$OUTD/$id.out" 2> "$OUTD/$id.err"
     echo $? > "$OUTD/$id.rc"
@@ -136,7 +145,7 @@ pwsh_worker() {  # $1=id
   (
     cd "$REPO" || { echo "cd failed" > "$OUTD/$id.err"; echo 99 > "$OUTD/$id.rc"; exit 99; }
     printf 'content for %s\n' "$id" > "$f"
-    env "${LK_ENV[@]}" pwsh -NoProfile -File "$PS1WIN" run \
+    env "${LK_ENV[@]}" AGENT_LOCK_LOG="$LLOGD/$id.log" pwsh -NoProfile -File "$PS1WIN" run \
       "git add -- $f; if (\$LASTEXITCODE -eq 0) { git commit -m 'integration $id' }" \
       > "$OUTD/$id.out" 2> "$OUTD/$id.err"
     echo $? > "$OUTD/$id.rc"
@@ -147,8 +156,8 @@ dump_worker() {  # $1=id — print a failed worker's captured output
   echo "  ---- worker $1 (rc=$(cat "$OUTD/$1.rc" 2>/dev/null || echo missing)) ----"
   sed 's/^/  [out] /' "$OUTD/$1.out" 2>/dev/null
   sed 's/^/  [err] /' "$OUTD/$1.err" 2>/dev/null
-  echo "  ---- lock log tail ----"
-  tail -n 20 "$LLOG" 2>/dev/null | sed 's/^/  [log] /'
+  echo "  ---- worker $1 lock log tail ----"
+  tail -n 20 "$LLOGD/$1.log" 2>/dev/null | sed 's/^/  [log] /'
 }
 
 # Strict per-worker check: every worker must have launched AND committed (rc 0).
@@ -253,24 +262,23 @@ else
   ok "no index.lock / 'Unable to create' errors in any worker's output"
 fi
 
-# 3f. Lock log: every hold acquired+released cleanly; no stolen leases, no
+# 3f. Lock logs: every hold acquired+released cleanly; no stolen leases, no
 # spurious steals, no timeouts (stale=300 over a minutes-long run means any
-# steal would be a real bug).
-# KNOWN-WATCH (flake risk, Windows FULL mode): these counts read ONE shared
-# log that all workers append to concurrently, and both impls' guarded log
-# writes silently drop a line on a transient sharing violation. If this gate
-# ever flakes, switch to per-worker lock logs summed over the concatenation,
-# as the interop suite's T1 does (see its comment). First full-strength CI
-# run passed, so watch only.
-a="$(grep -c ACQUIRED "$LLOG" 2>/dev/null)"; rl="$(grep -c RELEASED "$LLOG" 2>/dev/null)"
+# steal would be a real bug). Counts are summed over the CONCATENATION of the
+# per-worker logs (pattern from the interop suite's T1), so the old shared-log
+# flake risk — concurrent appends silently dropped on a transient sharing
+# violation — is CLOSED, not watched: one log per worker means no concurrent
+# appends, making exact equality with the worker count a safe gate.
+cat "$LLOGD"/*.log > "$LLOGALL" 2>/dev/null || : > "$LLOGALL"
+a="$(grep -c ACQUIRED "$LLOGALL")"; rl="$(grep -c RELEASED "$LLOGALL")"
 [ "$a" = "$TOTAL" ] && [ "$rl" = "$TOTAL" ] \
-  && ok "lock log balanced: $a acquired, $rl released (== $TOTAL workers)" \
-  || bad "lock log unbalanced: acquired=$a released=$rl want=$TOTAL"
-if grep -q -e "WARNING" -e "STOLE" -e "TIMEOUT" "$LLOG" 2>/dev/null; then
-  bad "lock log has WARNING/STOLE/TIMEOUT entries:"
-  grep -e "WARNING" -e "STOLE" -e "TIMEOUT" "$LLOG" | sed 's/^/  [log] /'
+  && ok "lock logs balanced: $a acquired, $rl released (== $TOTAL workers)" \
+  || bad "lock logs unbalanced: acquired=$a released=$rl want=$TOTAL"
+if grep -q -e "WARNING" -e "STOLE" -e "TIMEOUT" "$LLOGALL"; then
+  bad "lock logs have WARNING/STOLE/TIMEOUT entries:"
+  grep -e "WARNING" -e "STOLE" -e "TIMEOUT" "$LLOGALL" | sed 's/^/  [log] /'
 else
-  ok "lock log has no stolen-lease WARNINGs, steals, or timeouts"
+  ok "lock logs have no stolen-lease WARNINGs, steals, or timeouts"
 fi
 
 # 3g. Working tree clean (every written file was committed, nothing half-staged).
