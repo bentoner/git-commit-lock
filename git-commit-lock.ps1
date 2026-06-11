@@ -153,7 +153,7 @@
 #     reach 97; `run` keeps the command's exit code and warns on stderr,
 #     mirroring git-commit-lock.sh).
 #
-# Hold the lock ONLY for the stage+commit (sub-second). Decide what to stage,
+# Hold the lock ONLY for the stage+commit (seconds). Decide what to stage,
 # build any patch, resolve hook failures OUTSIDE the lock. See README.md
 # ("Suggested agent instructions").
 #

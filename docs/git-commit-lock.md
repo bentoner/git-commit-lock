@@ -332,10 +332,9 @@ Config knobs (env, mainly for tests):
 
 Keep the critical section small: decide what to stage, build any patch, and
 resolve failures **outside** the lock. A normal stage+commit holds the lock
-for under a second to a few seconds, and that is the healthy pattern — but
-nothing breaks at one second; the actual contract is to stay comfortably
-inside the staleness window (default 5 minutes). If a commit fails under the
-lock (e.g. a pre-commit hook rejects it), unstage your paths
+for seconds, and that is the healthy pattern; the actual contract is just to
+stay comfortably inside the staleness window (default 5 minutes). If a commit
+fails under the lock (e.g. a pre-commit hook rejects it), unstage your paths
 (`git reset -- <paths>`, which never touches the working tree) and
 `lock_release` **before** you investigate, then retry. Never start anything
 open-ended while holding the lock — an investigation, a build, or (worst,

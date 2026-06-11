@@ -81,7 +81,7 @@
 #   lock "fails open". We do NOT prevent this with a background heartbeat
 #   (keeps the tool a single synchronous script). Instead the contract is:
 #   COMMITS MUST BE FAST (the golden rule — well under the window; git commits
-#   should be sub-second, not minutes), and a holder that was nonetheless too
+#   should take seconds, not minutes), and a holder that was nonetheless too
 #   slow DETECTS the theft when it returns: lock_release verifies the file
 #   still carries our token and, if not, logs a loud WARNING and returns 98
 #   instead of reporting success. Any steal that overlaps the holder's actual
