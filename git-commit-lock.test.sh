@@ -29,9 +29,9 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB="$DIR/git-commit-lock.sh"
 
 if [ "${GCL_TEST_FULL:-0}" = 1 ]; then
-  GCL_MODE="FULL"; T1_ROUNDS=8; T1_N=25; T2B_ROUNDS=4
+  GCL_MODE="FULL"; T1_ROUNDS=8; T1_N=25; T2B_ROUNDS=4; T20_N=10
 else
-  GCL_MODE="REDUCED"; T1_ROUNDS=3; T1_N=8; T2B_ROUNDS=2
+  GCL_MODE="REDUCED"; T1_ROUNDS=3; T1_N=8; T2B_ROUNDS=2; T20_N=5
 fi
 echo "fan-out mode: $GCL_MODE (T1 ${T1_ROUNDS} rounds x ${T1_N} workers)"
 [ "$GCL_MODE" = REDUCED ] && echo "  (set GCL_TEST_FULL=1 for the full-strength 8x25 canary — CI runs it)"
@@ -65,6 +65,17 @@ epoch_to_stamp() {
   date -d "@$1" +%Y%m%d%H%M.%S 2>/dev/null || date -r "$1" +%Y%m%d%H%M.%S 2>/dev/null
 }
 backdate() { touch -t "$(epoch_to_stamp "$(( $(date +%s) - $2 ))")" "$1"; }
+
+# Clone a shell function under a new name — the steering tests' interposition
+# mechanism: a sourced test shell wraps a library internal (or a command like
+# mv/rm/touch with a shell function, which shadows the binary) to land "the
+# rival's rename" at an exact protocol position deterministically, then calls
+# the original through the clone. Exported (with the backdate helpers) so the
+# bash -c steering shells inherit them.
+clone_fn() {  # $1=existing function $2=new name
+  eval "$(declare -f "$1" | sed "1s/$1/$2/")"
+}
+export -f clone_fn epoch_to_stamp backdate
 
 # Fabricate a lock file the way a real (foreign) holder would have written it:
 # token line + owner line. The token MUST be "tok."-prefixed (wire format) or
@@ -140,32 +151,43 @@ grep -q "holder=pid=99999 host=ghost" "$LOG" \
   && ok "STALE log line carries the holder parsed from line 2" \
   || bad "holder from line 2 missing in the STALE log line"
 
-echo "== Test 2b: crash recovery under CONTENTION — stragglers must not rob the recovery winner ($GCL_MODE: $T2B_ROUNDS rounds) =="
-# The acquire-side displaced-live race (KNOWN RESIDUAL RACES in the impl
-# header): after a holder crashes, every waiter judges "stale" off the same
-# ghost mtime in the same poll window; the first steals + re-creates a FRESH
-# lock, and a straggler's mv — landing in its own mtime-recheck->mv gap —
-# displaces that innocent recovery winner, not the ghost. The grave-token
-# check must detect the mismatch and RESTORE the displaced lock (atomic hard
-# link), with the unrestorable third-party-re-create window staying a LOUD
-# 98. The interleaving is probabilistic, so the assertions are
-# outcome-shaped (they hold whichever interleaving happened) plus one
-# regression discriminator: pre-fix, the straggler's robbery logged a SECOND
-# STOLE line misattributed to the ghost (probed 5/5 with 4 waiters on one
-# ancient lock) and no displacement detection existed at all.
-# Sync: waiters launch against a FRESH fabricated lock and only once all
-# have logged WAITING is the lock backdated — so all judge stale within one
-# poll window (launch jitter would otherwise stagger them past the race).
+echo "== Test 2b: crash recovery under CONTENTION — claim-serialized: zero displacement, zero 98s ($GCL_MODE: $T2B_ROUNDS rounds) =="
+# Adapted from the wave-1 displaced-live regression test (plan test 2): the
+# claim SERIALIZES stealers, so the straggler-robs-recovery-winner race is
+# PREVENTED, not detected-and-repaired. Same scenario (one crashed lock, N
+# waiters judging stale in the same poll window — the launch/backdate sync
+# keeps them in one window), new assertions: every waiter exits 0 (zero
+# spurious 98s — pre-claim this displaced the recovery winner 5/5), NO grave
+# file ever exists (a background sampler watches .dead.* throughout — the
+# mutation discriminator against the wave-1 implementation), the recovery is
+# exactly one STOLE-BY-CLAIM per round (new line shape; the old "STOLE stale
+# lock" shape must never appear), zero STEAL-DISPLACED machinery lines, and
+# a clean final state (no lock, no claim). STALE=8 keeps a loaded box from
+# turning the winner's 0.1s hold into a legitimate second steal.
 T2B_N=4
-t2b_fail=0; t2b_ghost_stole=0; t2b_disp=0; t2b_rest=0; t2b_dispfail=0
+t2b_fail=0; t2b_stole=0; t2b_old_shape=0; t2b_disp=0; t2b_98=0
 for r in $(seq 1 "$T2B_ROUNDS"); do
   LOCK="$WORK/recov.$r.lock"; RAN="$WORK/recov.$r.ran"; : > "$RAN"
+  GRAVESEEN="$WORK/recov.$r.graveseen"; SAMPSTOP="$WORK/recov.$r.sampstop"
+  rm -f "$GRAVESEEN" "$SAMPSTOP"
   fabricate_lock "$LOCK" "tok.ghost.t2b.$r" "pid=999 host=ghost"   # fresh mtime: not yet stale
+  # Grave sampler: ANY .dead.* sighting at ANY moment during the round means
+  # the wave-1 grave machinery is back (an end-state check would miss a
+  # create-then-delete grave).
+  (
+    while [ ! -e "$SAMPSTOP" ]; do
+      for g in "$LOCK".dead.*; do
+        [ -e "$g" ] && : > "$GRAVESEEN"
+      done
+      sleep 0.01
+    done
+  ) &
+  sampler=$!
   pids=()
   for i in $(seq 1 "$T2B_N"); do
     : > "$WORK/recov.$r.$i.log"   # per-waiter logs: concurrent appends to one log drop lines
-    AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$WORK/recov.$r.$i.log" AGENT_LOCK_STALE_SECS=3 \
-      AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=120 \
+    AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$WORK/recov.$r.$i.log" AGENT_LOCK_STALE_SECS=8 \
+      AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=120 \
       bash "$LIB" run -- bash -c 'echo ran >> "$1"; sleep 0.1' _ "$RAN" 2>/dev/null &
     pids+=($!)
   done
@@ -174,47 +196,35 @@ for r in $(seq 1 "$T2B_ROUNDS"); do
       || { t2b_fail=1; echo "  round $r: waiter $i never logged WAITING"; }
   done
   backdate "$LOCK" 9999            # all waiters now judge the ghost stale together
-  n98=0
   for i in $(seq 1 "$T2B_N"); do
     wait "${pids[$((i-1))]}"; rc=$?
     case "$rc" in
       0)  ;;
-      98) n98=$((n98+1)) ;;       # loud fail-open redo: allowed, accounted below
-      *)  t2b_fail=1; echo "  round $r: waiter $i rc=$rc (want 0 or a loud 98)" ;;
+      98) t2b_98=$((t2b_98+1)); echo "  round $r: waiter $i rc=98 — displacement under the claim protocol" ;;
+      *)  t2b_fail=1; echo "  round $r: waiter $i rc=$rc (want 0)" ;;
     esac
   done
+  touch "$SAMPSTOP"; wait "$sampler" 2>/dev/null
   cat "$WORK/recov.$r."*.log > "$WORK/recov.$r.all.log"
   nran="$(grep -c ran "$RAN")"
   [ "$nran" = "$T2B_N" ] || { t2b_fail=1; echo "  round $r: only $nran/$T2B_N commands ran"; }
-  nlost="$(grep -c "WARNING: lock LOST" "$WORK/recov.$r.all.log")"
-  [ "$nlost" -ge "$n98" ] || { t2b_fail=1; echo "  round $r: $n98 exit-98s but only $nlost LOST warnings — silent robbery?"; }
   [ -e "$LOCK" ] && { t2b_fail=1; echo "  round $r: leftover lock"; }
-  for d in "$LOCK".dead.*; do
-    [ -e "$d" ] && { t2b_fail=1; echo "  round $r: leftover grave ${d##*/}"; }
-  done
-  t2b_ghost_stole=$(( t2b_ghost_stole + $(grep -c "STOLE stale lock (was held by pid=999 host=ghost)" "$WORK/recov.$r.all.log") ))
-  t2b_disp=$((     t2b_disp     + $(grep -c "STEAL-DISPLACED-LIVE" "$WORK/recov.$r.all.log") ))
-  t2b_rest=$((     t2b_rest     + $(grep -c "RESTORED it via hard link" "$WORK/recov.$r.all.log") ))
-  t2b_dispfail=$(( t2b_dispfail + $(grep -c "restore FAILED" "$WORK/recov.$r.all.log") ))
+  [ -e "$LOCK.next" ] && { t2b_fail=1; echo "  round $r: leftover claim"; }
+  [ -e "$GRAVESEEN" ] && { t2b_fail=1; echo "  round $r: a grave (.dead.*) existed during recovery — wave-1 machinery regression!"; }
+  t2b_stole=$((     t2b_stole     + $(grep -c "STOLE-BY-CLAIM" "$WORK/recov.$r.all.log") ))
+  t2b_old_shape=$(( t2b_old_shape + $(grep -c "STOLE stale lock" "$WORK/recov.$r.all.log") ))
+  t2b_disp=$((      t2b_disp      + $(grep -c "STEAL-DISPLACED" "$WORK/recov.$r.all.log") ))
 done
-[ "$t2b_fail" = 0 ] && ok "$T2B_ROUNDS rounds x $T2B_N waiters on one crashed lock: all ran, every exit 0 or a loud 98, clean final state" \
+[ "$t2b_fail" = 0 ] && ok "$T2B_ROUNDS rounds x $T2B_N waiters on one crashed lock: all ran, clean final state, no grave ever existed" \
                     || bad "crash-recovery contention failure (see above)"
-[ "$t2b_ghost_stole" -ge 1 ] && ok "the crashed ghost was reclaimed (ghost-attributed STOLE x$t2b_ghost_stole)" \
-                             || bad "ghost never stolen — crash recovery did not happen"
-# Regression discriminator (see the test header comment): more ghost-
-# attributed steals than ghosts with ZERO displacement detections means the
-# grave-token check is gone. (With the check present, the only way a ghost
-# is "stolen twice" is the rare unreadable-grave restore resurrecting it —
-# which logs a STEAL-DISPLACED line first, so t2b_disp > 0 keeps this green.)
-if [ "$t2b_ghost_stole" -gt "$T2B_ROUNDS" ] && [ "$t2b_disp" = 0 ]; then
-  bad "ghost stolen $t2b_ghost_stole times across $T2B_ROUNDS rounds with zero STEAL-DISPLACED detections — grave-token check regression!"
-else
-  ok "no misattributed double-steal of the ghost (displacements detected=$t2b_disp restored=$t2b_rest unrestorable=$t2b_dispfail)"
-fi
-# The displaced lane must always conclude loudly, one of exactly two ways.
-[ "$t2b_disp" = $((t2b_rest + t2b_dispfail)) ] \
-  && ok "every detected displacement concluded loudly (RESTORED or restore-FAILED)" \
-  || bad "displacement accounting wrong: $t2b_disp detected != $t2b_rest restored + $t2b_dispfail restore-failed"
+[ "$t2b_98" = 0 ] && ok "zero spurious 98s — the claim serialized recovery (pre-claim: near-certain displacement)" \
+                  || bad "$t2b_98 waiter(s) exited 98 — displacement happened under the claim protocol"
+[ "$t2b_stole" = "$T2B_ROUNDS" ] && ok "exactly one STOLE-BY-CLAIM per recovery (x$t2b_stole/$T2B_ROUNDS rounds)" \
+                                 || bad "STOLE-BY-CLAIM count $t2b_stole != $T2B_ROUNDS rounds (want exactly one steal per recovery)"
+[ "$t2b_old_shape" = 0 ] && ok "old grave-steal line shape never logged" \
+                         || bad "old 'STOLE stale lock' line appeared x$t2b_old_shape — wave-1 steal lane still present"
+[ "$t2b_disp" = 0 ] && ok "zero STEAL-DISPLACED lines (repair machinery removed; prevention, not repair)" \
+                    || bad "STEAL-DISPLACED fired x$t2b_disp — displacement machinery still present?"
 
 echo "== Test 3: REGRESSION — EMPTY lock file (crash between create and write) is still stolen =="
 # The file-protocol descendant of the 2026-05-30 orphan bug: an acquirer that
@@ -372,6 +382,22 @@ AGENT_LOCK_PATH="$WORK/warn.lock" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=50
   bash "$LIB" run -- true 2> "$WORK/t8.warn.err"
 grep -q "raise AGENT_LOCK_MAX_WAIT" "$WORK/t8.warn.err" && ok "STALE raised over default MAX_WAIT warns on stderr" \
                                                         || bad "no warning when STALE >= default MAX_WAIT"
+# The warning is the knob-RELATION form (MAX_WAIT <= STALE + CLAIM_STALE),
+# which REPLACED the old STALE >= MAX_WAIT rule (plan test 7): a setting the
+# old rule ignored must now warn — STALE=300 alone is fine (< 420), but
+# CLAIM_STALE=200 pushes worst-case recovery to 500 >= the default 420.
+AGENT_LOCK_PATH="$WORK/warn2.lock" AGENT_LOCK_LOG="$LOG" \
+  AGENT_LOCK_STALE_SECS=300 AGENT_LOCK_CLAIM_STALE_SECS=200 \
+  bash "$LIB" run -- true 2> "$WORK/t8.warn2.err"
+grep -q "raise AGENT_LOCK_MAX_WAIT" "$WORK/t8.warn2.err" \
+  && ok "knob-relation warning stacks STALE + CLAIM_STALE (the replaced rule would stay silent here)" \
+  || bad "no warning when STALE + CLAIM_STALE >= default MAX_WAIT — the replacement rule is missing"
+AGENT_LOCK_PATH="$WORK/warn3.lock" AGENT_LOCK_LOG="$LOG" \
+  AGENT_LOCK_STALE_SECS=300 AGENT_LOCK_CLAIM_STALE_SECS=200 AGENT_LOCK_MAX_WAIT=400 \
+  bash "$LIB" run -- true 2> "$WORK/t8.warn3.err"
+grep -q "raise AGENT_LOCK_MAX_WAIT" "$WORK/t8.warn3.err" \
+  && bad "knob-relation warning fired though MAX_WAIT was set explicitly" \
+  || ok "explicit MAX_WAIT silences the knob-relation warning (left-default gate kept)"
 wait "$h8"; [ "$?" = 0 ] && ok "holder unaffected by the timed-out waiter" || bad "holder rc=$? (want 0)"
 
 echo "== Test 9: sub-floor (pre-2000) file mtime is NOT treated as stale =="
@@ -543,10 +569,11 @@ echo "== Test 13: garbage AGENT_LOCK_* numerics fall back to defaults with a not
 LOCK="$WORK/num.lock"; LOG="$WORK/num.log"; : > "$LOG"
 AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" \
   AGENT_LOCK_STALE_SECS=banana AGENT_LOCK_POLL_SECS=-1 AGENT_LOCK_MAX_WAIT=0 \
+  AGENT_LOCK_CLAIM_STALE_SECS=2.5 \
   bash "$LIB" run -- bash -c 'true' 2> "$WORK/t13.err"; rc=$?
 [ "$rc" = 0 ] && ok "run succeeds despite garbage numeric config" || bad "rc=$rc with garbage numerics"
 n="$(grep -c "ignoring invalid" "$WORK/t13.err")"
-[ "$n" = 3 ] && ok "all 3 garbage values noted on stderr (got $n)" || bad "expected 3 'ignoring invalid' notes, got $n"
+[ "$n" = 4 ] && ok "all 4 garbage values noted on stderr, incl. CLAIM_STALE_SECS (got $n)" || bad "expected 4 'ignoring invalid' notes, got $n"
 
 echo "== Test 14: run outside any git repo hard-fails 96 unless AGENT_LOCK_PATH is set =="
 NR="$WORK/norepo"; mkdir -p "$NR"
@@ -572,25 +599,10 @@ leftovers="$(ls -A "$NRS" 2>/dev/null)"
 [ -z "$leftovers" ] && ok "sourcing left the CWD clean (no log or lock file created)" \
                     || bad "sourcing outside a repo created files in the CWD: $leftovers"
 
-echo "== Test 15: AGED .dead.* file graves are swept at acquire; fresh or non-file ones survive =="
-# The sweep is age-gated (mirrors the ps1 port): only graves older than the
-# stale window (default 300s here) are collected — kept from the dir era to
-# minimise churn — and it is a NON-RECURSIVE `rm -f`, so a directory at a
-# grave name (e.g. old-protocol litter) is never deleted.
-LOCK="$WORK/lit.lock"; LOG="$WORK/lit.log"; : > "$LOG"
-printf 'tok.old.1.1\n' > "$LOCK.dead.1.2"; backdate "$LOCK.dead.1.2" 9999   # aged file grave
-: > "$LOCK.dead.3.4"                                                        # FRESH file grave
-mkdir -p "$LOCK.dead.5.6"; backdate "$LOCK.dead.5.6" 9999                   # aged DIRECTORY at a grave name
-AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" bash "$LIB" run -- bash -c 'true'; rc=$?
-[ "$rc" = 0 ] || bad "T15 run rc=$rc"
-[ -e "$LOCK.dead.1.2" ] && bad "aged .dead.* file grave not swept at acquire" \
-                        || ok "aged .dead.* file grave swept at acquire"
-grep -q "SWEPT stale litter" "$LOG" && ok "sweep logged" || bad "no SWEPT entry logged"
-[ -e "$LOCK.dead.3.4" ] && ok "fresh .dead.* grave NOT swept (age gate kept)" \
-                        || bad "fresh .dead.* was swept — age gate broken"
-[ -d "$LOCK.dead.5.6" ] && ok "directory at a grave name untouched (sweep is rm -f, never recursive)" \
-                        || bad "directory grave was deleted — sweep went recursive?"
-rm -rf "$LOCK.dead.3.4" "$LOCK.dead.5.6"
+# (Test 15 — the age-gated .dead.* grave sweep — was DELETED 2026-06-12 with
+# the claim-serialized steal protocol: graves no longer exist, so there is
+# nothing to sweep. A new implementation must never create one; Test 2b's
+# sampler enforces that.)
 
 echo "== Test 16: EMPTY lock file at release — unverifiable lane (2 / run:1), NOT a theft verdict =="
 # Truncation stands in for the probe-F window: a file that reads empty after
@@ -916,6 +928,931 @@ AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" bash -c '
 ' _ "$LIB" "$LOCK"; rc=$?
 [ "$rc" = 0 ] && ok "lock file carries token (line 1, tok.-prefixed) + owner (line 2); release parses line 1 with owner present" \
               || bad "wire-format check failed at step code $rc"
+
+echo "== Test 20: claim contention — N concurrent stealers, ONE claim winner (plan test 1; $GCL_MODE: $T20_N workers) =="
+# N stealers race one ancient ghost: exactly one wins the O_EXCL claim and
+# steals (one STOLE-BY-CLAIM); the rest lose the claim create and acquire
+# normally in sequence after the winner releases. No displacement (zero
+# LOST/98), no leftovers. STALE=5 keeps a loaded box from re-stealing the
+# winner's brief hold.
+LOCK="$WORK/contend.lock"
+fabricate_lock "$LOCK" "tok.ghost.t20" "pid=888 host=ghost"
+backdate "$LOCK" 9999
+pids=(); t20_fail=0
+for i in $(seq 1 "$T20_N"); do
+  : > "$WORK/contend.$i.log"
+  AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$WORK/contend.$i.log" AGENT_LOCK_STALE_SECS=5 \
+    AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=120 \
+    bash "$LIB" run -- bash -c 'true' 2>/dev/null &
+  pids+=($!)
+done
+for i in $(seq 1 "$T20_N"); do
+  wait "${pids[$((i-1))]}"; rc=$?
+  [ "$rc" = 0 ] || { t20_fail=1; echo "  worker $i rc=$rc (want 0)"; }
+done
+cat "$WORK/contend."*.log > "$WORK/contend.all.log"
+nst="$(grep -c "STOLE-BY-CLAIM" "$WORK/contend.all.log")"
+nacq="$(grep -c "ACQUIRED" "$WORK/contend.all.log")"
+nrel="$(grep -c "RELEASED" "$WORK/contend.all.log")"
+nlost="$(grep -c "lock LOST" "$WORK/contend.all.log")"
+[ "$t20_fail" = 0 ] && ok "$T20_N concurrent stealers all completed with rc 0" || bad "claim-contention worker failures (see above)"
+[ "$nst" = 1 ] && ok "exactly ONE claim winner stole the ghost (STOLE-BY-CLAIM x$nst)" \
+               || bad "STOLE-BY-CLAIM x$nst (want exactly 1 — the claim must serialize stealers)"
+[ "$nacq" = "$T20_N" ] && [ "$nrel" = "$T20_N" ] && ok "balanced ACQUIRED/RELEASED ($nacq/$nrel of $T20_N)" \
+                                                  || bad "ACQUIRED=$nacq RELEASED=$nrel (want $T20_N each)"
+[ "$nlost" = 0 ] && ok "zero LOST warnings under claim contention" || bad "$nlost LOST warnings under claim contention"
+[ -e "$LOCK" ] && bad "leftover lock after contention" || ok "no leftover lock"
+[ -e "$LOCK.next" ] && bad "leftover claim after contention" || ok "no leftover claim"
+
+echo "== Test 21: crashed-claimant and empty-claim orphans age out; steals resume (plan tests 3+4) =="
+# (a) an aged foreign claim (crashed claimant): cleared by CLAIM-STALE-CLEARED,
+# then the steal completes; recovery latency bounded.
+LOCK="$WORK/cc.lock"; LOG="$WORK/cc.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t21" "pid=9 host=ghost"; backdate "$LOCK" 9999
+fabricate_lock "$LOCK.next" "tok.crashed.t21" "pid=8 host=crashed"; backdate "$LOCK.next" 9999
+t21_t0=$(date +%s)
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+  AGENT_LOCK_CLAIM_STALE_SECS=2 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=30 \
+  bash "$LIB" run -- bash -c 'true' 2>/dev/null; rc=$?
+t21_t1=$(date +%s)
+[ "$rc" = 0 ] && ok "waiter recovered through a crashed claimant's claim (rc 0)" || bad "rc=$rc behind a crashed claim"
+grep -q "CLAIM-STALE-CLEARED" "$LOG" && ok "aged claim cleared (CLAIM-STALE-CLEARED logged, with age)" || bad "no CLAIM-STALE-CLEARED entry"
+grep -q "STOLE-BY-CLAIM" "$LOG" && ok "steal completed after the clear" || bad "no STOLE-BY-CLAIM after clearing the crashed claim"
+[ $((t21_t1 - t21_t0)) -le 20 ] && ok "recovery latency bounded ($((t21_t1 - t21_t0))s)" || bad "recovery took $((t21_t1 - t21_t0))s (>20s)"
+[ -e "$LOCK.next" ] && bad "claim leftover after recovery" || ok "claim path clean after recovery"
+# (b) an EMPTY claim file (claimant died between create and write): same lane.
+LOCK="$WORK/ccempty.lock"; LOG="$WORK/ccempty.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t21b" "pid=9 host=ghost"; backdate "$LOCK" 9999
+: > "$LOCK.next"; backdate "$LOCK.next" 9999
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+  AGENT_LOCK_CLAIM_STALE_SECS=2 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=30 \
+  bash "$LIB" run -- bash -c 'true' 2>/dev/null; rc=$?
+[ "$rc" = 0 ] && ok "empty claim orphan aged out and recovery completed (rc 0)" || bad "rc=$rc behind an empty claim orphan"
+grep -q "CLAIM-STALE-CLEARED" "$LOG" && ok "empty claim cleared via the same staleness lane" || bad "empty claim was not cleared"
+
+echo "== Test 22: NON-CLAIM objects at the claim path — never deleted, per-path warn state (plan tests 5+13) =="
+# (a) a directory at ${LOCK}.next blocks steals (waiter reaches 97), is never
+# deleted, and warns once naming the claim path.
+LOCK="$WORK/cwt.lock"; LOG="$WORK/cwt.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t22" "pid=9 host=ghost"; backdate "$LOCK" 9999
+mkdir -p "$LOCK.next/sub"; echo keep > "$LOCK.next/sub/f"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+  AGENT_LOCK_CLAIM_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=3 \
+  bash "$LIB" run -- bash -c 'true' 2> "$WORK/t22a.err"; rc=$?
+[ "$rc" = 97 ] && ok "dir at claim path: steals blocked, waiter timed out (97)" || bad "dir at claim path: rc=$rc (want 97)"
+[ -f "$LOCK.next/sub/f" ] && ok "directory at claim path untouched" || bad "directory at claim path was damaged!"
+grep -q "is not a claim file" "$WORK/t22a.err" && ok "loud claim-path config warning on stderr" || bad "no claim-path config warning"
+grep -q "it is a directory" "$WORK/t22a.err" && ok "claim warning names the detected type (directory)" || bad "claim warning does not name the type"
+n="$(grep -c "is not a claim file" "$WORK/t22a.err")"
+[ "$n" = 1 ] && ok "claim-path warning fired exactly once (got $n)" || bad "claim-path warning fired $n times (want 1)"
+grep -q "STOLE-BY-CLAIM" "$LOG" && bad "stole despite a squatted claim path" || ok "no steal through a squatted claim path"
+[ -f "$LOCK" ] && ok "stale lock left in place (cannot be stolen safely)" || bad "lock vanished behind a squatted claim path"
+# (b) a free LOCK path is UNaffected by claim-path junk: normal acquire works.
+rm -f "$LOCK"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+  AGENT_LOCK_CLAIM_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=3 \
+  bash "$LIB" run -- bash -c 'true' 2> "$WORK/t22b.err"; rc=$?
+[ "$rc" = 0 ] && ok "normal acquisition on a free lock path unaffected by claim-path junk" \
+              || bad "free-path acquire rc=$rc with a dir at the claim path (want 0)"
+rm -rf "$LOCK.next"
+# (c) a dangling SYMLINK at the claim path (where symlinks can be made).
+LOCK="$WORK/cwts.lock"; LOG="$WORK/cwts.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t22c" "pid=9 host=ghost"; backdate "$LOCK" 9999
+if env MSYS=winsymlinks:nativestrict ln -s "$WORK/no-such-target" "$LOCK.next" 2>/dev/null && [ -L "$LOCK.next" ]; then
+  AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+    AGENT_LOCK_CLAIM_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=3 \
+    bash "$LIB" run -- bash -c 'true' 2> "$WORK/t22c.err"; rc=$?
+  [ "$rc" = 97 ] && ok "symlink at claim path: steals blocked (97)" || bad "symlink at claim path: rc=$rc (want 97)"
+  [ -L "$LOCK.next" ] && ok "claim-path symlink untouched" || bad "claim-path symlink was removed/replaced"
+  grep -q "it is a symlink" "$WORK/t22c.err" && ok "claim warning names the symlink" || bad "claim warning does not name the symlink"
+  rm -f "$LOCK.next"
+else
+  rm -f "$LOCK.next"
+  echo "note: cannot create symlinks here — claim-path symlink guard not exercised (CI POSIX legs cover it)"
+fi
+rm -f "$LOCK"
+# (d) a FIFO at the claim path — the reason the claim-path pre-create guard is
+# MANDATORY: without it the claim's noclobber open would HANG. Bounded
+# externally so a regression fails fast. (bash-only; see the ps1 POSIX note.)
+LOCK="$WORK/cwtf.lock"; LOG="$WORK/cwtf.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t22d" "pid=9 host=ghost"; backdate "$LOCK" 9999
+if command -v mkfifo >/dev/null 2>&1 && mkfifo "$LOCK.next" 2>/dev/null && [ -p "$LOCK.next" ]; then
+  AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+    AGENT_LOCK_CLAIM_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=3 \
+    bash "$LIB" run -- bash -c 'true' 2> "$WORK/t22d.err" &
+  p22=$!
+  hung=0
+  for _ in $(seq 1 100); do kill -0 "$p22" 2>/dev/null || break; sleep 0.1; done
+  if kill -0 "$p22" 2>/dev/null; then
+    hung=1
+    bad "FIFO at claim path HUNG the stealer — claim pre-create type guard missing"
+    kill -9 "$p22" 2>/dev/null          # exact PID we spawned; nothing else
+    ( : < "$LOCK.next" ) 2>/dev/null &  # pair a reader with the stuck writer-open
+    wait "$p22" 2>/dev/null
+  else
+    wait "$p22"; rc=$?
+    [ "$rc" = 97 ] && ok "FIFO at claim path: no hang, waiter timed out (97)" || bad "FIFO at claim path: rc=$rc (want 97)"
+    grep -q "it is a FIFO" "$WORK/t22d.err" && ok "claim warning names the FIFO" || bad "no FIFO claim warning"
+  fi
+  [ "$hung" = 0 ] && { [ -p "$LOCK.next" ] && ok "claim-path FIFO untouched" || bad "claim-path FIFO was removed/replaced"; }
+  rm -f "$LOCK.next" "$LOCK"
+else
+  rm -f "$LOCK.next" "$LOCK" 2>/dev/null
+  echo "note: mkfifo unavailable/unusable here — claim-path FIFO guard not exercised (CI POSIX legs cover it)"
+fi
+# (e) PER-PATH warn-once independence (plan test 13): a lock-path wrong-type
+# warning in the same process must NOT suppress a claim-path warning — and
+# vice versa. One sourced shell, two sequential acquires per direction.
+PPD="$WORK/ppg"; mkdir -p "$PPD"
+mkdir -p "$PPD/ldir.lock"
+fabricate_lock "$PPD/c2.lock" "tok.ghost.ppg" "pid=9 host=g"; backdate "$PPD/c2.lock" 9999
+mkdir -p "$PPD/c2.lock.next"
+AGENT_LOCK_PATH="$PPD/ldir.lock" AGENT_LOCK_LOG="$PPD/ppg.log" AGENT_LOCK_STALE_SECS=1 \
+  AGENT_LOCK_CLAIM_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=3 \
+  bash -c '
+    source "$1" || exit 70
+    lock_acquire; [ "$?" = 97 ] || exit 71      # dir at the LOCK path -> lock warning
+    AGENT_LOCK_PATH="$2"
+    lock_acquire; [ "$?" = 97 ] || exit 72      # dir at the CLAIM path -> claim warning
+    exit 0
+  ' _ "$LIB" "$PPD/c2.lock" 2> "$PPD/ab.err"; rc=$?
+[ "$rc" = 0 ] || bad "T22e lock-then-claim harness rc=$rc"
+grep -q "is not a lock file" "$PPD/ab.err" && grep -q "is not a claim file" "$PPD/ab.err" \
+  && ok "lock-path warning did not suppress the claim-path warning (per-path warn-once)" \
+  || bad "claim-path warning suppressed after a lock-path warning (shared warn-once state?)"
+PPD2="$WORK/ppg2"; mkdir -p "$PPD2"
+fabricate_lock "$PPD2/c1.lock" "tok.ghost.ppg2" "pid=9 host=g"; backdate "$PPD2/c1.lock" 9999
+mkdir -p "$PPD2/c1.lock.next"
+mkdir -p "$PPD2/ldir2.lock"
+AGENT_LOCK_PATH="$PPD2/c1.lock" AGENT_LOCK_LOG="$PPD2/ppg2.log" AGENT_LOCK_STALE_SECS=1 \
+  AGENT_LOCK_CLAIM_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=3 \
+  bash -c '
+    source "$1" || exit 70
+    lock_acquire; [ "$?" = 97 ] || exit 71      # dir at the CLAIM path -> claim warning
+    AGENT_LOCK_PATH="$2"
+    lock_acquire; [ "$?" = 97 ] || exit 72      # dir at the LOCK path -> lock warning
+    exit 0
+  ' _ "$LIB" "$PPD2/ldir2.lock" 2> "$PPD2/ba.err"; rc=$?
+[ "$rc" = 0 ] || bad "T22e claim-then-lock harness rc=$rc"
+grep -q "is not a claim file" "$PPD2/ba.err" && grep -q "is not a lock file" "$PPD2/ba.err" \
+  && ok "claim-path warning did not suppress the lock-path warning (reverse order)" \
+  || bad "lock-path warning suppressed after a claim-path warning (shared warn-once state?)"
+
+echo "== Test 23: live-slow holder — re-verify under the claim sees a fresh lock, CLAIM-ABORT (fresh), no steal (plan test 6) =="
+# Steered deterministically: the lock's mtime is renewed (as a live-slow
+# holder's re-create/renewal would) at the exact step-2 re-verify position,
+# via a sourced shell that wraps the library's verify internal. The claimant
+# must abort (fresh), keep waiting, and acquire normally once the holder
+# "releases" (the test removes the lock).
+LOCK="$WORK/lsf.lock"; LOG="$WORK/lsf.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t23" "pid=9 host=slow"; backdate "$LOCK" 9999
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=3 \
+  AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=30 \
+  bash -c '
+    source "$1" || exit 70
+    clone_fn _lock_verify_stale _vs_orig
+    F1=0
+    _lock_verify_stale() {
+      if [ "$F1" = 0 ]; then F1=1; command touch -- "$AGENT_LOCK_PATH"; fi
+      _vs_orig "$@"
+    }
+    lock_acquire || exit 72
+    lock_release || exit 74
+    exit 0
+  ' _ "$LIB" 2>/dev/null &
+w23=$!
+wait_for_grep "CLAIM-ABORT (fresh)" "$LOG" 20 \
+  && ok "claimant aborted on the renewed (fresh) lock — CLAIM-ABORT (fresh)" \
+  || bad "no CLAIM-ABORT (fresh) for the live-slow holder"
+rm -f "$LOCK"                       # the slow holder releases normally
+wait "$w23"; rc=$?
+[ "$rc" = 0 ] && ok "waiter then acquired and released normally (rc 0)" || bad "waiter rc=$rc after the slow holder released"
+grep -q "STOLE-BY-CLAIM" "$LOG" && bad "live lock was STOLEN despite the fresh re-verify" || ok "no steal of the live-slow holder's lock"
+[ -e "$LOCK.next" ] && bad "claim leftover after the fresh abort" || ok "claim deleted on the fresh abort"
+
+echo "== Test 24: OVERAGED own claim — CLAIM-ABORT (contested), no rename (plan test 8) =="
+# A suspended claimant's recheck must refuse to proceed on its own overaged
+# claim (a clearer may be acting on it). Steered: every recheck sees the
+# claim backdated past CLAIM_STALE. Mutation check: an implementation that
+# proceeds on an overaged claim would STOLE-BY-CLAIM and exit 0.
+LOCK="$WORK/contested.lock"; LOG="$WORK/contested.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t24" "pid=9 host=ghost"; backdate "$LOCK" 9999
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+  AGENT_LOCK_CLAIM_STALE_SECS=2 AGENT_LOCK_POLL_SECS=0.2 AGENT_LOCK_MAX_WAIT=4 \
+  bash -c '
+    source "$1" || exit 70
+    clone_fn _lock_claim_state _cs_orig
+    _lock_claim_state() {
+      backdate "$_LOCK_CLAIM_PATH" 10 2>/dev/null || true
+      _cs_orig "$@"
+    }
+    lock_acquire
+    exit $?
+  ' _ "$LIB" 2>/dev/null; rc=$?
+[ "$rc" = 97 ] && ok "claimant kept aborting contested and timed out (97)" || bad "rc=$rc (want 97)"
+grep -q "CLAIM-ABORT (contested)" "$LOG" && ok "CLAIM-ABORT (contested) logged" || bad "no contested abort logged"
+grep -q "STOLE-BY-CLAIM" "$LOG" && bad "implementation proceeded to rename on an OVERAGED claim" || ok "no rename on an overaged claim"
+l1=""; IFS= read -r l1 < "$LOCK" || true
+[ "$l1" = "tok.ghost.t24" ] && ok "ghost lock untouched by the contested aborts" || bad "ghost lock was modified (line1=$l1)"
+[ -e "$LOCK.next" ] && bad "claim leftover after contested aborts" || ok "claim deleted on each contested abort"
+rm -f "$LOCK"
+
+echo "== Test 25: discovery-position matrix — own-claim-installed discovered on EVERY exit (plan test 9) =="
+# A rival's rename can install OUR claim as the lock while we sit at any
+# post-claim position. Each position steers that rename to the exact spot
+# (wrapping a library internal or shadowing mv/rm/touch in a sourced shell)
+# and asserts: the victim DISCOVERS ownership (HOLD), its release returns 0
+# (per-attempt hold token — a per-acquire-token implementation fails this),
+# and nothing is orphaned. The interleavings follow the plan's corrected
+# steering (claimant A passes recheck; clearer clears; victim B claims; A's
+# delayed rename installs B's claim).
+MATRIX_INNER='
+  pos="$2"
+  source "$1" || exit 70
+  rival_install() { command mv -f -- "$_LOCK_CLAIM_PATH" "$AGENT_LOCK_PATH" 2>/dev/null; }
+  F1=0; F2=0
+  case "$pos" in
+    step2-fresh)
+      clone_fn _lock_verify_stale _vs_orig
+      _lock_verify_stale() {
+        if [ "$F1" = 0 ]; then F1=1; rival_install; fi
+        _vs_orig "$@"
+      } ;;
+    recheck-gone)
+      clone_fn _lock_claim_state _cs_orig
+      _lock_claim_state() {
+        if [ "$F1" = 0 ]; then F1=1; rival_install; fi
+        _cs_orig "$@"
+      } ;;
+    touch-gone)
+      touch() {
+        case "$*" in *".next"*)
+          if [ "$F1" = 0 ]; then F1=1; rival_install; fi ;;
+        esac
+        command touch "$@"
+      } ;;
+    lock-gone)
+      clone_fn _lock_verify_stale _vs_orig
+      _lock_verify_stale() {
+        if [ "$F1" = 0 ]; then F1=1; command rm -f -- "$AGENT_LOCK_PATH"; fi
+        _vs_orig "$@"
+      }
+      clone_fn _lock_claim_state _cs_orig
+      _lock_claim_state() {
+        if [ "$F2" = 0 ]; then F2=1; rival_install; fi
+        _cs_orig "$@"
+      } ;;
+    contested)
+      clone_fn _lock_claim_state _cs_orig
+      _lock_claim_state() {
+        if [ "$F1" = 0 ]; then F1=1; backdate "$_LOCK_CLAIM_PATH" 70
+        elif [ "$F2" = 0 ]; then F2=1; rival_install; fi
+        _cs_orig "$@"
+      } ;;
+    deletion-gone)
+      clone_fn _lock_verify_stale _vs_orig
+      _lock_verify_stale() {
+        if [ "$F1" = 0 ]; then F1=1; command touch -- "$AGENT_LOCK_PATH"; fi
+        _vs_orig "$@"
+      }
+      rm() {
+        case "$*" in *".next"*)
+          if [ "$F2" = 0 ]; then F2=1; rival_install; fi ;;
+        esac
+        command rm "$@"
+      } ;;
+    source-gone)
+      mv() {
+        case "$*" in *".next"*)
+          if [ "$F1" = 0 ]; then F1=1; rival_install; fi ;;
+        esac
+        command mv "$@"
+      } ;;
+  esac
+  lock_acquire || exit 72
+  l1=""
+  IFS= read -r l1 < "$AGENT_LOCK_PATH" 2>/dev/null || true
+  [ "$l1" = "$_LOCK_TOKEN" ] || exit 73
+  lock_release || exit 74
+  exit 0
+'
+for pos in step2-fresh recheck-gone touch-gone lock-gone contested deletion-gone source-gone; do
+  MD="$WORK/m25.$pos"; mkdir -p "$MD"
+  LOCK="$MD/m.lock"; LOG="$MD/m.log"; : > "$LOG"
+  fabricate_lock "$LOCK" "tok.ghost.m25" "pid=9 host=ghost"
+  backdate "$LOCK" 9999
+  AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=5 \
+    AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=20 \
+    bash -c "$MATRIX_INNER" _ "$LIB" "$pos" 2> "$MD/err"; rc=$?
+  case "$pos" in
+    step2-fresh|deletion-gone) expect="CLAIM-ABORT (fresh)" ;;
+    recheck-gone)              expect="claim recheck: claim gone" ;;
+    touch-gone)                expect="claim gone at touch" ;;
+    lock-gone)                 expect="CLAIM-ABORT (gone)" ;;
+    contested)                 expect="CLAIM-ABORT (contested)" ;;
+    source-gone)               expect="claim (source) gone at rename" ;;
+    *)                         expect="UNREACHABLE-position-$pos" ;;
+  esac
+  if [ "$rc" = 0 ] && grep -q "DISCOVERY-HOLD" "$LOG" && grep -qF "$expect" "$LOG" \
+     && [ ! -e "$LOCK" ] && [ ! -e "$LOCK.next" ]; then
+    ok "position $pos: exit '$expect' -> discovery-HOLD, release rc 0, no orphan"
+  else
+    bad "position $pos: rc=$rc discovery=$(grep -c DISCOVERY-HOLD "$LOG") expect-line=$(grep -cF "$expect" "$LOG") lock-left=$([ -e "$LOCK" ] && echo yes || echo no) claim-left=$([ -e "$LOCK.next" ] && echo yes || echo no)"
+  fi
+done
+
+echo "== Test 26: delayed claim still installs a FRESH lease (the pre-rename touch; plan test 10) =="
+# A claim aged close to CLAIM_STALE (steered: backdated 40s of 60 at the
+# recheck) must still install a lock whose mtime is ~now — the step-3.2
+# touch resets the clock; rename preserves it (probe R2). A no-touch
+# implementation installs a 40s-old lease and fails the age bound.
+LOCK="$WORK/lease.lock"; LOG="$WORK/lease.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t26" "pid=9 host=ghost"; backdate "$LOCK" 9999
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=300 \
+  AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=20 \
+  bash -c '
+    source "$1" || exit 70
+    clone_fn _lock_claim_state _cs_orig
+    F1=0
+    _lock_claim_state() {
+      if [ "$F1" = 0 ]; then F1=1; backdate "$_LOCK_CLAIM_PATH" 40; fi
+      _cs_orig "$@"
+    }
+    lock_acquire || exit 72
+    mt="$(stat -c %Y "$AGENT_LOCK_PATH" 2>/dev/null || stat -f %m "$AGENT_LOCK_PATH" 2>/dev/null)"
+    [ -n "$mt" ] || exit 73
+    age=$(( $(date +%s) - mt ))
+    [ "$age" -le 15 ] || exit 75
+    lock_release || exit 74
+    exit 0
+  ' _ "$LIB" 2>/dev/null; rc=$?
+case "$rc" in
+  0)  ok "installed lock mtime was fresh (full lease) despite the 40s-old claim" ;;
+  75) bad "installed lock inherited the AGED claim mtime — pre-rename touch missing (lease defect)" ;;
+  *)  bad "delayed-claim lease harness rc=$rc" ;;
+esac
+grep -q "STOLE-BY-CLAIM" "$LOG" && ok "the delayed claim still completed its steal" || bad "no STOLE-BY-CLAIM in the lease test"
+
+echo "== Test 27: lock GONE at re-verify — CLAIM-ABORT (gone), NO rename onto the absent path (plan test 11) =="
+# A live-slow holder releasing under a claimant must route to the normal
+# create race, never a rename onto the absent path. Mutation check: a
+# renaming implementation would install the CLAIM token; the correct one
+# acquires with a fresh CREATE token (the two must differ in the log).
+LOCK="$WORK/gone.lock4a"; LOG="$WORK/gone4a.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t27" "pid=9 host=ghost"; backdate "$LOCK" 9999
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=2 \
+  AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=20 \
+  bash -c '
+    source "$1" || exit 70
+    clone_fn _lock_verify_stale _vs_orig
+    F1=0
+    _lock_verify_stale() {
+      if [ "$F1" = 0 ]; then F1=1; command rm -f -- "$AGENT_LOCK_PATH"; fi
+      _vs_orig "$@"
+    }
+    lock_acquire || exit 72
+    lock_release || exit 74
+    exit 0
+  ' _ "$LIB" 2>/dev/null; rc=$?
+[ "$rc" = 0 ] && ok "claimant re-raced the create after the gone abort (rc 0)" || bad "abort-on-gone harness rc=$rc"
+grep -q "CLAIM-ABORT (gone)" "$LOG" && ok "CLAIM-ABORT (gone) logged" || bad "no CLAIM-ABORT (gone)"
+ctok="$(sed -n 's/.* CLAIM .* tok=\([^ ]*\) by .*/\1/p' "$LOG" | head -1)"
+atok="$(sed -n 's/.*ACQUIRED (.*tok=\([^)]*\)).*/\1/p' "$LOG" | head -1)"
+if [ -n "$ctok" ] && [ -n "$atok" ] && [ "$ctok" != "$atok" ]; then
+  ok "acquired via a fresh CREATE token, not the claim's (claim=$ctok != acquired=$atok)"
+else
+  bad "claim token vs acquired token: claim='$ctok' acquired='$atok' (equal or missing => renamed onto the absent path?)"
+fi
+grep -q "DISCOVERY-HOLD" "$LOG" && bad "spurious discovery-HOLD in the gone lane" || ok "no spurious discovery-HOLD"
+
+echo "== Test 28: SUB-FLOOR claim mtime is never cleared — treated as just-created (plan test 12) =="
+LOCK="$WORK/cfloor.lock"; LOG="$WORK/cfloor.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t28" "pid=9 host=ghost"; backdate "$LOCK" 9999
+fabricate_lock "$LOCK.next" "tok.subfloor.t28" "pid=8 host=old"
+touch -t 197001120000 "$LOCK.next"          # epoch ~950400 — far below the floor
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+  AGENT_LOCK_CLAIM_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=2 \
+  bash "$LIB" run -- bash -c 'true' 2>/dev/null; rc=$?
+[ "$rc" = 97 ] && ok "sub-floor claim: waiter timed out (97) instead of clearing" || bad "sub-floor claim: rc=$rc (want 97)"
+grep -q "CLAIM-STALE-CLEARED" "$LOG" && bad "sub-floor claim was CLEARED — mtime floor missing on the claim path" \
+                                     || ok "sub-floor claim never cleared (floor applies to the claim)"
+[ -f "$LOCK.next" ] && ok "sub-floor claim file untouched" || bad "sub-floor claim file was removed"
+rm -f "$LOCK" "$LOCK.next"
+
+echo "== Test 29: BLOCKED steal rename — claim deleted IMMEDIATELY, no CLAIM_STALE penalty (plan test 14) =="
+# The rename is forced to fail-with-the-lock-still-present (a shadowed mv —
+# the no-delete-share squat, deterministically). The claimant must delete its
+# own claim at once and re-poll: with CLAIM_STALE=600, a leftover claim would
+# block every later attempt (exactly one CLAIM line); immediate deletion
+# yields a fresh CLAIM line per attempt.
+LOCK="$WORK/blocked.lock"; LOG="$WORK/blocked.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t29" "pid=9 host=ghost"; backdate "$LOCK" 9999
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+  AGENT_LOCK_CLAIM_STALE_SECS=600 AGENT_LOCK_POLL_SECS=0.2 AGENT_LOCK_MAX_WAIT=3 \
+  bash -c '
+    source "$1" || exit 70
+    mv() { case "$*" in *".next"*) return 1;; esac; command mv "$@"; }
+    lock_acquire
+    exit $?
+  ' _ "$LIB" 2>/dev/null; rc=$?
+[ "$rc" = 97 ] && ok "blocked-steal waiter honoured MAX_WAIT (97)" || bad "blocked-steal rc=$rc (want 97)"
+nclaim="$(grep -c "] CLAIM " "$LOG")"
+[ "$nclaim" -ge 2 ] && ok "claim re-created on later attempts (x$nclaim) — deleted immediately, no ageout penalty" \
+                    || bad "only $nclaim CLAIM line(s) — the failed steal's claim was left to age out (60s-class penalty)"
+grep -q "steal FAILED" "$LOG" && ok "blocked rename logged (damped steal FAILED)" || bad "no steal FAILED log line"
+[ -e "$LOCK.next" ] && bad "claim leftover after the blocked steal attempts" || ok "no claim leftover at exit"
+[ -f "$LOCK" ] && ok "squatted lock left in place" || bad "lock vanished in the blocked lane"
+rm -f "$LOCK"
+
+echo "== Test 30: static checks — the claim touch is NON-creating with an explicit existence check (plan test 16) =="
+grep -q 'touch -c -- "\$_LOCK_CLAIM_PATH"' "$LIB" \
+  && ok "claim touch uses 'touch -c --' (non-creating)" \
+  || bad "no 'touch -c -- \$_LOCK_CLAIM_PATH' in the implementation"
+grep -A3 'touch -c -- "\$_LOCK_CLAIM_PATH"' "$LIB" | grep -q -- '-e "\$_LOCK_CLAIM_PATH"' \
+  && ok "explicit existence check follows the touch (the exit code carries no gone signal)" \
+  || bad "no explicit [ -e ] existence check after the claim touch"
+bad_touch="$(grep 'touch ' "$LIB" | grep '_LOCK_CLAIM_PATH' | grep -v -- '-c')"
+[ -z "$bad_touch" ] && ok "no creating touch of the claim path anywhere" \
+                    || bad "creating touch of the claim path found: $bad_touch"
+
+echo "== Test 31: LEAKED-claim discovery — the leaked-token memory closes the unverified-claim lanes (plan test 21) =="
+# (a) main leg: a recheck-unreadable exit leaks the claim token; a rival
+# later installs that claim as the lock; the leaver's per-poll memory check
+# adopts it (HOLD) and release returns 0.
+# NB: _lock_read_tok / _lock_cur_token shadows run inside COMMAND
+# SUBSTITUTIONS (subshells), so their fire-once state must live in flag
+# FILES — a variable assignment would be lost when the subshell exits.
+T31A_INNER='
+  source "$1" || exit 70
+  clone_fn _lock_read_tok _rt_orig
+  SF1="$AGENT_LOCK_PATH.steer1"
+  _lock_read_tok() {
+    if [ ! -e "$SF1" ] && [ "$1" = "$_LOCK_CLAIM_PATH" ]; then : > "$SF1"; printf ""; return 0; fi
+    _rt_orig "$@"
+  }
+  lock_acquire || exit 72
+  lock_release || exit 74
+  exit 0
+'
+LOCK="$WORK/leak.lock"; LOG="$WORK/leak.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t31" "pid=9 host=ghost"; backdate "$LOCK" 9999
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=300 \
+  AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.2 AGENT_LOCK_MAX_WAIT=60 \
+  bash -c "$T31A_INNER" _ "$LIB" 2>/dev/null &
+w31=$!
+if wait_for_grep "LEAKED-CLAIM (recheck-unreadable)" "$LOG" 30; then
+  ok "recheck-unreadable exit fed the leaked-token memory"
+  mv -f -- "$LOCK.next" "$LOCK"            # the rival's rename installs the leaked claim
+else
+  bad "no LEAKED-CLAIM (recheck-unreadable) entry"
+fi
+wait "$w31"; rc=$?
+[ "$rc" = 0 ] && ok "leaver discovered its installed leaked claim and released rc 0" || bad "leaked-discovery harness rc=$rc"
+grep -q "DISCOVERY-HOLD (leaked-token memory)" "$LOG" && ok "adoption went through the leaked-token memory" \
+                                                      || bad "no leaked-token-memory DISCOVERY-HOLD"
+[ -e "$LOCK" ] && bad "lock leftover after leaked-claim adoption" || ok "lock released cleanly after adoption"
+[ -e "$LOCK.next" ] && bad "claim leftover after leaked-claim adoption" || ok "no claim leftover"
+# Hmm wait: STALE=300 — the ghost is backdated 9999 so it IS stale; fine.
+# (b) steering variant: the rival install lands between the leaver's
+# poll-read and its NEXT claim create, so the leaver runs one full ABORTING
+# claim attempt before discovery (mutation check: an implementation that
+# drops memory entries on a claim-attempt abort must fail — it would never
+# adopt and would time out).
+LOCK="$WORK/leakb.lock"; LOG="$WORK/leakb.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t31b" "pid=9 host=ghost"; backdate "$LOCK" 9999
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=300 \
+  AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.2 AGENT_LOCK_MAX_WAIT=60 \
+  bash -c '
+    source "$1" || exit 70
+    clone_fn _lock_read_tok _rt_orig
+    clone_fn _lock_new_token _nt_orig
+    SF1="$AGENT_LOCK_PATH.steer1"      # flag FILES: subshell-safe fire-once state
+    F2=0; NTC=0
+    _lock_read_tok() {
+      if [ ! -e "$SF1" ] && [ "$1" = "$_LOCK_CLAIM_PATH" ]; then : > "$SF1"; printf ""; return 0; fi
+      _rt_orig "$@"
+    }
+    _lock_new_token() {
+      if [ -e "$SF1" ] && [ "$F2" = 0 ]; then
+        NTC=$((NTC+1))
+        if [ "$NTC" = 2 ]; then F2=1; command mv -f -- "$_LOCK_CLAIM_PATH" "$AGENT_LOCK_PATH" 2>/dev/null; fi
+      fi
+      _nt_orig "$@"
+    }
+    lock_acquire || exit 72
+    lock_release || exit 74
+    exit 0
+  ' _ "$LIB" 2>/dev/null; rc=$?
+[ "$rc" = 0 ] && ok "memory survived an aborting claim attempt; adoption still happened (rc 0)" \
+              || bad "steering-variant rc=$rc (memory dropped on claim-attempt abort?)"
+lk_line="$(grep -n "LEAKED-CLAIM" "$LOG" | head -1 | cut -d: -f1)"
+ab_line="$(grep -n "CLAIM-ABORT (fresh)" "$LOG" | head -1 | cut -d: -f1)"
+dh_line="$(grep -n "DISCOVERY-HOLD (leaked-token memory)" "$LOG" | head -1 | cut -d: -f1)"
+if [ -n "$lk_line" ] && [ -n "$ab_line" ] && [ -n "$dh_line" ] \
+   && [ "$lk_line" -lt "$ab_line" ] && [ "$ab_line" -lt "$dh_line" ]; then
+  ok "order proven: leak -> full aborting claim attempt -> memory adoption"
+else
+  bad "expected leak(line $lk_line) < abort(line $ab_line) < adoption(line $dh_line) ordering"
+fi
+# (c) crashed leaver: the leaver dies (SIGKILL) with the entry pending; a
+# suspended rival installs the leaked claim -> a bounded unowned orphan that
+# ages out; the log's CLAIM tok= line identifies the unowned lock's token
+# (forensics).
+LOCK="$WORK/leakc.lock"; LOG="$WORK/leakc.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t31c" "pid=9 host=ghost"; backdate "$LOCK" 9999
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=300 \
+  AGENT_LOCK_CLAIM_STALE_SECS=600 AGENT_LOCK_POLL_SECS=0.2 AGENT_LOCK_MAX_WAIT=60 \
+  bash -c "$T31A_INNER" _ "$LIB" 2>/dev/null &
+w31c=$!
+if wait_for_grep "LEAKED-CLAIM (recheck-unreadable)" "$LOG" 30; then
+  L31=""; IFS= read -r L31 < "$LOCK.next" || true
+  kill -9 "$w31c" 2>/dev/null            # untrappable death; exact PID only
+  wait "$w31c" 2>/dev/null
+  mv -f -- "$LOCK.next" "$LOCK"          # the suspended rival installs the orphan
+  grep -qF "tok=$L31 by" "$LOG" && ok "forensics: the unowned lock's token appears in a CLAIM line" \
+                                || bad "unowned lock token $L31 not identifiable from CLAIM log lines"
+  : > "$WORK/leakc.w2.log"
+  AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$WORK/leakc.w2.log" AGENT_LOCK_STALE_SECS=2 \
+    AGENT_LOCK_CLAIM_STALE_SECS=2 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=30 \
+    bash "$LIB" run -- bash -c 'true' 2>/dev/null; rc=$?
+  [ "$rc" = 0 ] && ok "waiters recovered the unowned orphan at staleness (bounded residual-5 outcome)" \
+                || bad "recovery rc=$rc behind the unowned orphan"
+  grep -q "STOLE-BY-CLAIM" "$WORK/leakc.w2.log" && ok "orphan reclaimed by a normal staleness steal" \
+                                                || bad "orphan not reclaimed via STOLE-BY-CLAIM"
+else
+  bad "crashed-leaver setup: no LEAKED-CLAIM entry"
+  kill -9 "$w31c" 2>/dev/null; wait "$w31c" 2>/dev/null
+fi
+[ -e "$LOCK" ] && bad "lock leftover after crashed-leaver recovery" || ok "no lock leftover after crashed-leaver recovery"
+# (d) the REAL deletion-unlink-blocked feeder + the arc-end resolution pass
+# (Windows-only: needs a no-delete-share handle; on POSIX open handles never
+# block unlink). The claimant pauses at its claim touch; a pwsh holder pins
+# the claim (FileShare.Read); the lock is renewed so the claimant aborts
+# (fresh) and its token-checked deletion BLOCKS -> leaked-blocked feeder.
+# The handle then closes, the ghost is removed, the claimant acquires
+# normally and its RELEASE's arc-end pass unlinks the leaked claim.
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*)
+    if command -v pwsh >/dev/null 2>&1; then
+      LOCK="$WORK/leakd.lock"; LOG="$WORK/leakd.log"; : > "$LOG"
+      fabricate_lock "$LOCK" "tok.ghost.t31d" "pid=9 host=ghost"; backdate "$LOCK" 9999
+      T31R="$WORK/t31d.ready"; T31G="$WORK/t31d.go"; rm -f "$T31R" "$T31G"
+      T31R="$T31R" T31G="$T31G" \
+      AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+        AGENT_LOCK_CLAIM_STALE_SECS=600 AGENT_LOCK_POLL_SECS=0.2 AGENT_LOCK_MAX_WAIT=120 \
+        bash -c '
+          source "$1" || exit 70
+          F1=0
+          touch() {
+            case "$*" in *".next"*)
+              if [ "$F1" = 0 ]; then
+                F1=1
+                command touch "$T31R"
+                until [ -e "$T31G" ]; do sleep 0.05; done
+              fi ;;
+            esac
+            command touch "$@"
+          }
+          lock_acquire || exit 72
+          lock_release || exit 74
+          exit 0
+        ' _ "$LIB" 2>/dev/null &
+      w31d=$!
+      if wait_for_file "$T31R" 30; then
+        CW="$(cygpath -m "$LOCK.next")"; HR="$WORK/t31d.hready"; HG="$WORK/t31d.hgo"; rm -f "$HR" "$HG"
+        HRW="$(cygpath -m "$HR")"; HGW="$(cygpath -m "$HG")"
+        pwsh -NoProfile -Command "
+          \$fs = [System.IO.File]::Open('$CW', [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+          [System.IO.File]::WriteAllText('$HRW', 'r')
+          while (-not (Test-Path -LiteralPath '$HGW')) { Start-Sleep -Milliseconds 50 }
+          \$fs.Dispose()
+        " > "$WORK/t31d.pwsh.err" 2>&1 &
+        h31d=$!
+        if wait_for_file "$HR" 60; then
+          touch -- "$LOCK"               # renew: forces the fresh abort -> blocked deletion
+          touch "$T31G"
+          if wait_for_grep "LEAKED-CLAIM (deletion-unlink-blocked-while-present)" "$LOG" 30; then
+            ok "blocked claim unlink fed the leaked-token memory (deletion-unlink-blocked-while-present)"
+          else
+            bad "no deletion-unlink-blocked LEAKED-CLAIM entry"
+          fi
+          touch "$HG"                    # close the handle
+          sleep 0.5
+          rm -f "$LOCK"                  # the 'slow holder' releases; claimant now acquires
+          wait "$w31d"; rc=$?
+          [ "$rc" = 0 ] && ok "leaver acquired normally after the leak (rc 0, leak pending into the hold)" \
+                        || bad "T31d leaver rc=$rc"
+          grep -q "claim unlinked at arc end" "$LOG" && ok "release's arc-end resolution pass unlinked the leaked claim" \
+                                                     || bad "arc-end resolution pass did not resolve the leaked claim"
+          [ -e "$LOCK.next" ] && bad "leaked claim left after the arc-end pass" || ok "no leaked claim leftover"
+        else
+          bad "T31d pwsh handle holder never signalled ready"
+          touch "$T31G"; touch "$HG"; wait "$w31d" 2>/dev/null
+        fi
+        wait "$h31d" 2>/dev/null
+      else
+        bad "T31d claimant never reached its claim touch"
+        kill -9 "$w31d" 2>/dev/null; wait "$w31d" 2>/dev/null
+      fi
+      rm -f "$LOCK" "$LOCK.next"
+    else
+      echo "note: pwsh not on PATH — the real blocked-unlink feeder leg not exercised here (Windows CI covers it)"
+    fi
+    ;;
+  *)
+    echo "note: the blocked-unlink feeder leg is Windows-only by construction (POSIX open handles never block unlink); the read-shadow legs above cover the memory machinery"
+    ;;
+esac
+
+echo "== Test 32: per-attempt tokens — an abandoned own-token lock never aliases discovery or release (plan test 22) =="
+# Walk: the first CREATE's read-back is forced blank (and the abandoned lock
+# backdated stale). A later CLAIM attempt is steered into a recheck-gone
+# discovery against that abandoned lock: a reused-per-acquire-token
+# implementation would see "its" token there and false-HOLD; per-attempt
+# tokens make it a miss, and the claimant then steals normally and releases
+# rc 0 against the WINNING attempt's token.
+LOCK="$WORK/perattempt.lock"; LOG="$WORK/perattempt.log"; : > "$LOG"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=5 \
+  AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=30 \
+  bash -c '
+    source "$1" || exit 70
+    clone_fn _lock_cur_token _ct_orig
+    clone_fn _lock_claim_state _cs_orig
+    SF1="$AGENT_LOCK_PATH.steer1"      # flag FILE: the cur_token shadow runs in subshells
+    F2=0
+    _lock_cur_token() {
+      if [ ! -e "$SF1" ] && [ "${_LOCK_HELD:-0}" = 0 ] && [ -z "$_LOCK_CLAIM_TOKEN" ]; then
+        : > "$SF1"
+        backdate "$AGENT_LOCK_PATH" 9999 2>/dev/null || true
+        printf ""
+        return 0
+      fi
+      _ct_orig "$@"
+    }
+    _lock_claim_state() {
+      if [ "$F2" = 0 ]; then F2=1; command rm -f -- "$_LOCK_CLAIM_PATH"; fi
+      _cs_orig "$@"
+    }
+    lock_acquire || exit 72
+    lock_release || exit 74
+    exit 0
+  ' _ "$LIB" 2>/dev/null; rc=$?
+[ "$rc" = 0 ] && ok "abandon -> claim -> steal walk completed with release rc 0 (per-attempt hold token)" \
+              || bad "per-attempt-token harness rc=$rc"
+grep -q "acquire verification FAILED" "$LOG" && ok "the first create was abandoned (read-back forced blank)" \
+                                             || bad "abandonment lane never ran"
+grep -q "claim recheck: claim gone" "$LOG" && ok "the steered discovery against the abandoned lock ran" \
+                                           || bad "recheck-gone discovery never ran"
+grep -q "DISCOVERY-HOLD" "$LOG" && bad "FALSE discovery-HOLD on the abandoned own-token lock (token reuse!)" \
+                                || ok "no false discovery-HOLD — the abandoned token did not alias the claim attempt"
+grep -q "STOLE-BY-CLAIM" "$LOG" && ok "the abandoned lock was then reclaimed by a normal steal" \
+                                || bad "no STOLE-BY-CLAIM of the abandoned lock"
+
+echo "== Test 33: TERM mid-claim — the trap deletes the claim (token-checked), no 98, no ageout penalty (plan test 23) =="
+# (a) main: claimant paused inside its claim window (at the touch), TERM'd.
+# The trap must delete OUR claim, run the discovery read (miss: the ghost is
+# foreign), restore traps, re-raise (143) — and must NOT touch the lock.
+T33_INNER='
+  source "$1" || exit 70
+  F1=0
+  touch() {
+    case "$*" in *".next"*)
+      if [ "$F1" = 0 ]; then
+        F1=1
+        command touch "$T33R"
+        until [ -e "$T33G" ]; do sleep 0.05; done
+      fi ;;
+    esac
+    command touch "$@"
+  }
+  lock_acquire
+  exit $?
+'
+LOCK="$WORK/termclaim.lock"; LOG="$WORK/termclaim.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t33" "pid=9 host=ghost"; backdate "$LOCK" 9999
+T33R="$WORK/t33.ready"; T33G="$WORK/t33.go"; rm -f "$T33R" "$T33G"
+T33R="$T33R" T33G="$T33G" \
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+  AGENT_LOCK_CLAIM_STALE_SECS=600 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=60 \
+  bash -c "$T33_INNER" _ "$LIB" 2>/dev/null &
+w33=$!
+wait_for_file "$T33R" 30 || bad "T33a claimant never reached its claim touch"
+kill -TERM "$w33" 2>/dev/null
+sleep 0.1
+kill -TERM "$w33" 2>/dev/null
+touch "$T33G"
+wait "$w33"; rc=$?
+[ "$rc" = 143 ] && ok "TERM'd claimant re-raised and died 143" || bad "TERM'd claimant rc=$rc (want 143)"
+[ -e "$LOCK.next" ] && bad "claim leftover after TERM (trap cleanup missing)" || ok "trap deleted the in-flight claim"
+l1=""; IFS= read -r l1 < "$LOCK" || true
+[ "$l1" = "tok.ghost.t33" ] && ok "the lock itself untouched by the trap (no release semantics on a mere claim)" \
+                            || bad "lock modified by the dying claimant (line1=$l1)"
+grep -q "lock LOST" "$LOG" && bad "98-classification ran on a mere claim" || ok "no 98 classification for the dying claimant"
+# No ageout penalty: with CLAIM_STALE=600, a leftover claim would block this
+# next stealer past its MAX_WAIT; immediate trap deletion lets it steal now.
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+  AGENT_LOCK_CLAIM_STALE_SECS=600 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=10 \
+  bash "$LIB" run -- bash -c 'true' 2>/dev/null; rc=$?
+[ "$rc" = 0 ] && ok "next stealer recovered immediately (no CLAIM_STALE penalty)" || bad "next stealer rc=$rc — ageout penalty paid"
+# (b) FOREIGN-claim leg: a foreign claim planted before the TERM must
+# SURVIVE the dying claimant's trap (kills a blind-unlink trap).
+LOCK="$WORK/termforeign.lock"; LOG="$WORK/termforeign.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t33b" "pid=9 host=ghost"; backdate "$LOCK" 9999
+rm -f "$T33R" "$T33G"
+T33R="$T33R" T33G="$T33G" \
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+  AGENT_LOCK_CLAIM_STALE_SECS=600 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=60 \
+  bash -c "$T33_INNER" _ "$LIB" 2>/dev/null &
+w33b=$!
+wait_for_file "$T33R" 30 || bad "T33b claimant never reached its claim touch"
+rm -f "$LOCK.next"
+fabricate_lock "$LOCK.next" "tok.foreign.t33" "pid=7 host=rival"   # a rival claimed meanwhile
+kill -TERM "$w33b" 2>/dev/null
+sleep 0.1
+kill -TERM "$w33b" 2>/dev/null
+touch "$T33G"
+wait "$w33b"; rc=$?
+[ "$rc" = 143 ] && ok "TERM'd claimant (foreign-claim leg) died 143" || bad "foreign-claim leg rc=$rc (want 143)"
+l1=""; IFS= read -r l1 < "$LOCK.next" 2>/dev/null || true
+[ "$l1" = "tok.foreign.t33" ] && ok "foreign claim SURVIVED the dying claimant's trap (token-checked deletion)" \
+                              || bad "foreign claim deleted/damaged by the trap (line1='$l1') — blind unlink!"
+rm -f "$LOCK" "$LOCK.next"
+# (c) blocked-unlink variant (Windows-only): TERM lands while the claim's
+# unlink is blocked by a no-delete-share handle — the trap's ONE bounded
+# retry fails, the process exits LEAVING the claim (residual-5 class), and
+# the next stealer recovers at CLAIM_STALE.
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*)
+    if command -v pwsh >/dev/null 2>&1; then
+      LOCK="$WORK/termblocked.lock"; LOG="$WORK/termblocked.log"; : > "$LOG"
+      fabricate_lock "$LOCK" "tok.ghost.t33c" "pid=9 host=ghost"; backdate "$LOCK" 9999
+      rm -f "$T33R" "$T33G"
+      T33R="$T33R" T33G="$T33G" \
+      AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+        AGENT_LOCK_CLAIM_STALE_SECS=4 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=60 \
+        bash -c "$T33_INNER" _ "$LIB" 2>/dev/null &
+      w33c=$!
+      if wait_for_file "$T33R" 30; then
+        CW="$(cygpath -m "$LOCK.next")"; HR="$WORK/t33c.hready"; HG="$WORK/t33c.hgo"; rm -f "$HR" "$HG"
+        HRW="$(cygpath -m "$HR")"; HGW="$(cygpath -m "$HG")"
+        pwsh -NoProfile -Command "
+          \$fs = [System.IO.File]::Open('$CW', [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+          [System.IO.File]::WriteAllText('$HRW', 'r')
+          while (-not (Test-Path -LiteralPath '$HGW')) { Start-Sleep -Milliseconds 50 }
+          \$fs.Dispose()
+        " > "$WORK/t33c.pwsh.err" 2>&1 &
+        h33c=$!
+        if wait_for_file "$HR" 60; then
+          kill -TERM "$w33c" 2>/dev/null
+          sleep 0.1
+          kill -TERM "$w33c" 2>/dev/null
+          touch "$T33G"
+          wait "$w33c"; rc=$?
+          [ "$rc" = 143 ] && ok "TERM'd claimant exited 143 despite the blocked unlink" || bad "blocked-unlink TERM rc=$rc (want 143)"
+          [ -e "$LOCK.next" ] && ok "claim LEFT behind (bounded residual-5 behavior — no machinery pretends otherwise)" \
+                              || bad "claim gone despite the no-delete-share handle?"
+          touch "$HG"; wait "$h33c" 2>/dev/null
+          AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+            AGENT_LOCK_CLAIM_STALE_SECS=4 AGENT_LOCK_POLL_SECS=0.2 AGENT_LOCK_MAX_WAIT=30 \
+            bash "$LIB" run -- bash -c 'true' 2>/dev/null; rc=$?
+          [ "$rc" = 0 ] && grep -q "CLAIM-STALE-CLEARED" "$LOG" \
+            && ok "next stealer recovered at CLAIM_STALE (cleared the orphaned claim)" \
+            || bad "recovery after the blocked-unlink TERM failed (rc=$rc)"
+        else
+          bad "T33c pwsh handle holder never signalled ready"
+          touch "$T33G"; kill -TERM "$w33c" 2>/dev/null; wait "$w33c" 2>/dev/null
+          touch "$HG"; wait "$h33c" 2>/dev/null
+        fi
+      else
+        bad "T33c claimant never reached its claim touch"
+        kill -9 "$w33c" 2>/dev/null; wait "$w33c" 2>/dev/null
+      fi
+      rm -f "$LOCK" "$LOCK.next"
+    else
+      echo "note: pwsh not on PATH — TERM-blocked-unlink leg not exercised here (Windows CI covers it)"
+    fi
+    ;;
+  *)
+    echo "note: TERM-blocked-unlink leg is Windows-only by construction (POSIX open handles never block unlink)"
+    ;;
+esac
+
+echo "== Test 34: TERM on a STEAL-acquired hold releases exactly like a create-acquired one (plan test 24) =="
+# All acquisition paths go through the shared claim-the-hold helper, so a
+# steal-acquired holder must run the same HELD/trap machinery: release on
+# TERM, re-raise, 143 (T11's contract, on a steal-acquired hold).
+LOCK="$WORK/stealterm.lock"; LOG="$WORK/stealterm.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t34" "pid=9 host=ghost"; backdate "$LOCK" 9999
+READY="$WORK/t34.ready"; GO34="$WORK/t34.go"; rm -f "$READY" "$GO34"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=2 \
+  AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=30 \
+  bash "$LIB" run -- bash -c 'touch "$1"; until [ -e "$2" ]; do sleep 0.05; done' _ "$READY" "$GO34" 2>/dev/null &
+w34=$!
+wait_for_file "$READY" 30 || bad "T34 steal-holder never signalled ready"
+grep -q "STOLE-BY-CLAIM" "$LOG" && ok "the hold under TERM test is steal-acquired (STOLE-BY-CLAIM)" \
+                                || bad "holder did not acquire via steal — parity test vacuous"
+kill -TERM "$w34" 2>/dev/null
+sleep 0.1
+kill -TERM "$w34" 2>/dev/null
+touch "$GO34"
+wait "$w34"; rc=$?
+[ "$rc" = 143 ] && ok "TERM'd steal-acquired holder exited 143 (signal re-raised)" || bad "steal-acquired TERM rc=$rc (want 143)"
+[ -e "$LOCK" ] && bad "lock left held after TERM on a steal-acquired hold" || ok "steal-acquired lock released on TERM"
+grep -q "RELEASED" "$LOG" && ok "release logged on the steal-acquired TERM path" || bad "no RELEASED entry for the steal-acquired hold"
+
+echo "== Test 35: release-time leaked-claim cleanup — displaced hold cleans its own installed leak, 98 (plan test 25) =="
+# (a) B leaks token L (recheck-unreadable; the ghost vanishes at the same
+# moment), acquires fresh N normally; a rival installs L over the lock,
+# displacing B's held N. B's release must return 98 AND unlink L (the lock
+# path is clean immediately after), logging RELEASE-CLEANED-LEAKED-CLAIM.
+LOCK="$WORK/relclean.lock"; LOG="$WORK/relclean.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t35" "pid=9 host=ghost"; backdate "$LOCK" 9999
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=5 \
+  AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=20 \
+  bash -c '
+    source "$1" || exit 70
+    clone_fn _lock_read_tok _rt_orig
+    SF1="$AGENT_LOCK_PATH.steer1"      # flag FILE: the read_tok shadow runs in subshells
+    _lock_read_tok() {
+      if [ ! -e "$SF1" ] && [ "$1" = "$_LOCK_CLAIM_PATH" ]; then
+        : > "$SF1"
+        command rm -f -- "$AGENT_LOCK_PATH"     # the live-slow ghost holder releases here
+        printf ""
+        return 0
+      fi
+      _rt_orig "$@"
+    }
+    lock_acquire || exit 72                      # leaks L, then creates fresh N
+    [ -e "$_LOCK_CLAIM_PATH" ] || exit 73        # the leaked claim is still on disk
+    command mv -f -- "$_LOCK_CLAIM_PATH" "$AGENT_LOCK_PATH" 2>/dev/null || exit 76   # rival installs L
+    lock_release; rrc=$?
+    [ "$rrc" = 98 ] || exit 74
+    [ -e "$AGENT_LOCK_PATH" ] && exit 75         # cleaned immediately — no STALE stall
+    exit 0
+  ' _ "$LIB" 2>/dev/null; rc=$?
+case "$rc" in
+  0)  ok "displaced hold: release returned 98 AND cleaned the installed leaked claim immediately" ;;
+  74) bad "release did not classify the leaked-claim displacement as 98" ;;
+  75) bad "release returned 98 but LEFT the installed leaked claim (a STALE-window stall)" ;;
+  *)  bad "release-cleanup harness rc=$rc" ;;
+esac
+grep -q "RELEASE-CLEANED-LEAKED-CLAIM" "$LOG" && ok "RELEASE-CLEANED-LEAKED-CLAIM logged" \
+                                              || bad "no RELEASE-CLEANED-LEAKED-CLAIM log line"
+grep -q "LEAKED-CLAIM (recheck-unreadable)" "$LOG" && ok "the leak rode through the successful acquire into release" \
+                                                   || bad "leak entry missing"
+# (b) boundary variant: the installed L is instantly stale; a successor's
+# steal lands between B's leaked-token verification and its cleanup unlink.
+# B must NOT delete the successor's live lock (the pre-unlink re-read backs
+# off; entry dropped) and must still classify 98.
+LOCK="$WORK/relbound.lock"; LOG="$WORK/relbound.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t35b" "pid=9 host=ghost"; backdate "$LOCK" 9999
+fabricate_lock "$WORK/t35b.succ" "tok.successor.t35" "pid=7 host=succ"
+SUCC="$WORK/t35b.succ" \
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=5 \
+  AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=20 \
+  bash -c '
+    source "$1" || exit 70
+    clone_fn _lock_read_tok _rt_orig
+    clone_fn _lock_cur_token _ct_orig
+    SF1="$AGENT_LOCK_PATH.steer1"      # flag FILES: both shadows run in subshells
+    SF3="$AGENT_LOCK_PATH.steer3"
+    L=""; RELPHASE=0
+    _lock_read_tok() {
+      if [ ! -e "$SF1" ] && [ "$1" = "$_LOCK_CLAIM_PATH" ]; then
+        : > "$SF1"
+        command rm -f -- "$AGENT_LOCK_PATH"
+        printf ""
+        return 0
+      fi
+      _rt_orig "$@"
+    }
+    _lock_cur_token() {
+      local r; r="$(_ct_orig "$@")"
+      if [ "$RELPHASE" = 1 ] && [ ! -e "$SF3" ] && [ -n "$L" ] && [ "$r" = "$L" ]; then
+        : > "$SF3"
+        command mv -f -- "$SUCC" "$AGENT_LOCK_PATH" 2>/dev/null   # the successor steals L
+      fi
+      printf "%s" "$r"
+    }
+    lock_acquire || exit 72
+    IFS= read -r L < "$_LOCK_CLAIM_PATH" || exit 73
+    command mv -f -- "$_LOCK_CLAIM_PATH" "$AGENT_LOCK_PATH" 2>/dev/null || exit 76   # rival installs L
+    RELPHASE=1
+    lock_release; rrc=$?
+    [ "$rrc" = 98 ] || exit 74
+    l1=""; IFS= read -r l1 < "$AGENT_LOCK_PATH" 2>/dev/null || true
+    [ "$l1" = "tok.successor.t35" ] || exit 75   # the successor lock must survive
+    exit 0
+  ' _ "$LIB" 2>/dev/null; rc=$?
+case "$rc" in
+  0)  ok "boundary variant: pre-unlink re-read backed off — successor's lock survived, release still 98" ;;
+  74) bad "boundary variant: release did not classify 98" ;;
+  75) bad "boundary variant: B DELETED the successor's live lock (boundary re-read missing)" ;;
+  *)  bad "boundary-variant harness rc=$rc" ;;
+esac
+grep -q "RELEASE-CLEANED-LEAKED-CLAIM" "$LOG" && bad "boundary variant wrongly logged a leaked-claim cleanup" \
+                                              || ok "no cleanup line when the re-read backed off"
+rm -f "$LOCK" "$LOCK.next" "$WORK/t35b.succ"
 
 # NOTES (deliberately untested here):
 # * lock_release's LEFTOVER lane (the unlink blocked persistently) needs a
