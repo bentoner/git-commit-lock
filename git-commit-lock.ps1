@@ -1281,14 +1281,19 @@ function script:Lock-ClaimTrapCleanup {
             # Present but unreadable/empty at the boundary: ownership
             # unverifiable - never delete what might be a successor's nascent
             # lock; leave it (the staleness backstop recovers a true orphan).
+            # Stderr too, like the normal release's unverifiable lane.
             script:Lock-Log "WARNING: trap-time discovery-HOLD lock present but EMPTY/unreadable at the boundary re-read; ownership unverifiable - leaving it in place. (tok=$tok)"
+            [Console]::Error.WriteLine("git-commit-lock: WARNING - the lock file read empty/unreadable during acquire unwind (still present). Ownership unverifiable; lock file left in place.")
         } else {
             # Gone, or a foreign token: displaced between the discovery read
             # and the boundary re-read - a successor owns the path now; do
             # not touch it. (No 98 verdict surfaces here: the unwind has no
             # caller to return one to; the displacement is the successor's
-            # detected lane.)
+            # detected lane.) Stderr too, like the normal release's
+            # gone/foreign lane - though as a note, not a "commit was NOT
+            # serialised" warning: no command ran under this discovery-HOLD.
             script:Lock-Log "trap-time discovery-HOLD displaced before its release (tok=$tok); leaving the path to its successor"
+            [Console]::Error.WriteLine("git-commit-lock: note - our briefly-installed lock (claim adopted at exit) was displaced before its trap-time release; path left to its successor.")
         }
     }
 }
@@ -1765,7 +1770,13 @@ function Lock-Release {
             # Re-read no longer the leaked token: a successor stole/replaced
             # it - its rename destroyed our leaked claim, resolving the leak;
             # do NOT touch the successor's live lock. Either way the entry is
-            # resolved.
+            # resolved. (Unconditional drop - deliberately NOT the
+            # resolve-pass's inconclusive-keep (Lock-LeakedLockResolved): the
+            # boundary re-read ran the FULL 8-try ladder immediately after
+            # this same arc read the leaked token OK, so an unreadable/empty
+            # re-read here means the leak file was destroyed and a successor
+            # is mid-create at the path - not a transient read flake - and
+            # the leaked token cannot reappear.)
             script:Lock-LeakedDrop $cur
             script:Lock-LeakedResolvePass
             script:Lock-Log "WARNING: lock LOST before release - our held lock was displaced by our own leaked claim (rival rename). This commit was NOT exclusive - redo it. (ours=$script:LockToken installed-leak=$cur)"

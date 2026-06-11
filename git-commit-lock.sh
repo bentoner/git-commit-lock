@@ -1650,6 +1650,12 @@ lock_release() {
       # Re-read no longer the leaked token: a successor stole/replaced it —
       # its rename destroyed our leaked claim, resolving the leak; do NOT
       # touch the successor's live lock. Either way the entry is resolved.
+      # (Unconditional drop — deliberately NOT the resolve-pass's
+      # inconclusive-keep (_lock_leaked_lock_resolved): the boundary re-read
+      # ran the FULL 8-try ladder immediately after this same arc read the
+      # leaked token OK, so an empty-but-present re-read here means the leak
+      # file was destroyed and a successor is mid-create at the path — not a
+      # transient read flake — and the leaked token cannot reappear.)
       _lock_leaked_drop "$cur"
       _lock_leaked_resolve_pass
       _lock_restore_traps

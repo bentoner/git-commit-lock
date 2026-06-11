@@ -69,8 +69,9 @@ serialized through a claim file, so when several waiters race to recover the
 same dead lock exactly one steals it and the recovering waiter keeps the
 lock it recovered (except on the Windows PowerShell 5.1 lane, where a rival's
 create can win the recovered path and the claimant backs off cleanly) — the
-narrow residual races surface as the same loud exit 98. The lock is advisory: it serialises cooperating
-agents and trusts the repo and every process running as the same user — see
+narrow residual races surface as the same loud exit 98. The lock is
+advisory: it serialises cooperating agents and trusts the repo and every
+process running as the same user — see
 [Security and trust
 assumptions](docs/git-commit-lock.md#security-and-trust-assumptions).
 Full design and rationale — why a stealable lease beats

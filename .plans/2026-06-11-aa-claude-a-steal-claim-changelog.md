@@ -485,8 +485,10 @@ orphans it unwatched). Fix: a three-way lock read in both impls —
   same classification a sharing-violation read takes — then a later
   acquire ADOPTS the kept entry and releases rc 0; plus
   drop-on-different-token and drop-on-definitively-absent legs; kills
-  the pre-fix implementation via the adoption leg, which times out when
-  the entry was dropped). Interop **Test 16e part 1** is the ps1
+  the pre-fix implementation at the survive-membership check (exit 71)
+  the moment the entry is dropped — the adoption leg never runs against
+  it, and additionally guards the fixed behaviour end-to-end). Interop
+  **Test 16e part 1** is the ps1
   mirror (keep + drop), driven by a dot-sourcing pwsh driver — the ps1
   side's unit-equivalent steering mechanism, first used here.
 - Empirically demonstrated pre-commit (probe + suite): inconclusive
@@ -567,3 +569,96 @@ lighter than the doc's, per the disposition.
 - Integration suite NOT run: nothing it exercises changed (the fixes
   are anomaly-lane semantics, tests, headers and docs; the protocol's
   happy paths are untouched).
+
+## Fix wave 2 (2026-06-12) — recovery-test backdate-harness race + cosmetics
+
+### Item 1 — the multi-waiter recovery tests' backdate raced the protocol
+
+A loaded-box run (preserved `cl-interop-42280df2`) failed T16/T16b-class
+assertions with the protocol behaving exactly as designed. Race walk:
+the harness plants a FRESH ghost, waits for every waiter's WAITING line,
+then backdates. Under load (a) the sync can stall past STALE, so the
+ghost ages stale NATURALLY and a fast waiter steals it BEFORE the touch
+(observed: pwsh waiter judged the fresh ghost at age=3s == STALE
+boundary), and (b) the backdate's touch then lands on the WINNER'S
+freshly installed lock, ageing it to 10000s — a rival legitimately
+re-steals it and the displaced winner exits 98 ("zero 98s / exactly one
+STOLE-BY-CLAIM" fail, no protocol fault).
+
+Harness shape chosen (same for unit T2b and interop T16 — and T16b,
+which shares the pattern and the race; the WAITING-sync shape was KEPT
+because launching against a pre-aged ghost loses the contention: the
+first arrival steals before slow-cold-start waiters even poll, so they
+contend on a LIVE lock instead of the stale one):
+
+- **`sync_waiting_fresh`** — the WAITING sync now keeps the ghost FRESH
+  (`touch -c` to now each 0.2s poll) so it cannot age stale mid-sync;
+  freshening is race-safe (a live winner lock is already fresh; `-c`
+  never resurrects a released path).
+- **`backdate_ghost`** — token-guarded backdate: pre-read must be the
+  ghost (else no touch — premise already gone); ghost post-read is
+  conclusive-valid; non-ghost post-read is arbitrated by MTIME (a
+  winner's installed lock is fresh => the touch hit the ghost — valid;
+  ancient => the touch hit the winner's live lock — invalid; vanished
+  => non-conclusive).
+- **Outcome-based acceptance with bounded retries (x3/round)**: a
+  non-conclusive backdate accepts a CLEAN outcome (harness damage always
+  manifests as 98s / "lock LOST" / steals != 1 / leftovers) and discards
+  + retries a dirty one as unattributable. Two intermediate designs were
+  measured insufficient before this: strict post-check discarded VALID
+  rounds constantly (waiters poll at 0.05s; the post-read costs
+  subprocess spawns — interop T16b failed 3/3 attempts under load with
+  the steal at age=9999s, i.e. the touch HAD hit the ghost), and mtime
+  arbitration alone still failed when the whole steal+release cycle
+  completed before the post-read (path vanished, nothing to arbitrate).
+- Interop T16/T16b STALE 3 -> 8 (margin against natural ageing; nothing
+  in the tests depends on the smaller window).
+- A real protocol displacement bug cannot hide behind the retry: it
+  dirties every attempt, exhausts the 3 tries, and fails loudly
+  ("no clean round under a conclusive backdate"), logs preserved.
+
+Stability evidence (REDUCED, this Windows box, counts read back):
+- Unit suite x7 (1 foreground, 1 final foreground, 5 under concurrent
+  load incl. a 2-unit+2-interop round): T2b green in 7/7; full suite
+  213/0 in both foreground runs.
+- Interop suite x8: run 1 went 141/0 with the guard FIRING live on
+  T16 try 1 (discard + clean retry); after the final outcome-based
+  design, 6/6 consecutive 141/0 (5 under concurrent load).
+- Known artifact, documented at unit 12d: a suite launched as a
+  BACKGROUND job from a non-job-control shell inherits SIGINT-ignored,
+  which bash reports as `trap -- '' SIGINT` and 12d's leftover-trap
+  regex flags (false failure; foreground runs green). Comment added at
+  12d.
+
+### Items 2–5 (confirmation-review cosmetics)
+
+2. `lock_release` displaced-by-own-leak lane (both impls): kept the
+   unconditional `_lock_leaked_drop`/`Lock-LeakedDrop` and added the
+   justifying comment (divergence from the resolve-pass's
+   inconclusive-keep is sound here: the boundary re-read ran the FULL
+   8-try ladder immediately after the same arc read the leaked token
+   OK, so empty-but-present means the leak file was destroyed, not a
+   read flake). Chosen over routing through
+   `_lock_leaked_lock_resolved` to avoid a redundant extra lock read
+   and a subtle LEFTOVER-lane behaviour change.
+3. The Phase-5 Test-36 kill-mechanism sentence corrected in place (the
+   pre-fix impl dies at the survive-membership check, exit 71 — not via
+   the adoption-leg timeout).
+4. ps1 `Lock-ClaimTrapCleanup` unverifiable/displaced lanes now write
+   stderr too (parity with bash + the ps1 normal release); the
+   displaced lane's stderr is a note, not a "commit was NOT serialised"
+   warning — no command ran under a discovery-HOLD. (The Blocking-2
+   paragraph above predates this; its "log only" description of those
+   two lanes is superseded.)
+5. README: re-wrapped the over-long merged line at "exit 98. The lock
+   is advisory…" to the file's ~78-col style.
+
+### Verification (this wave)
+
+- Unit REDUCED foreground: **213 passed, 0 failed**, exit 0 (x2).
+- Interop REDUCED: **141 passed, 0 failed**, exit 0 (x6 on the final
+  design, 5 under load).
+- `shellcheck -S info` clean on both suites + git-commit-lock.sh;
+  `Invoke-ScriptAnalyzer -Severity Warning,Error` clean on the ps1.
+- Preserved failure dirs (`cl-interop-42280df2` and this wave's two)
+  deleted after extraction.

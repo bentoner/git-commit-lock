@@ -66,6 +66,63 @@ epoch_to_stamp() {
 }
 backdate() { touch -t "$(epoch_to_stamp "$(( $(date +%s) - $2 ))")" "$1"; }
 
+# Token-guarded backdate for the contended-recovery rounds (T2b). Why: under
+# load a fast waiter can complete its ENTIRE steal (claim -> rename-over ->
+# ACQUIRED) before the harness's `touch` executes, so a blind backdate lands
+# on the WINNER'S freshly installed lock, making it instantly stale for every
+# rival — a legitimate re-steal then fails the round's "zero 98s / exactly
+# one STOLE-BY-CLAIM" assertions although the protocol behaved exactly as
+# designed (observed 2026-06-12 on a loaded box). Verdicts:
+#   * pre-read not the ghost: a waiter stole the ghost BEFORE the touch (it
+#     aged stale naturally during a stalled sync); no touch is performed and
+#     the round premise is gone — invalid, the caller retries the round.
+#   * post-read the ghost: conclusive — nothing ever rewrites the ghost
+#     token at the path, so the touch verifiably hit the ghost; any steal
+#     after the post-read steals an ALREADY-ancient ghost, exactly the
+#     scenario the round wants. Valid.
+#   * post-read anything else: a steal raced the touch->re-read window —
+#     COMMON under load (waiters poll every 0.05s; the post-read costs
+#     subprocess spawns), so it must not blindly invalidate. The lock's
+#     MTIME arbitrates which file the touch hit: a winner's installed lock
+#     is FRESH (the rename carries the claim file's just-created mtime), so
+#     fresh => the touch hit the GHOST and a legitimate steal followed —
+#     valid; ancient => the touch landed on the WINNER'S live lock and
+#     corrupted the round — invalid, retry. Vanished => cannot arbitrate —
+#     invalid, retry.
+backdate_ghost() {  # $1=lock $2=ghost token $3=age-secs -> 0 iff the round premise is intact
+  local pre post now mt
+  pre="$(head -n 1 -- "$1" 2>/dev/null | tr -d '\r')"
+  [ "$pre" = "$2" ] || return 1
+  backdate "$1" "$3" 2>/dev/null || return 1
+  post="$(head -n 1 -- "$1" 2>/dev/null | tr -d '\r')"
+  [ "$post" = "$2" ] && return 0
+  [ -e "$1" ] || return 1
+  now="$(date +%s)"
+  mt="$(stat -c %Y -- "$1" 2>/dev/null || stat -f %m -- "$1" 2>/dev/null)" || return 1
+  [ $(( now - mt )) -lt $(( $3 / 2 )) ]
+}
+
+# Wait for every waiter's WAITING line while keeping the ghost lock FRESH
+# (touch -c to now, no-create so a released path is never resurrected): a
+# fresh ghost cannot be judged stale, so no waiter can steal it before the
+# guarded backdate — without this, a sync stalled past STALE (slow worker
+# cold starts on a loaded box) lets the ghost age stale naturally and a
+# waiter steals it mid-sync. Freshening is race-safe: if a steal slipped in
+# anyway, touching the winner's (already fresh) live lock to "now" is a
+# harmless no-op, and backdate_ghost's pre-read catches the broken premise.
+sync_waiting_fresh() {  # $1=lock $2=timeout-secs $3..=waiter logs -> 0 iff all logged WAITING
+  local lock="$1" deadline f ok=1
+  deadline=$(( $(date +%s) + $2 )); shift 2
+  for f in "$@"; do
+    until grep -q "WAITING for lock" "$f" 2>/dev/null; do
+      touch -c "$lock" 2>/dev/null
+      if [ "$(date +%s)" -ge "$deadline" ]; then ok=0; break; fi
+      sleep 0.2
+    done
+  done
+  [ "$ok" = 1 ]
+}
+
 # Clone a shell function under a new name — the steering tests' interposition
 # mechanism: a sourced test shell wraps a library internal (or a command like
 # mv/rm/touch with a shell function, which shadows the binary) to land "the
@@ -164,57 +221,105 @@ echo "== Test 2b: crash recovery under CONTENTION — claim-serialized: zero dis
 # lock" shape must never appear), zero STEAL-DISPLACED machinery lines, and
 # a clean final state (no lock, no claim). STALE=8 keeps a loaded box from
 # turning the winner's 0.1s hold into a legitimate second steal.
+# Harness race guards: the sync keeps the ghost fresh while it waits
+# (sync_waiting_fresh) so a stalled sync can't let the ghost age stale on
+# its own, and the backdate is token-guarded (backdate_ghost) — when a fast
+# waiter's completed steal races the touch (the touch may then have aged the
+# WINNER'S live lock), the attempt is kept only if its outcome is clean and
+# otherwise discarded and retried (bounded), instead of failing assertions
+# the protocol never violated.
 T2B_N=4
-t2b_fail=0; t2b_stole=0; t2b_old_shape=0; t2b_disp=0; t2b_98=0
+T2B_TRIES=3   # per-round attempts; see the backdate_ghost note
+t2b_fail=0; t2b_stole=0; t2b_old_shape=0; t2b_disp=0; t2b_98=0; t2b_retried=0
 for r in $(seq 1 "$T2B_ROUNDS"); do
-  LOCK="$WORK/recov.$r.lock"; RAN="$WORK/recov.$r.ran"; : > "$RAN"
-  GRAVESEEN="$WORK/recov.$r.graveseen"; SAMPSTOP="$WORK/recov.$r.sampstop"
-  rm -f "$GRAVESEEN" "$SAMPSTOP"
-  fabricate_lock "$LOCK" "tok.ghost.t2b.$r" "pid=999 host=ghost"   # fresh mtime: not yet stale
-  # Grave sampler: ANY .dead.* sighting at ANY moment during the round means
-  # the wave-1 grave machinery is back (an end-state check would miss a
-  # create-then-delete grave).
-  (
-    while [ ! -e "$SAMPSTOP" ]; do
-      for g in "$LOCK".dead.*; do
-        [ -e "$g" ] && : > "$GRAVESEEN"
+  t2b_valid=0
+  for try in $(seq 1 "$T2B_TRIES"); do
+    GHOST="tok.ghost.t2b.$r.$try"
+    LOCK="$WORK/recov.$r.lock"; RAN="$WORK/recov.$r.ran"; : > "$RAN"
+    GRAVESEEN="$WORK/recov.$r.graveseen"; SAMPSTOP="$WORK/recov.$r.sampstop"
+    rm -f "$GRAVESEEN" "$SAMPSTOP" "$LOCK" "$LOCK.next"
+    fabricate_lock "$LOCK" "$GHOST" "pid=999 host=ghost"   # fresh mtime: not yet stale
+    # Grave sampler: ANY .dead.* sighting at ANY moment during the round means
+    # the wave-1 grave machinery is back (an end-state check would miss a
+    # create-then-delete grave).
+    (
+      while [ ! -e "$SAMPSTOP" ]; do
+        for g in "$LOCK".dead.*; do
+          [ -e "$g" ] && : > "$GRAVESEEN"
+        done
+        sleep 0.01
       done
-      sleep 0.01
+    ) &
+    sampler=$!
+    pids=()
+    for i in $(seq 1 "$T2B_N"); do
+      : > "$WORK/recov.$r.$i.log"   # per-waiter logs: concurrent appends to one log drop lines
+      AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$WORK/recov.$r.$i.log" AGENT_LOCK_STALE_SECS=8 \
+        AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=120 \
+        bash "$LIB" run -- bash -c 'echo ran >> "$1"; sleep 0.1' _ "$RAN" 2>/dev/null &
+      pids+=($!)
     done
-  ) &
-  sampler=$!
-  pids=()
-  for i in $(seq 1 "$T2B_N"); do
-    : > "$WORK/recov.$r.$i.log"   # per-waiter logs: concurrent appends to one log drop lines
-    AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$WORK/recov.$r.$i.log" AGENT_LOCK_STALE_SECS=8 \
-      AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=120 \
-      bash "$LIB" run -- bash -c 'echo ran >> "$1"; sleep 0.1' _ "$RAN" 2>/dev/null &
-    pids+=($!)
+    t2b_sync=1
+    if ! sync_waiting_fresh "$LOCK" 60 "$WORK/recov.$r.1.log" "$WORK/recov.$r.2.log" \
+                            "$WORK/recov.$r.3.log" "$WORK/recov.$r.4.log"; then
+      t2b_sync=0
+      for i in $(seq 1 "$T2B_N"); do
+        grep -q "WAITING for lock" "$WORK/recov.$r.$i.log" 2>/dev/null \
+          || echo "  round $r: waiter $i never logged WAITING"
+      done
+    fi
+    backdate_ghost "$LOCK" "$GHOST" 9999; bd=$?   # all waiters now judge the ghost stale together
+    round_98=0; round_badrc=0
+    for i in $(seq 1 "$T2B_N"); do
+      wait "${pids[$((i-1))]}"; rc=$?
+      case "$rc" in
+        0)  ;;
+        98) round_98=$((round_98+1)); echo "  round $r: waiter $i rc=98 — displacement under the claim protocol" ;;
+        *)  round_badrc=$((round_badrc+1)); echo "  round $r: waiter $i rc=$rc (want 0)" ;;
+      esac
+    done
+    touch "$SAMPSTOP"; wait "$sampler" 2>/dev/null
+    cat "$WORK/recov.$r."*.log > "$WORK/recov.$r.all.log"
+    if [ "$bd" != 0 ]; then
+      # The backdate was NOT conclusively clean (see backdate_ghost; under
+      # load the whole steal+release cycle often completes before the
+      # post-read, leaving nothing to arbitrate). Accept the attempt anyway
+      # if its OUTCOME is clean: harness interference (the touch ageing a
+      # live lock) always manifests in the outcome — 98s, LOST warnings,
+      # extra steals, leftovers — so a clean outcome satisfies the round's
+      # assertions regardless of which file the touch hit. A dirty outcome
+      # under a non-conclusive backdate is unattributable: discard the
+      # attempt and retry the round.
+      round_dirty=0
+      [ "$round_98" = 0 ] && [ "$round_badrc" = 0 ] || round_dirty=1
+      [ "$t2b_sync" = 1 ] || round_dirty=1
+      [ "$(grep -c "STOLE-BY-CLAIM" "$WORK/recov.$r.all.log")" = 1 ] || round_dirty=1
+      [ "$(grep -c "lock LOST" "$WORK/recov.$r.all.log")" = 0 ] || round_dirty=1
+      { [ -e "$LOCK" ] || [ -e "$LOCK.next" ]; } && round_dirty=1
+      if [ "$round_dirty" = 1 ]; then
+        t2b_retried=$((t2b_retried+1))
+        echo "  round $r try $try: non-conclusive backdate AND dirty outcome — attempt discarded, retrying"
+        rm -f "$LOCK" "$LOCK.next" "$RAN" "$GRAVESEEN" "$SAMPSTOP"
+        continue
+      fi
+    fi
+    t2b_valid=1
+    [ "$t2b_sync" = 1 ] || t2b_fail=1
+    [ "$round_badrc" = 0 ] || t2b_fail=1
+    t2b_98=$((t2b_98+round_98))
+    nran="$(grep -c ran "$RAN")"
+    [ "$nran" = "$T2B_N" ] || { t2b_fail=1; echo "  round $r: only $nran/$T2B_N commands ran"; }
+    [ -e "$LOCK" ] && { t2b_fail=1; echo "  round $r: leftover lock"; }
+    [ -e "$LOCK.next" ] && { t2b_fail=1; echo "  round $r: leftover claim"; }
+    [ -e "$GRAVESEEN" ] && { t2b_fail=1; echo "  round $r: a grave (.dead.*) existed during recovery — wave-1 machinery regression!"; }
+    t2b_stole=$((     t2b_stole     + $(grep -c "STOLE-BY-CLAIM" "$WORK/recov.$r.all.log") ))
+    t2b_old_shape=$(( t2b_old_shape + $(grep -c "STOLE stale lock" "$WORK/recov.$r.all.log") ))
+    t2b_disp=$((      t2b_disp      + $(grep -c "STEAL-DISPLACED" "$WORK/recov.$r.all.log") ))
+    break
   done
-  for i in $(seq 1 "$T2B_N"); do
-    wait_for_grep "WAITING for lock" "$WORK/recov.$r.$i.log" 30 \
-      || { t2b_fail=1; echo "  round $r: waiter $i never logged WAITING"; }
-  done
-  backdate "$LOCK" 9999            # all waiters now judge the ghost stale together
-  for i in $(seq 1 "$T2B_N"); do
-    wait "${pids[$((i-1))]}"; rc=$?
-    case "$rc" in
-      0)  ;;
-      98) t2b_98=$((t2b_98+1)); echo "  round $r: waiter $i rc=98 — displacement under the claim protocol" ;;
-      *)  t2b_fail=1; echo "  round $r: waiter $i rc=$rc (want 0)" ;;
-    esac
-  done
-  touch "$SAMPSTOP"; wait "$sampler" 2>/dev/null
-  cat "$WORK/recov.$r."*.log > "$WORK/recov.$r.all.log"
-  nran="$(grep -c ran "$RAN")"
-  [ "$nran" = "$T2B_N" ] || { t2b_fail=1; echo "  round $r: only $nran/$T2B_N commands ran"; }
-  [ -e "$LOCK" ] && { t2b_fail=1; echo "  round $r: leftover lock"; }
-  [ -e "$LOCK.next" ] && { t2b_fail=1; echo "  round $r: leftover claim"; }
-  [ -e "$GRAVESEEN" ] && { t2b_fail=1; echo "  round $r: a grave (.dead.*) existed during recovery — wave-1 machinery regression!"; }
-  t2b_stole=$((     t2b_stole     + $(grep -c "STOLE-BY-CLAIM" "$WORK/recov.$r.all.log") ))
-  t2b_old_shape=$(( t2b_old_shape + $(grep -c "STOLE stale lock" "$WORK/recov.$r.all.log") ))
-  t2b_disp=$((      t2b_disp      + $(grep -c "STEAL-DISPLACED" "$WORK/recov.$r.all.log") ))
+  [ "$t2b_valid" = 1 ] || { t2b_fail=1; echo "  round $r: no clean round under a conclusive backdate in $T2B_TRIES attempts"; }
 done
+[ "$t2b_retried" = 0 ] || echo "  note: $t2b_retried discarded attempt(s) — harness backdate race, not a protocol verdict"
 [ "$t2b_fail" = 0 ] && ok "$T2B_ROUNDS rounds x $T2B_N waiters on one crashed lock: all ran, clean final state, no grave ever existed" \
                     || bad "crash-recovery contention failure (see above)"
 [ "$t2b_98" = 0 ] && ok "zero spurious 98s — the claim serialized recovery (pre-claim: near-certain displacement)" \
@@ -525,6 +630,10 @@ echo "$out" | grep -q CHAINED-EXIT-TRAP && ok "caller's EXIT trap still ran on e
 grep -q RELEASED "$LOG12C" && ok "release logged on EXIT path" || bad "no RELEASED entry on EXIT path"
 
 # 12d: caller's signal traps are restored verbatim; absent traps reset to default.
+# NB: run the SUITE in the foreground (or under `bash -m`). A suite launched as
+# a background job from a non-job-control shell inherits SIGINT-ignored, which
+# bash reports as `trap -- '' SIGINT` — this assertion then flags it as a
+# leftover lock trap (false failure; observed 2026-06-12, harness-induced).
 out="$(AGENT_LOCK_PATH="$WORK/src4.lock" AGENT_LOCK_LOG="$LOG" bash -c '
   trap "echo MY-TERM-HANDLER" TERM
   source "$1" || exit 70
