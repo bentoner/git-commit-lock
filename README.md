@@ -65,6 +65,9 @@ agent can't wedge the others; a holder that loses the lock mid-hold finds out
 at release (exit code 98) rather than silently claiming success. Full design
 and rationale — including why `flock` and other OS lock primitives don't fit
 this cross-runtime setting:
+
+update sentence per changes made to main doc
+
 [`docs/git-commit-lock.md`](docs/git-commit-lock.md).
 
 Two wire-compatible implementations share one lock file and protocol, so a
@@ -80,8 +83,7 @@ PowerShell-on-POSIX is not a configuration we support; on macOS and Linux,
 use the bash implementation. CI nevertheless runs the two implementations
 against each other on all three OSes — not as platform support, but because
 two independent implementations hammering one lock is cheap adversarial
-verification of the protocol (it has
-already caught a real bug that single-OS testing missed).
+verification of the protocol.
 
 ## Install
 
@@ -104,10 +106,17 @@ This symlinks `git-commit-lock.sh` and `git-commit-lock.ps1` into
 `~/.local/bin/` and is idempotent — re-run any time, e.g. after moving the
 repo. On Windows, real symlinks require Developer Mode; if symlinks are
 unavailable, skip the installer and invoke the scripts by path from the clone
-(e.g. `path/to/git-commit-lock/git-commit-lock.sh`). Installing is only a
+(e.g. `path/to/git-commit-lock/git-commit-lock.sh`). 
+
+it would be better to copy on symlink fail right? Let's take advantage of having built self-contained scripts.
+
+Installing is only a
 convenience so every checkout can use the same command names.
 
 ## Suggested agent instructions
+
+let's move this above install section. the install instructions are instructions for agents; this one is also
+for humans to the extent the humans don't let their agents edit their user context.
 
 Agents only benefit from the lock if their instructions tell them to use it.
 Copy this into the instruction context (`AGENTS.md`, `CLAUDE.md`, Cursor
@@ -223,6 +232,8 @@ knobs and how staleness and stealing work.
 
 ## Alternatives and related tools
 
+make this the final section
+
 If each agent can have its own checkout or index, or you need to coordinate
 *edits* rather than commits, other tools fit better — alone or alongside the
 lock:
@@ -247,6 +258,8 @@ lock:
   work, avoiding the shared checkout entirely.
 
 ## Running the tests
+
+delete - ensure coverage in and reference main doc instead.
 
 ```sh
 bash git-commit-lock.test.sh             # bash implementation
