@@ -7,11 +7,16 @@
 # both engines - keep it ASCII).
 #
 # PowerShell port of git-commit-lock.sh, for agents whose native shell is PowerShell
-# (notably Codex on Windows). It is WIRE-COMPATIBLE with git-commit-lock.sh: same lock
-# directory, same dir-mtime staleness / rename-steal / token-release protocol, so
-# a .ps1 holder and a .sh holder in the SAME working tree (e.g. Codex and Claude)
-# correctly serialise against EACH OTHER. git-commit-lock.sh remains the authoritative
-# design; docs/git-commit-lock.md is the "why". Keep the two in lock-step.
+# (notably Codex on Windows). It is WIRE-COMPATIBLE with git-commit-lock.sh: the lock
+# is the same regular FILE created with an atomic create-or-fail open, whose CONTENT
+# is the ownership token (line 1, "tok."-prefixed; line 2 the informational
+# "pid=<pid> host=<host>" owner), with the same file-mtime staleness /
+# rename-aside-steal / token-compare-release protocol - so a .ps1 holder and a
+# .sh holder in the SAME working tree (e.g. Codex and Claude) correctly serialise
+# against EACH OTHER. git-commit-lock.sh remains the authoritative design (its header
+# carries the full protocol: lock file format, staleness, acquire verification,
+# fail-open lease ceiling, known residual races); docs/git-commit-lock.md is the
+# "why". Keep the two in lock-step.
 #
 # WHY A SEPARATE PS PORT (instead of Codex calling git-commit-lock.sh):
 #   On Windows the bare name `bash` on the plain PATH resolves to
@@ -25,6 +30,54 @@
 #   running the lock + commit in PowerShell avoids bash/WSL entirely. Claude keeps
 #   using git-commit-lock.sh (it ships its own MINGW64 Git-Bash, immune to this).
 #
+# PORT-SPECIFIC NOTES (where this implementation differs in MECHANISM, never
+# in protocol, from git-commit-lock.sh):
+#   * Acquire is one [IO.File]::Open(CreateNew) - atomic create-or-fail - and
+#     the token+owner content is written, flushed and closed THROUGH that
+#     creation handle, so the write is bound to the file object we created and
+#     cannot land on a successor's file. ANY exception on the open means
+#     "contended/refused", not an error: an existing directory at the path
+#     throws UnauthorizedAccessException (verified, pwsh 7.5), not IOException,
+#     and must degrade to the wait loop's config warning, never throw out.
+#   * The pre-create type guard is LOAD-BEARING here on Windows, not just
+#     symmetry with bash: CreateFile resolves a symlink at the final path
+#     component, so CreateNew on a DANGLING symlink tunnels through the link
+#     and creates the TARGET (probed 2026-06-11) instead of failing like
+#     POSIX O_CREAT|O_EXCL. The guard routes any non-regular-file path to the
+#     never-steal warn lane before the create is attempted. (On Unix, .NET's
+#     open uses O_CREAT|O_EXCL, which refuses symlink/FIFO/device paths with
+#     an exception; the guard is symmetry there.)
+#   * All reads of the lock file go through a FileStream opened with
+#     FileShare ReadWrite|Delete (never ReadAllText's Read-only share), so our
+#     own readers can never block another party's steal rename or release
+#     unlink, even transiently (probe D2).
+#   * The steal's content guard determines "empty" by STAT (Length -eq 0)
+#     WITHOUT opening the file, and opens for read only when size > 0: on
+#     Unix a FIFO at the lock path is neither a container nor a reparse
+#     point, and a read-open on a writer-less FIFO blocks in open(2) before
+#     any timeout logic runs. ACCEPTED RESIDUAL (ps1-on-Unix only; bash
+#     refuses all of these via its `[ -f ]` guard): a typo'd-path FIFO -
+#     and likewise a device node or socket, for which .NET has no clean
+#     portable type probe - stats as size 0 and takes the empty-orphan
+#     steal lane: renamed aside AND grave-deleted, so damage is capped at
+#     the one misconfigured inode (in practice /dev permissions make real
+#     device nodes unrenamable anyway). Same accepted class as the
+#     empty-user-file residual.
+#   * Release is File.Delete with a brief retry (~5x20ms) and NO rename-aside
+#     fallback: probe D1 shows the handle class that blocks our unlink blocks
+#     a rename identically for files (both need DELETE access on the source),
+#     so the fallback could never fire usefully. One non-handle exception: the
+#     Windows READ-ONLY attribute fails File.Delete but not File.Move (and
+#     bash `rm -f` clears it). Nothing in the protocol ever sets read-only;
+#     if something external does, the leftover warning fires and the stale
+#     steal (a rename) recovers the path.
+#   * Future option, this side only (recorded per the plan; NOT implemented):
+#     handle-based ops (open with delete sharing, fstat the mtime / read the
+#     token / delete via FILE_DISPOSITION on that one handle) could close the
+#     residual check-then-act windows outright here. bash has no handle
+#     persistence, so the protocol-level claim stays "shrunk, detected, not
+#     closed" - see KNOWN RESIDUAL RACES in git-commit-lock.sh.
+#
 # USAGE (Codex's normal path - run ONE quoted command string under the lock):
 #   & ~/.local/bin/git-commit-lock.ps1 run "git add -- path/a path/b; if (`$LASTEXITCODE -eq 0) { git commit -m 'msg' }"
 #
@@ -34,21 +87,22 @@
 #       and propagates cleanly; it does not abort the lock release);
 #   96  usage / configuration error: bad arguments, more than one command
 #       argument, an empty or unparseable command, or `run` outside a git repo
-#       with AGENT_LOCK_DIR unset. The lock was NEVER acquired and the command
+#       with AGENT_LOCK_PATH unset. The lock was NEVER acquired and the command
 #       NEVER ran.
 #   97  timed out waiting for the lock (AGENT_LOCK_MAX_WAIT). The command
 #       NEVER ran.
 #   98  the lock was STOLEN mid-hold (held past the stale window while a
-#       contender waited). The command DID run but was NOT serialised - verify
-#       with `git log` and redo it under the lock.
+#       contender waited): at release the lock file is GONE, or carries a
+#       non-empty FOREIGN token - both definitive, because acquire's read-back
+#       verified our token at the path. The command DID run but was NOT
+#       serialised - verify with `git log` and redo it under the lock.
 #   1   the command itself threw a terminating error; or (with its own distinct
-#       warning) the release-time token read kept failing - or found the token
-#       file MISSING - while the lock dir still existed: the work may or may
-#       not have been exclusive (neither impl can prove its own acquire-time
-#       token write landed, so a missing token is NOT proof of theft), the
-#       lock dir is left in place for the stale window to reclaim, and success
-#       is NOT reported. A failing command keeps its own exit code. Same
-#       verdicts as git-commit-lock.sh for the same on-disk states.
+#       warning) the lock file still reads EMPTY after the release-time retry
+#       ladder while the file is present: ownership is unverifiable (that is
+#       the create->write window of a successor after a boundary steal, or
+#       external truncation - not proof of theft), the file is left in place,
+#       and success is NOT reported. A failing command keeps its own exit
+#       code. Same verdicts as git-commit-lock.sh for the same on-disk states.
 #   Avoid exit codes 96-98 as meaningful codes of your own command: they are
 #   reserved by this contract and a wrapped command exiting 98 is
 #   indistinguishable from a stolen lock.
@@ -68,7 +122,7 @@
 #
 #   Dot-source notes:
 #   * Dot-sourcing injects the public functions (Lock-Acquire, Lock-Release,
-#     Invoke-WithLock), the script:-scoped helpers (Lock-* / Get-LockGitDir),
+#     Invoke-WithLock), the script:-scoped helpers (Lock-* / Get-Lock*),
 #     and the script-scope $Lock* variables into your session. It does NOT
 #     change your $ErrorActionPreference or StrictMode: both are set inside
 #     the functions (function-scoped, restored automatically on return).
@@ -81,29 +135,38 @@
 #   * Lock-Acquire is NOT reentrant: a second Lock-Acquire while holding is
 #     refused ($false, message on stderr) rather than self-deadlocking for the
 #     stale window and then stealing its own lock (mirrors git-commit-lock.sh).
+#   * Lock-Acquire NEVER repairs a failed post-create read-back by writing to
+#     the path: after winning the create it re-reads line 1 and claims the
+#     hold only on its own token; anything else (foreign, empty, gone after
+#     the retry ladder) is logged loudly and treated as NOT acquired - see
+#     ACQUIRE VERIFICATION in git-commit-lock.sh.
 #   * Lock-Release returns $true on a clean release; $false otherwise, with
-#     $script:LockReleaseStatus set to 'stolen' (token mismatch / dir gone:
-#     your work was NOT exclusive - redo), 'unreadable' (token unreadable or
-#     MISSING while the lock dir still exists: exclusivity unproven, dir left
-#     for the stale window; do not report success), or 'leftover' (token
-#     verified - the work WAS exclusive - but the dir could be neither deleted
-#     nor renamed aside; waiters stay blocked until the stale window reclaims
-#     it; `run` keeps the command's exit code and warns on stderr, mirroring
-#     git-commit-lock.sh).
+#     $script:LockReleaseStatus set to 'stolen' (file gone, or a non-empty
+#     foreign token: your work was NOT exclusive - redo; `run` maps this to
+#     98), 'unreadable' (the file still reads EMPTY after the retry ladder
+#     while present, or persistently would not open: exclusivity unproven,
+#     file left in place for the staleness backstop; do not report success),
+#     or 'leftover' (token verified - the work WAS exclusive - but the file
+#     could not be deleted; it is left blocking waiters until the stale
+#     window elapses AND the blocking handle closes - the same handle blocks
+#     a stealer's rename (probe D1), so until then waiters re-poll and may
+#     reach 97; `run` keeps the command's exit code and warns on stderr,
+#     mirroring git-commit-lock.sh).
 #
 # Hold the lock ONLY for the stage+commit (sub-second). Decide what to stage,
 # build any patch, resolve hook failures OUTSIDE the lock. See README.md
 # ("Suggested agent instructions").
 #
 # CONFIG (env, mainly for tests) - identical names/semantics to git-commit-lock.sh:
-#   AGENT_LOCK_DIR, AGENT_LOCK_STALE_SECS (default 300), AGENT_LOCK_POLL_SECS
-#   (default 2), AGENT_LOCK_MAX_WAIT (default 420), AGENT_LOCK_LOG.
+#   AGENT_LOCK_PATH (lock file path; default <gitdir>/commit.lock),
+#   AGENT_LOCK_STALE_SECS (default 300), AGENT_LOCK_POLL_SECS (default 2),
+#   AGENT_LOCK_MAX_WAIT (default 420), AGENT_LOCK_LOG.
 #   Invalid numeric values are reported on stderr and replaced by the default
 #   (never a load-time throw). STALE_SECS and MAX_WAIT must be positive
 #   integers, POLL_SECS may be fractional - same rules as git-commit-lock.sh.
 
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingEmptyCatchBlock', '',
-    Justification = 'Deliberate throughout: lock-path I/O must never abort the holder. Every swallow is conservative (retry, skip, or fall through to a guarded slow path) and the dir-mtime stale window is the recovery backstop. See docs/git-commit-lock.md.')]
+    Justification = 'Deliberate throughout: lock-path I/O must never abort the holder. Every swallow is conservative (retry, skip, or fall through to a guarded slow path) and the file-mtime stale window is the recovery backstop. See docs/git-commit-lock.md.')]
 param(
     [Parameter(Position = 0)]
     [string]$Action,
@@ -120,7 +183,7 @@ param(
 # Mirrors git-commit-lock.sh: lock + log live in `git rev-parse --absolute-git-dir`
 # (e.g. C:/repo/.git/commit.lock). Windows git prints a forward-slash drive path
 # (C:/repo/.git), exactly what MINGW git prints for git-commit-lock.sh, so both sides
-# compute the SAME lock-dir string and contend on the same NTFS directory.
+# compute the SAME lock-path string and contend on the same NTFS file.
 function script:Get-LockGitDir {
     Set-StrictMode -Off
     $ErrorActionPreference = 'Continue'
@@ -163,17 +226,27 @@ function script:Get-LockNum {
     return $val
 }
 
-$script:LockGitDir = script:Get-LockGitDir
+# Lazy gitdir resolution (perf): the `git rev-parse` child process exists only
+# to DEFAULT the lock/log paths, so skip it entirely when BOTH are explicit
+# (the common test/sub-agent-override case). When only AGENT_LOCK_PATH is
+# explicit the log still defaults into the git dir, so the resolution stays.
+# (Mirrors git-commit-lock.sh.) The two not-in-repo guards below stay correct
+# when skipped: both are gated on AGENT_LOCK_PATH being unset.
+if ($env:AGENT_LOCK_PATH -and $env:AGENT_LOCK_LOG) {
+    $script:LockGitDir = $null
+} else {
+    $script:LockGitDir = script:Get-LockGitDir
+}
 $script:LockInRepo = [bool]$script:LockGitDir
 if ($script:LockInRepo) { $script:LockBase = $script:LockGitDir } else { $script:LockBase = (Get-Location).Path }
-# Not in a repo: the CLI `run` path hard-fails (exit 96) unless AGENT_LOCK_DIR
+# Not in a repo: the CLI `run` path hard-fails (exit 96) unless AGENT_LOCK_PATH
 # is set; dot-sourcing keeps the CWD fallback (so sourcing never explodes) but
 # says so out loud.
-if (-not $script:LockInRepo -and -not $env:AGENT_LOCK_DIR -and $MyInvocation.InvocationName -eq '.') {
-    [Console]::Error.WriteLine("git-commit-lock: WARNING - not inside a git repository; defaulting the lock to $script:LockBase/commit.lock (CWD). Set AGENT_LOCK_DIR to control this.")
+if (-not $script:LockInRepo -and -not $env:AGENT_LOCK_PATH -and $MyInvocation.InvocationName -eq '.') {
+    [Console]::Error.WriteLine("git-commit-lock: WARNING - not inside a git repository; defaulting the lock to $script:LockBase/commit.lock (CWD). Set AGENT_LOCK_PATH to control this.")
 }
 
-if ($env:AGENT_LOCK_DIR) { $script:LockDir = $env:AGENT_LOCK_DIR } else { $script:LockDir = "$script:LockBase/commit.lock" }
+if ($env:AGENT_LOCK_PATH) { $script:LockPath = $env:AGENT_LOCK_PATH } else { $script:LockPath = "$script:LockBase/commit.lock" }
 if ($env:AGENT_LOCK_LOG) { $script:LockLog = $env:AGENT_LOCK_LOG } else { $script:LockLog = "$script:LockBase/git-commit-lock.log" }
 $script:LockStale   = [int](script:Get-LockNum -Name 'AGENT_LOCK_STALE_SECS' -Raw $env:AGENT_LOCK_STALE_SECS -Default 300 -IntegerOnly)
 $script:LockPoll    = [double](script:Get-LockNum -Name 'AGENT_LOCK_POLL_SECS' -Raw $env:AGENT_LOCK_POLL_SECS -Default 2)
@@ -188,8 +261,8 @@ if (-not $env:AGENT_LOCK_MAX_WAIT -and $script:LockStale -ge $script:LockMaxWait
 }
 
 # Floor for a PLAUSIBLE lock mtime (epoch secs; 2000-01-01). A freshly created
-# dir can transiently report the Windows FILETIME zero (1601-01-01 -> a NEGATIVE
-# unix epoch) in the window between creation and its first metadata write, which
+# file can transiently report the Windows FILETIME zero (1601-01-01 -> a NEGATIVE
+# unix epoch) to an observer (probes C/C1b - files, not just the old dirs), which
 # would compute as a ~400-year "age" and trigger a spurious steal of a live,
 # just-acquired lock. Any mtime below this floor is an unsettled/garbage reading,
 # not a genuinely stale lock, so we refuse to steal on it and wait instead.
@@ -199,10 +272,13 @@ $script:LockHeld = $false
 # Unique per acquisition: identifies OUR hold so release can tell whether the lock
 # it is about to free is still the one we took. pid alone isn't enough (pids get
 # reused across the stale window), so mix in Get-Random + the acquire time. The
-# ".ps" marker just helps when reading a mixed log. Format need NOT match the .sh
-# token - steal detection only needs inequality, and each side reads its own.
+# "tok." prefix is WIRE FORMAT (the steal's content guard keys on it - see LOCK
+# FILE FORMAT in git-commit-lock.sh); the ".ps" marker just helps when reading a
+# mixed log.
 $script:LockToken = ''
-$script:LockMe = "pid=$PID host=$env:COMPUTERNAME"
+# [Environment]::MachineName, not $env:COMPUTERNAME: the latter is Windows-only,
+# so `host=` would be blank on the POSIX CI legs.
+$script:LockMe = "pid=$PID host=$([Environment]::MachineName)"
 $script:LockRunRc = 0
 # Set by Lock-Release when it returns $false: 'stolen', 'unreadable' or 'leftover'.
 $script:LockReleaseStatus = 'ok'
@@ -224,128 +300,184 @@ function script:Lock-Log([string]$msg) {
     } catch { }
 }
 
-# mtime (epoch secs) of the lock dir itself - the staleness clock, same value the
-# .sh side reads via `stat -c %Y`. $null if the dir vanished mid-check. If the
-# read keeps failing while the dir EXISTS, staleness detection is broken on
-# this system - crashed holders can then never be stolen - so say so loudly,
-# once per process (parity with git-commit-lock.sh's warning). The retry loop
-# is anti-false-alarm: under contention the dir routinely vanishes
-# (release/steal) between probes, which must not be misdiagnosed as a broken
-# clock - only persistent failure on a present dir counts.
+# Loud, once-per-process config warning for a non-lock object at the lock path
+# (a directory - e.g. a leftover old-protocol dir lock or a typo like
+# AGENT_LOCK_PATH=$HOME - a symlink, a device, or a regular file whose content
+# is not lock-shaped). Such a path is NEVER stolen or deleted; waiters will
+# reach 97 until a human fixes the path or removes the object.
+$script:LockNonLockWarned = $false
+function script:Lock-WarnNonLock([string]$reason) {
+    Set-StrictMode -Off
+    if ($script:LockNonLockWarned) { return }
+    $script:LockNonLockWarned = $true
+    [Console]::Error.WriteLine("git-commit-lock: WARNING - $script:LockPath exists but is not a lock file ($reason). Refusing to steal or delete it; waiters will time out (97). If AGENT_LOCK_PATH is a typo, fix it; if this is a stray file or a leftover old-protocol lock directory, remove it by hand.")
+    script:Lock-Log "WARNING: non-lock object at lock path ($reason) - never stolen; waiters reach 97 until it is removed by hand"
+}
+
+# Link-aware existence probe: the FileSystemInfo for the path ITSELF (a
+# dangling symlink included - it must read as "exists but wrong type" so the
+# guard warns instead of classing it as normal contention every poll), or
+# $null when the path is absent. Get-Item -Force sees the link, not the
+# target; [IO.File]::Exists would report a dangling link as absent.
+function script:Lock-GetPathItem {
+    Set-StrictMode -Off
+    try { return (Get-Item -LiteralPath $script:LockPath -Force -ErrorAction Stop) } catch { return $null }
+}
+
+# Is this FileSystemInfo a plain regular file (not a directory, not any kind
+# of symlink/reparse point)? The only shape acquire may create over and the
+# steal may rename - everything else is the never-steal config-warning lane.
+function script:Lock-IsPlainFile($item) {
+    Set-StrictMode -Off
+    if ($null -eq $item) { return $false }
+    if ($item.PSIsContainer) { return $false }
+    return (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0)
+}
+
+# mtime (epoch secs) of the lock file itself, stamped by the creating write -
+# the staleness clock, same value the .sh side reads via `stat -c %Y`. $null
+# if the file vanished mid-check. If the read keeps failing while the file
+# EXISTS, staleness detection is broken on this system - crashed holders can
+# then never be stolen - so say so loudly, once per process (parity with
+# git-commit-lock.sh's warning). The retry loop is anti-false-alarm: under
+# contention the file routinely vanishes (release/steal) between probes,
+# which must not be misdiagnosed as a broken clock - only persistent failure
+# on a present file counts.
 $script:LockMtimeWarned = $false
-function script:Lock-DirMtime {
+function script:Lock-PathMtime {
     Set-StrictMode -Off
     $m = $null; $present = $false
     for ($i = 0; $i -lt 3; $i++) {
         try {
-            $item = Get-Item -LiteralPath $script:LockDir -Force -ErrorAction Stop
+            $item = Get-Item -LiteralPath $script:LockPath -Force -ErrorAction Stop
             $m = ([DateTimeOffset]$item.LastWriteTimeUtc).ToUnixTimeSeconds()
             break
         } catch {
             $m = $null
-            if (Test-Path -LiteralPath $script:LockDir) { $present = $true } else { $present = $false; break }
+            if (Test-Path -LiteralPath $script:LockPath) { $present = $true } else { $present = $false; break }
         }
     }
     if ($null -eq $m -and $present -and -not $script:LockMtimeWarned) {
         $script:LockMtimeWarned = $true
-        [Console]::Error.WriteLine("git-commit-lock: WARNING - cannot read the lock dir's mtime on this system. Staleness detection is BROKEN: stale locks will never be stolen, so a crashed holder wedges waiters until AGENT_LOCK_MAX_WAIT.")
-        script:Lock-Log 'WARNING: lock-dir mtime unreadable (probes failed with the dir present); staleness detection disabled'
+        [Console]::Error.WriteLine("git-commit-lock: WARNING - cannot read the lock file's mtime on this system. Staleness detection is BROKEN: stale locks will never be stolen, so a crashed holder wedges waiters until AGENT_LOCK_MAX_WAIT.")
+        script:Lock-Log 'WARNING: lock-file mtime unreadable (probes failed with the file present); staleness detection disabled'
     }
     return $m
 }
 
-# Read the token currently recorded in the lock dir (whoever holds it now),
+# Read line 1 of the lock file (the token of whoever holds it now),
 # distinguishing three outcomes so Lock-Release can be honest about what it saw:
-#   Status='ok'         Token = the recorded token
-#   Status='gone'       the lock dir itself no longer exists (stolen + freed)
-#   Status='unreadable' the dir exists but the token could not be read after
-#                       escalating retries - either the file would not open (a
-#                       persistent Windows sharing violation) or it is MISSING
-#                       while the dir is present. Neither is proof of theft (a
-#                       real steal renames the dir away, and our own
-#                       acquire-time token write is swallowed after retries,
-#                       so we cannot prove it ever landed) - and not proof of
-#                       ownership either. Mirrors git-commit-lock.sh, where
-#                       `cat` cannot distinguish ENOENT from a sharing
-#                       violation: BOTH impls route this state to the
-#                       conservative unverifiable lane, never to "stolen".
+#   Status='ok'         Token = line 1, trailing whitespace stripped (non-empty)
+#   Status='gone'       the lock file no longer exists
+#   Status='unreadable' the file exists but no token came back after escalating
+#                       retries - it persistently would not open (a Windows
+#                       sharing violation) or it still reads EMPTY. An empty
+#                       read is the rival create->write gap (probe F) or
+#                       external truncation - NOT proof of theft, and not
+#                       proof of ownership either. Mirrors git-commit-lock.sh's
+#                       empty-after-retries lane: BOTH impls route this state
+#                       to the conservative unverifiable verdict, never to
+#                       "stolen".
 # Retries with escalating backoff (20ms..320ms): under heavy contention a read
-# can transiently hit a sharing violation, and crying "stolen" on that would be
-# false. A REAL steal renames the dir away, so a successful read then returns a
-# DIFFERENT token (still a mismatch) - retrying never hides a genuine theft.
+# can transiently hit a sharing violation or the empty window, and crying
+# "stolen" on that would be false. A REAL steal renames the file away, so a
+# successful read then returns a DIFFERENT token (still a mismatch) - retrying
+# never hides a genuine theft. The FileStream opens with ReadWrite|Delete
+# sharing so this read can never block a rival's steal/release (probe D2).
 function script:Lock-ReadCurToken {
     param([int]$MaxTries = 8)
     Set-StrictMode -Off
     $delay = 20
     for ($i = 0; $i -lt $MaxTries; $i++) {
         try {
-            return @{ Status = 'ok'; Token = ([System.IO.File]::ReadAllText("$script:LockDir/token")).Trim() }
+            $line = $null
+            $fs = [System.IO.File]::Open($script:LockPath, [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+            try {
+                $sr = New-Object System.IO.StreamReader($fs)
+                $line = $sr.ReadLine()
+            } finally { $fs.Dispose() }
+            if ($null -ne $line) { $line = $line.TrimEnd() }   # CRLF tolerance
+            if ($line) { return @{ Status = 'ok'; Token = $line } }
+            # Empty read with the file present: the create->write window of a
+            # rival (probe F) - retry before classifying as unverifiable.
+        } catch [System.IO.FileNotFoundException] {
+            return @{ Status = 'gone'; Token = '' }
         } catch [System.IO.DirectoryNotFoundException] {
             return @{ Status = 'gone'; Token = '' }
         } catch {
-            # FileNotFoundException (dir present, token file absent) lands
-            # here too: retry like any other failed read, then fall through to
-            # 'unreadable' - NOT a definitive verdict (see the contract above).
-            if (-not (Test-Path -LiteralPath $script:LockDir)) { return @{ Status = 'gone'; Token = '' } }
-            Start-Sleep -Milliseconds $delay
-            if ($delay -lt 320) { $delay = $delay * 2 }
+            # Transient open failure (e.g. a sharing violation): retry, unless
+            # the file is genuinely gone.
+            if (-not (Test-Path -LiteralPath $script:LockPath)) { return @{ Status = 'gone'; Token = '' } }
         }
+        Start-Sleep -Milliseconds $delay
+        if ($delay -lt 320) { $delay = $delay * 2 }
     }
-    if (Test-Path -LiteralPath $script:LockDir) { return @{ Status = 'unreadable'; Token = '' } }
+    if (Test-Path -LiteralPath $script:LockPath) { return @{ Status = 'unreadable'; Token = '' } }
     return @{ Status = 'gone'; Token = '' }
 }
 
-# Atomic create-or-fail for a DIRECTORY. PowerShell's `New-Item -ItemType
-# Directory` checks existence then creates (a TOCTOU window two racers can both
-# pass), and [IO.Directory]::CreateDirectory SILENTLY succeeds on an existing dir
-# - neither is a mutex gate. So we create a uniquely-named temp dir and ATOMICALLY
-# rename it into place: [IO.Directory]::Move throws if the destination exists, and
-# the NTFS rename lets exactly one racer win (the .sh side's `mkdir` is the same
-# atomic gate, contending on the same path). Returns $true iff we created it.
-function script:Lock-TryCreateDir {
+# Atomic create-or-fail for the lock FILE, with the token+owner content
+# written, flushed and closed THROUGH the creation handle: the write is bound
+# to the file object we created and cannot land on a successor's file,
+# whatever happens to the path meanwhile. CreateNew + the content write stamp
+# the mtime (the staleness clock); no post-create stamp is needed - the floor
+# guard is the backstop for unsettled readings. The handle shares
+# ReadWrite|Delete so a waiter's probes never collide with the creation.
+# Returns $true iff we created the file. ANY exception means "not created":
+# IOException = a rival's live lock (normal contention); an existing directory
+# throws UnauthorizedAccessException; on Unix a FIFO/device path fails the
+# O_CREAT|O_EXCL open with its own exception. All of them must degrade to the
+# wait loop - which diagnoses the non-file cases - never throw out of acquire.
+# A created-but-write-failed file (e.g. ENOSPC) returns $false too; the empty
+# or torn orphan it leaves ages into its corresponding steal lane.
+function script:Lock-TryCreateFile {
     Set-StrictMode -Off
     $ErrorActionPreference = 'Stop'
-    $parent = Split-Path -Parent $script:LockDir
-    if ($parent) { try { [void][System.IO.Directory]::CreateDirectory($parent) } catch { } }
-    $tmp = "$($script:LockDir).new.$PID.$(Get-Random)"
-    try { [void][System.IO.Directory]::CreateDirectory($tmp) } catch { return $false }
+    $fs = $null
     try {
-        [System.IO.Directory]::Move($tmp, $script:LockDir)   # throws if dest exists
-        # Stamp the staleness clock NOW, the instant the dir becomes visible, so a
-        # waiter can't catch an unsettled FILETIME-zero (1601) mtime and steal our
-        # brand-new lock. The floor guard in Lock-Acquire is the real backstop;
-        # this just shrinks the window.
-        try { [System.IO.Directory]::SetLastWriteTimeUtc($script:LockDir, [DateTime]::UtcNow) } catch { }
+        $fs = [System.IO.File]::Open($script:LockPath, [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+        # BOM-free UTF-8, LF line ends: the shared wire format (line 1 token,
+        # line 2 owner), readable by the .sh side's plain `read`.
+        $bytes = (New-Object System.Text.UTF8Encoding $false).GetBytes("$script:LockToken`n$script:LockMe`n")
+        $fs.Write($bytes, 0, $bytes.Length)
+        $fs.Flush()
         return $true
     } catch {
-        try { [System.IO.Directory]::Delete($tmp, $true) } catch { }
         return $false
+    } finally {
+        if ($null -ne $fs) { try { $fs.Dispose() } catch { } }
     }
 }
 
-# Opportunistic, age-gated sweep of litter beside the lock: failed-delete graves
-# (<lock>.dead.* from steals, <lock>.rel.* from releases - both impls) and
-# orphaned acquire temps (<lock>.new.*, ours). Only entries older than the stale
-# window are touched, so a LIVE acquirer's .new temp mid-rename is never swept.
-# Pure best-effort: every step is guarded, failure changes nothing.
+# Opportunistic, age-gated sweep of steal graves beside the lock (`.dead.*`,
+# left when a steal winner's grave delete failed - mirrored in
+# git-commit-lock.sh; the dir era's `.new.*`/`.rel.*` litter cannot exist in
+# the file protocol). Only entries older than the stale window (with a
+# plausible mtime) are swept, and only via the non-recursive File.Delete: a
+# directory or other non-file at a grave name is skipped (and would make
+# File.Delete throw anyway). Pure best-effort: any failure just leaves the
+# entry for a later sweep.
 function script:Lock-SweepLitter {
     Set-StrictMode -Off
     try {
-        $parent = Split-Path -Parent $script:LockDir
-        $leaf = Split-Path -Leaf $script:LockDir
+        $parent = Split-Path -Parent $script:LockPath
+        $leaf = Split-Path -Leaf $script:LockPath
         if (-not $parent -or -not $leaf) { return }
         if (-not (Test-Path -LiteralPath $parent)) { return }
         $now = script:Lock-Now
-        foreach ($pat in @("$leaf.new.*", "$leaf.dead.*", "$leaf.rel.*")) {
-            foreach ($d in @(Get-ChildItem -LiteralPath $parent -Filter $pat -Force -ErrorAction SilentlyContinue)) {
-                try {
-                    $mt = ([DateTimeOffset]$d.LastWriteTimeUtc).ToUnixTimeSeconds()
-                    if ($mt -gt $script:LockMtimeFloor -and ($now - $mt) -ge $script:LockStale) {
-                        [System.IO.Directory]::Delete($d.FullName, $true)
-                        script:Lock-Log "SWEPT stale litter $($d.Name)"
-                    }
-                } catch { }
-            }
+        foreach ($g in @(Get-ChildItem -LiteralPath $parent -Filter "$leaf.dead.*" -Force -ErrorAction SilentlyContinue)) {
+            try {
+                if ($g.PSIsContainer) { continue }   # never recursive: a dir grave stays
+                $mt = ([DateTimeOffset]$g.LastWriteTimeUtc).ToUnixTimeSeconds()
+                if ($mt -gt $script:LockMtimeFloor -and ($now - $mt) -ge $script:LockStale) {
+                    [System.IO.File]::Delete($g.FullName)
+                    script:Lock-Log "SWEPT stale litter $($g.Name)"
+                }
+            } catch { }
         }
     } catch { }
 }
@@ -364,12 +496,15 @@ function script:Lock-RegisterExitBackstop {
         # variables come back empty when the closure was built inside a
         # function) survives into the exiting action - both measured on pwsh
         # 7.5 AND 5.1, 2026-06-10. A scriptblock with literal values does.
-        $bsDir = $script:LockDir.Replace("'", "''")
+        # The read uses the same delete-sharing FileStream as everywhere else.
+        $bsPath = $script:LockPath.Replace("'", "''")
         $bsTok = $script:LockToken.Replace("'", "''")
         $bsLog = $script:LockLog.Replace("'", "''")
         $action = [scriptblock]::Create(
-            "try { `$cur = ([System.IO.File]::ReadAllText('$bsDir/token')).Trim(); " +
-            "if (`$cur -eq '$bsTok') { [System.IO.Directory]::Delete('$bsDir', `$true); " +
+            "try { `$fs = [System.IO.File]::Open('$bsPath', [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)); " +
+            "try { `$sr = New-Object System.IO.StreamReader(`$fs); `$cur = `$sr.ReadLine() } finally { `$fs.Dispose() }; " +
+            "if (`$null -ne `$cur) { `$cur = `$cur.TrimEnd() }; " +
+            "if (`$cur -eq '$bsTok') { [System.IO.File]::Delete('$bsPath'); " +
             "`$ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); " +
             "[System.IO.File]::AppendAllText('$bsLog', `$ts + ' [pid=' + `$PID + '] RELEASED (engine-event backstop at process exit; tok=$bsTok)' + [char]10) } } catch { }")
         $script:LockExitJob = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action $action
@@ -403,69 +538,193 @@ function Lock-Acquire {
         return $false
     }
     $script:LockAcquireFail = ''
-    $start = script:Lock-Now
-    $script:LockToken = "tok.ps.$PID.$(Get-Random).$(script:Lock-Now)"
+    # Ensure the parent directory exists (an explicit AGENT_LOCK_PATH may point
+    # somewhere not yet created - mirrors git-commit-lock.sh's `mkdir -p`).
+    $parent = Split-Path -Parent $script:LockPath
+    if ($parent) { try { [void][System.IO.Directory]::CreateDirectory($parent) } catch { } }
     script:Lock-SweepLitter
+    $start = script:Lock-Now
+    $script:LockToken = "tok.ps.$PID.$(Get-Random).$start"
+    $waitingLogged = $false
 
     while ($true) {
-        if (script:Lock-TryCreateDir) {
-            # Won the lock. Write our token (used by Lock-Release to confirm we
-            # still own it) plus owner/epoch for logging. BOM-free UTF8 so the .sh
-            # side reads them cleanly. All guarded: a failed write must not abort.
-            # Token write is load-bearing: Lock-Release compares it to detect a
-            # steal, so a silently-dropped write here would later look like a theft
-            # (a false "stolen mid-hold"). Retry briefly - we just created the dir
-            # and hold it exclusively, so a transient sharing hiccup clears fast.
-            for ($i = 0; $i -lt 5; $i++) {
-                try { [System.IO.File]::WriteAllText("$script:LockDir/token", "$script:LockToken`n"); break }
-                catch { Start-Sleep -Milliseconds 20 }
+        # PRE-CREATE TYPE GUARD (load-bearing on Windows, not just bash
+        # symmetry - see PORT-SPECIFIC NOTES: CreateNew on a DANGLING symlink
+        # tunnels through the link and creates the TARGET here, so the create
+        # must not be attempted unless the path is absent or carries a plain
+        # non-reparse regular file, where CreateNew fails safely). The
+        # check-then-open gap is acceptable: a non-lock object at the path is
+        # static misconfiguration, not a racing peer.
+        $creatable = $false
+        $probe = script:Lock-GetPathItem
+        if ($null -eq $probe -or (script:Lock-IsPlainFile $probe)) { $creatable = $true }
+
+        if ($creatable -and (script:Lock-TryCreateFile)) {
+            # The file now carries our token and its mtime (the staleness
+            # clock) is stamped by the creating write.
+            #
+            # VERIFY via a path read-back before claiming the hold (see
+            # ACQUIRE VERIFICATION in git-commit-lock.sh): only our own token
+            # proves we hold the path. NEVER repair a failed read-back by
+            # writing to the path - after a long suspension the path may
+            # legitimately belong to a successor.
+            $rb = script:Lock-ReadCurToken -MaxTries 8
+            if ($rb.Status -eq 'ok' -and $rb.Token -eq $script:LockToken) {
+                $script:LockHeld = $true
+                script:Lock-RegisterExitBackstop
+                script:Lock-Log "ACQUIRED ($script:LockMe tok=$script:LockToken)"
+                return $true
             }
-            try { [System.IO.File]::WriteAllText("$script:LockDir/epoch", "$(script:Lock-Now)`n") } catch { }
-            try { [System.IO.File]::WriteAllText("$script:LockDir/owner", "$script:LockMe`n") } catch { }
-            $script:LockHeld = $true
-            script:Lock-RegisterExitBackstop
-            script:Lock-Log "ACQUIRED ($script:LockMe tok=$script:LockToken)"
-            return $true
+            $found = $rb.Token; if (-not $found) { $found = '<empty-or-gone>' }
+            script:Lock-Log "WARNING: acquire verification FAILED - create won but read-back found '$found' (ours=$script:LockToken); not acquired, re-entering wait"
+            [Console]::Error.WriteLine('git-commit-lock: WARNING - acquire verification failed: the lock file did not read back our token; treating the lock as NOT acquired and waiting')
+            # fall through to the blocked branch of this same iteration
         }
 
-        # Lock exists. Steal it if the DIR's mtime is older than the stale window -
-        # but ONLY if the mtime is a plausible reading. A sub-floor value is an
-        # unsettled FILETIME-zero (1601) read of a just-created lock, NOT a stale
-        # one; stealing on it would yank a live, brand-new lock (the cross-impl
-        # race the interop self-test caught 2026-06-03). Treat it as recent: wait.
-        $mt = script:Lock-DirMtime
-        if ($null -ne $mt -and $mt -gt $script:LockMtimeFloor) {
-            $age = (script:Lock-Now) - $mt
-            if ($age -ge $script:LockStale) {
-                $holder = '?'
-                try { $holder = ([System.IO.File]::ReadAllText("$script:LockDir/owner")).Trim() } catch { }
-                script:Lock-Log "STALE (age=${age}s holder=$holder) -> stealing"
-                # Re-read the mtime IMMEDIATELY before the steal: between our
-                # staleness reading and the Move, the stale dir may have been
-                # freed and re-created by a NEW live holder (or a rival stealer
-                # may have done steal+re-acquire). Abort the steal unless the
-                # reading is unchanged. This SHRINKS the check-then-act window
-                # to the Move itself rather than closing it; the residual race
-                # is detected, not silent - a wrongly-moved victim's release
-                # cries stolen instead of reporting success.
-                $mt2 = script:Lock-DirMtime
-                if ($null -eq $mt2 -or $mt2 -ne $mt) {
-                    script:Lock-Log "STEAL-ABORT (lock dir mtime changed under us; treating it as live)"
-                    continue
+        # Blocked (create lost, was skipped by the type guard, or won-but-
+        # failed verification). One WAITING line on the first blocked poll
+        # only: lets a log reader see this acquirer actually contended, and
+        # lets tests hold-until-WAITING instead of sleeping.
+        if (-not $waitingLogged) {
+            $waitingLogged = $true
+            script:Lock-Log "WAITING for lock ($script:LockMe tok=$script:LockToken)"
+        }
+
+        # PER-POLL TYPE GUARD (cheap; every blocked poll, NOT age-gated): an
+        # actively-written non-lock path (the canonical AGENT_LOCK_PATH=$HOME
+        # typo: writes keep refreshing its mtime) never ages past the stale
+        # window, so an age-gated guard would never diagnose it. Warn only on
+        # exists-but-wrong-type - a path that vanished since the failed create
+        # is normal contention (re-race the create), not a config problem.
+        # The existence probe sees the link itself (Lock-GetPathItem): a
+        # DANGLING symlink is refused by the pre-create guard forever but
+        # reads as absent to a target-following probe, which would misclassify
+        # it as contention every poll and starve the waiter to 97 undiagnosed.
+        $item = script:Lock-GetPathItem
+        if ($null -ne $item) {
+            if (-not (script:Lock-IsPlainFile $item)) {
+                script:Lock-WarnNonLock 'it is not a regular file'
+            } else {
+                # A regular file: a live lock, a stale one, or a crash orphan.
+                # Steal if the FILE's mtime is older than the stale window -
+                # but only on a PLAUSIBLE mtime (>= 2000-01-01): a sub-floor
+                # reading is an unsettled FILETIME-zero transient of a
+                # just-created lock (probes C/C1b), not a stale one; stealing
+                # on it would yank a live, brand-new lock. Treat as recent.
+                $mt = script:Lock-PathMtime
+                if ($null -ne $mt -and $mt -gt $script:LockMtimeFloor) {
+                    $age = (script:Lock-Now) - $mt
+                    if ($age -ge $script:LockStale) {
+                        # CONTENT GUARD (age-gated, runs only on a stale
+                        # candidate): steal only lock-shaped content - an
+                        # EMPTY file (the crash-between-create-and-write
+                        # orphan) or line 1 starting "tok." (a real token,
+                        # possibly torn mid-token). Anything else is a user
+                        # file at a typo'd path or a torn write shorter than
+                        # the prefix: never steal it. "Empty" is determined by
+                        # STAT, without opening (a FIFO read-open would block
+                        # on Unix - see PORT-SPECIFIC NOTES); the owner (line
+                        # 2) is read in the same open as line 1, BEFORE the
+                        # final mtime re-read below - an open inserted after
+                        # the re-read would widen exactly the window it
+                        # shrinks.
+                        $stealOk = $false; $holder = '?'
+                        $len = $null
+                        try { $len = (New-Object System.IO.FileInfo $script:LockPath).Length } catch { $len = $null }
+                        if ($null -ne $len) {
+                            if ($len -eq 0) {
+                                $stealOk = $true   # genuinely empty: the crash-orphan lane
+                            } else {
+                                $line1 = $null; $line2 = $null; $readFailed = $false
+                                try {
+                                    $fs = [System.IO.File]::Open($script:LockPath, [System.IO.FileMode]::Open,
+                                        [System.IO.FileAccess]::Read,
+                                        ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+                                    try {
+                                        $sr = New-Object System.IO.StreamReader($fs)
+                                        $line1 = $sr.ReadLine()
+                                        $line2 = $sr.ReadLine()
+                                    } finally { $fs.Dispose() }
+                                } catch [System.IO.FileNotFoundException] {
+                                    $len = $null   # vanished mid-check: normal contention; re-poll
+                                } catch [System.IO.DirectoryNotFoundException] {
+                                    $len = $null
+                                } catch {
+                                    $readFailed = $true
+                                }
+                                if ($null -ne $len) {
+                                    if ($readFailed) {
+                                        # Persistent read failure with a non-empty file
+                                        # still present: neither "empty" nor the
+                                        # never-steal lane - skip this steal attempt and
+                                        # re-poll. Self-correcting: a handle that blocks
+                                        # our read usually blocks the steal rename too
+                                        # (probe D1), so refusing costs nothing.
+                                        script:Lock-Log "steal skipped: stale lock content unreadable (age=${age}s); re-polling"
+                                    } else {
+                                        if ($null -ne $line1) { $line1 = $line1.TrimEnd() }
+                                        if ($null -ne $line2) { $line2 = $line2.TrimEnd() }
+                                        if ($line1 -and $line1.StartsWith('tok.')) {
+                                            $stealOk = $true
+                                            if ($line2) { $holder = $line2 }
+                                        } elseif ($line1) {
+                                            script:Lock-WarnNonLock 'its content is not lock-shaped'
+                                        } else {
+                                            # Line 1 blank. Re-stat: vanished -> contention;
+                                            # NOW empty -> the crash-orphan lane; non-empty
+                                            # with a blank first line -> not lock-shaped (a
+                                            # torn write of ours always starts with 't').
+                                            $len2 = $null
+                                            try { $len2 = (New-Object System.IO.FileInfo $script:LockPath).Length } catch { $len2 = $null }
+                                            if ($null -ne $len2) {
+                                                if ($len2 -eq 0) { $stealOk = $true }
+                                                else { script:Lock-WarnNonLock 'its content is not lock-shaped' }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if ($stealOk) {
+                            # Re-read the mtime IMMEDIATELY before the steal: a
+                            # rival may have completed steal+re-acquire since
+                            # our read above, in which case the file is now a
+                            # brand-new LIVE lock and renaming it aside would
+                            # rob it. Any change (fresher, sub-floor, or gone)
+                            # aborts this attempt and re-enters the loop. This
+                            # SHRINKS the check-then-act window; it cannot
+                            # close it with these primitives - see KNOWN
+                            # RESIDUAL RACES in git-commit-lock.sh (the
+                            # residual is detected at the victim's release).
+                            $mt2 = script:Lock-PathMtime
+                            if ($null -eq $mt2 -or $mt2 -ne $mt) {
+                                $now2 = '<gone>'; if ($null -ne $mt2) { $now2 = $mt2 }
+                                script:Lock-Log "steal aborted: lock file mtime changed underneath us (was $mt, now $now2)"
+                                continue
+                            }
+                            script:Lock-Log "STALE (age=${age}s holder=$holder) -> stealing"
+                            # Atomic steal: rename the stale file aside. Only
+                            # one concurrent stealer wins (the rest throw and
+                            # re-poll); then everyone re-races the create. The
+                            # victim (if still alive) will fail at ITS release:
+                            # gone or foreign token => 98.
+                            $grave = "$($script:LockPath).dead.$PID.$(script:Lock-Now)"
+                            try {
+                                [System.IO.File]::Move($script:LockPath, $grave)
+                                try { [System.IO.File]::Delete($grave) } catch { }
+                                script:Lock-Log "STOLE stale lock (was held by $holder)"
+                            } catch { }
+                            continue
+                        }
+                    }
                 }
-                # Atomic steal: rename the stale dir aside. Only one concurrent
-                # stealer wins (the rest throw); then everyone re-races create.
-                $grave = "$($script:LockDir).dead.$PID.$(script:Lock-Now)"
-                try {
-                    [System.IO.Directory]::Move($script:LockDir, $grave)
-                    try { [System.IO.Directory]::Delete($grave, $true) } catch { }
-                    script:Lock-Log "STOLE stale lock (was held by $holder)"
-                } catch { }
-                continue
             }
         }
+        # (path absent: normal contention - the next iteration re-races the create)
 
-        # A live holder has it - wait, unless we have waited too long.
+        # A live holder has it (or a never-steal object squats it) - wait,
+        # unless we have waited too long.
         if (((script:Lock-Now) - $start) -ge $script:LockMaxWait) {
             script:Lock-Log "TIMEOUT after $($script:LockMaxWait)s waiting for lock"
             [Console]::Error.WriteLine("git-commit-lock: timed out after $($script:LockMaxWait)s waiting for commit lock")
@@ -481,21 +740,31 @@ function Lock-Acquire {
 
 # Release. Returns $true if we held the lock cleanly throughout. Returns $false
 # otherwise, with $script:LockReleaseStatus saying why:
-#   'stolen'      our lease was stolen before release - the work we just did was
-#                 NOT exclusive and should be treated as failed (run -> exit 98);
-#   'unreadable'  the lock dir still exists but its token could not be read
-#                 even after escalating retries - the file would not open (a
-#                 persistent sharing violation) or it is MISSING. Neither is
-#                 proof of theft, and not proof of ownership either, so we do
-#                 NOT delete the dir (the stale window reclaims it; an
-#                 opportunistic sweep cleans any grave litter) and we do NOT
-#                 report success (run -> exit 1 unless the command already
+#   'stolen'      our lease was stolen before release - the lock file is GONE,
+#                 or carries a non-empty FOREIGN token (both definitive:
+#                 acquire's read-back proved our token was at the path). The
+#                 work we just did was NOT exclusive and should be treated as
+#                 failed (run -> exit 98);
+#   'unreadable'  the file still reads EMPTY after the retry ladder while
+#                 present (or persistently would not open). NOT definitive
+#                 theft evidence: it cannot be our own failed write (acquire's
+#                 read-back positively verified our token at the path), but it
+#                 can be a successor mid-create after a boundary steal (probe
+#                 F's window) or external truncation. We cannot verify
+#                 ownership either way: do NOT delete (it may be a successor's
+#                 nascent live lock), do NOT report success - leave the file
+#                 (the staleness backstop recovers a true orphan). Same
+#                 verdict as git-commit-lock.sh's rc-2 lane for the same
+#                 on-disk state (run -> exit 1 unless the command already
 #                 failed with its own code);
-#   'leftover'    the token verified (the work WAS exclusive) but the dir could
-#                 be neither deleted nor renamed aside, so the lock is left in
-#                 place blocking waiters until the stale window. A cleanup
-#                 failure, not a serialisation failure: `run` keeps the
-#                 command's exit code and warns on stderr.
+#   'leftover'    the token verified (the work WAS exclusive) but the file
+#                 could not be deleted even after retries, so the lock is left
+#                 in place blocking waiters. Recovery needs BOTH the stale
+#                 window elapsing AND the blocking handle closing - the same
+#                 handle blocks a stealer's rename (probe D1), so until then
+#                 waiters re-poll and may reach 97. A cleanup failure, not a
+#                 serialisation failure: `run` keeps the command's exit code
+#                 and warns on stderr.
 function Lock-Release {
     Set-StrictMode -Off
     $ErrorActionPreference = 'Stop'
@@ -504,72 +773,65 @@ function Lock-Release {
     $script:LockReleaseStatus = 'ok'
     script:Lock-UnregisterExitBackstop
 
-    # Did we keep the lock the whole time? Compare the dir's current token to ours.
+    # Did we keep the lock the whole time? Compare the file's current token to
+    # ours - and on a match, re-read once more IMMEDIATELY before the delete to
+    # shrink the steal-between-check-and-delete window. The boundary re-read is
+    # classified by the SAME rules as the first read (empty-at-boundary is the
+    # unverifiable lane, never a delete: in the file era an empty read is
+    # precisely the create->write window of a successor after a boundary
+    # steal). The window cannot be closed with these primitives - see KNOWN
+    # RESIDUAL RACES in git-commit-lock.sh; the residual case is detected by
+    # the displaced party, never silent.
     $read = script:Lock-ReadCurToken -MaxTries 8
-    if ($read.Status -eq 'unreadable') {
-        $script:LockReleaseStatus = 'unreadable'
-        script:Lock-Log "WARNING: token UNREADABLE or MISSING at release (lock dir still present; exclusivity unproven, dir left for the stale window). NOT claiming success. (ours=$script:LockToken)"
-        [Console]::Error.WriteLine("git-commit-lock: WARNING - could not read the lock token at release (missing token file or persistent sharing violation). Exclusivity is unproven; the lock dir was left in place and will be reclaimed after the stale window. Verify with 'git log' before relying on this commit.")
-        return $false
+    if ($read.Status -eq 'ok' -and $read.Token -eq $script:LockToken) {
+        $read = script:Lock-ReadCurToken -MaxTries 2
     }
-    if ($read.Status -eq 'gone' -or $read.Token -ne $script:LockToken) {
-        # Our lease expired and the lock was stolen (possibly re-acquired by
-        # someone else). Do NOT delete the dir - it may be a successor's LIVE lock.
-        $now = $read.Token; if (-not $now) { $now = '<none>' }
+    if (-not ($read.Status -eq 'ok' -and $read.Token -eq $script:LockToken)) {
+        if ($read.Status -eq 'unreadable') {
+            $script:LockReleaseStatus = 'unreadable'
+            script:Lock-Log "WARNING: lock file present but EMPTY at release (after retries); ownership unverifiable. Leaving it in place. (ours=$script:LockToken)"
+            [Console]::Error.WriteLine("git-commit-lock: WARNING - the lock file read empty at release (still present). Ownership unverifiable; lock file left in place. Verify with 'git log'.")
+            return $false
+        }
+        # Gone, or a foreign token: our lease expired and the lock was stolen
+        # (and possibly re-acquired by someone else). Do NOT touch the path -
+        # it may be a successor's LIVE lock. Loudly report the non-exclusive
+        # hold.
+        $now = $read.Token; if (-not $now) { $now = '<gone>' }
         script:Lock-Log "WARNING: lock LOST before release (held longer than $($script:LockStale)s stale window; stolen). This commit was NOT exclusive - redo it. (ours=$script:LockToken now=$now)"
         [Console]::Error.WriteLine("git-commit-lock: WARNING - lock was stolen mid-hold (held > $($script:LockStale)s). Your commit was NOT serialised; verify with 'git log' and redo under the lock.")
         $script:LockReleaseStatus = 'stolen'
         return $false
     }
 
-    # Still ours. Re-read the token IMMEDIATELY before the delete: this shrinks
-    # (does NOT close) the check-then-act window in which a boundary steal +
-    # re-acquire could slip between our check and the Delete - the residual
-    # race is detected, not silent (the successor's release would cry stolen).
-    # An 'unreadable' result here does not divert: the robust read above already
-    # said the lock is ours, and unreadable is not evidence to the contrary.
-    $read2 = script:Lock-ReadCurToken -MaxTries 2
-    if ($read2.Status -eq 'gone' -or ($read2.Status -eq 'ok' -and $read2.Token -ne $script:LockToken)) {
-        $now = $read2.Token; if (-not $now) { $now = '<none>' }
-        script:Lock-Log "WARNING: lock LOST at release boundary (stolen between check and delete). This commit was NOT exclusive - redo it. (ours=$script:LockToken now=$now)"
-        [Console]::Error.WriteLine("git-commit-lock: WARNING - lock was stolen mid-hold (held > $($script:LockStale)s). Your commit was NOT serialised; verify with 'git log' and redo under the lock.")
-        $script:LockReleaseStatus = 'stolen'
-        return $false
-    }
-
-    # Free it. Recovery (rename-aside) triggers ONLY on a failed delete: while
-    # the dir exists no one else can create it, so it is unambiguously ours and
-    # the rename is safe. We must NOT re-check existence after a *successful*
-    # delete - by then a successor may have re-created the dir and entered its
-    # own critical section, and moving it aside would steal that live lock
-    # (two holders -> lost update).
+    # Still ours - free it: one unlink. File.Delete is silent on a missing
+    # file, which is the "vanished mid-race = already released" branch. On
+    # Windows the delete can fail while a foreign no-delete-share handle (AV
+    # scanner, naive reader) is open on the file; retry briefly. The retry is
+    # grounded on probe D1, not on hope: the handle class that blocks our
+    # delete also blocks any steal's rename, so the path cannot be
+    # stolen-and-recreated while the delete keeps failing (the read-only-
+    # attribute exception and the between-retries gap are documented in the
+    # headers; both end in the same detected-98 class).
     $deleted = $false
-    try { [System.IO.Directory]::Delete($script:LockDir, $true); $deleted = $true } catch { $deleted = $false }
+    for ($i = 0; $i -lt 5; $i++) {
+        try { [System.IO.File]::Delete($script:LockPath); $deleted = $true; break }
+        catch { Start-Sleep -Milliseconds 20 }
+    }
     if (-not $deleted) {
-        $grave = "$($script:LockDir).rel.$PID.$(script:Lock-Now)"
-        $renamed = $false
-        try {
-            [System.IO.Directory]::Move($script:LockDir, $grave)
-            $renamed = $true
-            # Renamed aside: the lock IS released (waiters can re-create the
-            # dir). The grave is best-effort litter; the sweep at the next
-            # acquire collects stragglers.
-            try { [System.IO.Directory]::Delete($grave, $true) } catch { }
-        } catch { $renamed = $false }
-        if (-not $renamed -and (Test-Path -LiteralPath $script:LockDir)) {
-            # Both the delete and the rename failed and the dir is still in
-            # place: the lock is NOT released. The work itself WAS exclusive
-            # (token verified above), so this is a cleanup failure, not a
-            # serialisation failure - but do NOT log RELEASED or claim a clean
-            # release: waiters stay blocked until the stale-window mtime
-            # backstop reclaims the dir. (Mirrors git-commit-lock.sh.)
+        if (Test-Path -LiteralPath $script:LockPath) {
+            # Persistent failure: the lock is NOT released (LEFTOVER). Do not
+            # claim success - waiters stay blocked until the stale window
+            # elapses AND the blocking handle closes (the same handle blocks
+            # their steal rename, so until then they re-poll, possibly to 97).
             $script:LockReleaseStatus = 'leftover'
-            script:Lock-Log "WARNING: release FAILED - delete and rename-aside both failed; lock dir left in place (tok=$script:LockToken). Waiters are blocked until the $($script:LockStale)s stale window reclaims it."
-            [Console]::Error.WriteLine("git-commit-lock: WARNING - could not remove the lock dir ($script:LockDir); it is left behind and will block waiters until the $($script:LockStale)s stale window expires")
+            script:Lock-Log "WARNING: release FAILED - could not delete the lock file after 5 attempts; LEFTOVER (tok=$script:LockToken). Waiters are blocked until the $($script:LockStale)s stale window elapses AND the blocking handle closes."
+            [Console]::Error.WriteLine("git-commit-lock: WARNING - could not remove the lock file ($script:LockPath); it is left behind and will block waiters until the $($script:LockStale)s stale window expires and whatever holds it open lets go")
             return $false
         }
-        # else: renamed aside, or the dir vanished between the failed delete
-        # and the rename - already gone, equally released.
+        # else: the file vanished while the delete kept failing - already
+        # gone, equally released (the same branch File.Delete's silent-on-
+        # missing behaviour covers).
     }
     script:Lock-Log "RELEASED ($script:LockMe tok=$script:LockToken)"
     return $true
@@ -586,8 +848,10 @@ function Lock-Release {
 #      command, instead of unwinding this script past the release logic;
 #   1  if the command threw a terminating error (mapped in a try/catch so an
 #      in-session caller can never read a stale $LASTEXITCODE as success);
-#   then overridden by the release outcome: stolen -> 98; unreadable-token ->
-#      1 if the command had succeeded (a failing command's own code is kept).
+#   then overridden by the release outcome: stolen -> 98; unverifiable
+#      ('unreadable') -> 1 if the command had succeeded (a failing command's
+#      own code is kept); leftover -> the command's code is kept (cleanup
+#      failure, not a serialisation failure; the warning is on stderr).
 # The command runs with $ErrorActionPreference = 'Continue' (a sane default),
 # not this script's internal 'Stop'. Its stdout/stderr flow to the host.
 function Invoke-WithLock {
@@ -687,8 +951,8 @@ if ($MyInvocation.InvocationName -ne '.') {
                 foreach ($l in $script:LockUsage) { [Console]::Error.WriteLine($l) }
                 exit 96
             }
-            if (-not $script:LockInRepo -and -not $env:AGENT_LOCK_DIR) {
-                [Console]::Error.WriteLine('git-commit-lock: not inside a git repository and AGENT_LOCK_DIR is not set; refusing to guess a lock location (a CWD-scoped lock would not serialise anything). cd into the repo or set AGENT_LOCK_DIR.')
+            if (-not $script:LockInRepo -and -not $env:AGENT_LOCK_PATH) {
+                [Console]::Error.WriteLine('git-commit-lock: not inside a git repository and AGENT_LOCK_PATH is not set; refusing to guess a lock location (a CWD-scoped lock would not serialise anything). cd into the repo or set AGENT_LOCK_PATH.')
                 exit 96
             }
             Invoke-WithLock -CommandString ([string]$parts[0])
