@@ -5,3 +5,8 @@
 # OS / editor cruft
 .DS_Store
 Thumbs.db
+/.agent/review-queue
+/.agent/review-queue.lock
+/.agent/review-queue.lock.*
+/.agent/last-opened
+/.agent/.tmp.*
