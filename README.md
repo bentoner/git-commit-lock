@@ -79,8 +79,8 @@ bash holder and a PowerShell holder in the same tree serialise against
 PowerShell-on-POSIX is not a configuration we support; on macOS and Linux,
 use the bash implementation. CI nevertheless runs the two implementations
 against each other on all three OSes — not as platform support, but because
-two independent implementations
-hammering one lock is cheap adversarial verification of the protocol (it has
+two independent implementations hammering one lock is cheap adversarial
+verification of the protocol (it has
 already caught a real bug that single-OS testing missed).
 
 ## Install
