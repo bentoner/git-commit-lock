@@ -1,3 +1,22 @@
+## Review round 4 of the convergence loop, 2026-06-11 — CONVERGED
+
+> **Codex: clean — no findings at any severity.** Claude: concur with GO, no
+> design defects; five non-blocking precision items, all folded same day:
+> interop tests (a)/(b) gated to Windows (on POSIX unlink/rename never block
+> on open handles — ungated they'd redden the ubuntu/macos legs);
+> ps1-on-Unix device/socket residual documented beside the FIFO one (bash
+> refuses via `-f`; grave-delete caps damage at the misconfigured inode);
+> per-poll guard's "exists" pinned to `-e || -L` (dangling symlink must warn,
+> not read as contention); the release-retry gap added to the residual-races
+> inventory (handle can close between retries; detected ⇒ 98); the
+> actively-rewritten-user-file diagnostics gap documented as the accepted
+> flip side of age-gating the content guard. **Loop closed: zero findings
+> from one reviewer, zero design defects from the other, severity trending
+> MAJOR→pins→precision across rounds 2–4 — further rounds would be
+> manufacturing findings, not converging.** Ben decides GO/NO-GO; on GO,
+> implementation runs as a branch + PR per the new GitHub workflow, after CI
+> is green (Sequencing).
+
 ## Review round 3 of the convergence loop, 2026-06-11 (fresh Claude + Codex)
 
 > **Status: all findings folded same day.** Claude: concur with GO; one MAJOR
@@ -442,8 +461,18 @@ never ages past the window, so an age-gated guard would never fire and
 waiters would hit 97 with no diagnosis. The per-poll guard warns only on
 **exists-but-wrong-type** — a path that vanished between the failed create
 and the check is normal contention (re-race the create), not a config
-warning, or the once-per-process warning would burn on a healthy system. The
-content guard (step 3) stays age-gated (don't read content on every poll).
+warning, or the once-per-process warning would burn on a healthy system.
+"Exists" is pinned as `-e || -L` (ps1: a probe that sees the link itself,
+e.g. `Get-Item -Force`, not the target): a **dangling symlink** is refused
+by O_CREAT|O_EXCL forever but reads as absent to a bare `-e`, so keying
+existence on `-e` alone would classify it as normal contention every poll
+and the waiter would die at 97 with no diagnosis. The
+content guard (step 3) stays age-gated (don't read content on every poll) —
+accepting one diagnostics gap as the flip side: an actively-REWRITTEN
+regular user file at a typo'd path also never ages into the content guard,
+so it too ends in 97 without a config warning. Safety is intact either way
+(nothing is stolen or deleted); these two lanes trade diagnosis for not
+stat/reading the path's content on every poll.
 
 1. mtime above floor and age ≥ stale window;
 2. **the lock path must be a regular file and not a symlink**
@@ -466,9 +495,14 @@ content guard (step 3) stays age-gated (don't read content on every poll).
    so it reaches this step, and a read-open on a writer-less FIFO blocks in
    `open(2)` before any timeout logic runs (the same hazard class the bash
    pre-create guard kills; bash's *steal* is already safe via `[ -f ]`).
-   Residual: a typo'd-path FIFO stats as size 0 and gets renamed aside as an
-   empty orphan — a harmless rename, same accepted class as the
-   empty-user-file residual. (The .NET-on-Unix blocking claim is
+   Residual (ps1-on-Unix only; bash refuses all of these via `[ -f ]`): a
+   typo'd-path FIFO — and likewise a device node or socket, which .NET has no
+   clean portable type probe for, so step 2's "never steal a device" is
+   delivered by bash but not by ps1 on Unix — stats as size 0 and takes the
+   empty-orphan lane: renamed aside AND grave-deleted, so damage is capped at
+   the one misconfigured inode (in practice /dev permissions make real device
+   nodes unrenamable anyway). Same accepted class as the empty-user-file
+   residual. (The .NET-on-Unix blocking claim is
    reasoned-not-probed — no pwsh-on-Unix on this box; one line on CI's
    ubuntu leg settles it.) Two lanes pinned identically in both impls:
    (a) a **persistent read failure with the file still present** is neither
@@ -566,8 +600,16 @@ release cries 98 — see "races" below).
   completes steal+re-acquire ⇒ our rename moves a brand-new live lock.
 - *Release-side:* between the token check and the unlink, a boundary steal +
   re-acquire slips in ⇒ our unlink deletes the successor's live file.
+- *Release-retry gap (new with the retry, for completeness):* the D1 guarantee
+  ("the handle blocking our unlink also blocks a steal's rename") holds while
+  the handle is OPEN — it can close *between* our ~20ms retries, letting a
+  steal + re-create land before the next attempt, whose `rm -f` then deletes
+  the successor's live file. Needs a contract-breach stale hold plus a full
+  steal+create inside the gap; the retry technically widens the release-side
+  window by the ~100ms budget. Same detection as the others (successor's
+  release ⇒ 98).
 
-Both still require a hold that overran the stale window, and both are detected
+All require a hold that overran the stale window, and all are detected
 (the displaced holder's release finds a missing/foreign token ⇒ 98). Note for
 the future, not this change: the ps1 side *could* close both windows outright
 with handle-based ops (open the file with delete sharing, fstat the mtime /
@@ -660,7 +702,13 @@ missing-token) fabricates by deleting the token file — re-split it into
 (i) truncate-the-lock-file ⇒ both impls report the unverifiable lane, and
 (ii) delete-the-lock-file ⇒ both impls report **98** (a new cross-impl
 gone⇒theft agreement assertion). New interop tests (pwsh required,
-so they live here): (a) **blocked release** — a pwsh process holds the lock
+so they live here). **Tests (a) and (b) — including (a)'s recovery half —
+are gated to Windows** (skip-with-note elsewhere, like Phase 1's mkfifo
+conditioning): they manufacture blocking via a `FileShare.Read` holder, and
+on POSIX unlink/rename never block on open handles (.NET's Unix FileShare is
+advisory among .NET openers and gates no namespace operation), so on the
+ubuntu/macos CI legs (a) would fail outright — the release simply succeeds —
+and (b) would pass vacuously: (a) **blocked release** — a pwsh process holds the lock
 file with `FileShare.Read` while the bash holder releases ⇒ deterministic
 leftover path — rc 1 meaning the *sourced* `lock_release` return value /
 `LockReleaseStatus='leftover'`; the `run` wrapper keeps the wrapped command's
