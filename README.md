@@ -60,11 +60,12 @@ on POSIX filesystems and NTFS alike, with no dependency on `flock` — whose
 content is the holder's unique token. Every worktree has its own git dir, so
 independent worktrees get independent locks, while all agents sharing one
 checkout contend on the same lock. A lock held longer than 5 minutes
-(configurable) is presumed crashed and is stolen, so a dead agent can't wedge
-the others; a holder that loses the lock mid-hold finds out at release (exit
-code 98) rather than silently claiming success. Full design and rationale —
-including why `flock` and other OS lock primitives don't fit this
-cross-runtime setting: [`docs/git-commit-lock.md`](docs/git-commit-lock.md).
+(configurable) is presumed crashed and can be stolen by a waiter, so a dead
+agent can't wedge the others; a holder that loses the lock mid-hold finds out
+at release (exit code 98) rather than silently claiming success. Full design
+and rationale — including why `flock` and other OS lock primitives don't fit
+this cross-runtime setting:
+[`docs/git-commit-lock.md`](docs/git-commit-lock.md).
 
 Two wire-compatible implementations share one lock file and protocol, so a
 bash holder and a PowerShell holder in the same tree serialise against
@@ -75,10 +76,10 @@ bash holder and a PowerShell holder in the same tree serialise against
   shell is pwsh (e.g. Codex): on Windows a bare `bash` resolves to WSL for
   some agents, and WSL's git can't reach a Windows-side commit signer
 
-On macOS and Linux, use the bash implementation: no agent harness drives
-pwsh there, so PowerShell-on-POSIX is not a supported configuration. CI
-nevertheless runs the two implementations against each other on all three
-OSes — not as platform support, but because two independent implementations
+PowerShell-on-POSIX is not a configuration we support; on macOS and Linux,
+use the bash implementation. CI nevertheless runs the two implementations
+against each other on all three OSes — not as platform support, but because
+two independent implementations
 hammering one lock is cheap adversarial verification of the protocol (it has
 already caught a real bug that single-OS testing missed).
 
