@@ -400,3 +400,60 @@ Where each plan rule landed (ps1:line anchors at commit time):
   destination — routed through the existing damped blocked-steal lane;
   header-documented). The 5.1 'lost' lane gained a log line with no bash
   counterpart (the lane itself is plan-specified).
+
+## Phase 4 — docs + README
+
+`docs/git-commit-lock.md`:
+- "How the lock works" intro: "each built around a single filesystem
+  operation" reworded (the steal is now claim create + rename-over; the
+  three primitives still cover everything).
+- "The protocol in detail": steal bullet rewritten for claim+rename-over
+  (claim file, recheck -> touch -> re-verify -> rename-over, prevention vs
+  the old detect+repair); new "A claim is itself leased" paragraph (60s
+  ageout, free-for-all clearing, MAX_WAIT > STALE + CLAIM_STALE relation +
+  left-default warning gate); never-steal guards gain the per-path clause;
+  ps1-on-POSIX exception updated (rename-over consumes the inode; claim-path
+  clear lane); new "Aborted steals self-resolve" paragraph (token-checked
+  deletion, unconditional discovery read, per-attempt tokens, leaked-token
+  memory incl. best-effort release cleanup + 98, trap-time cleanup, the
+  arc-scoped structural no-unowned-orphan claim, pointer to the headers for
+  the lane inventory); version-skew deployment note; mtime-floor caveat
+  extended to claims. Fixed an ambiguity my own edit created ("bound that
+  claim" -> "bound that guarantee" — claim is now a protocol object).
+- Port section: wire-format bullet now names the shared claim file; new
+  "rename-over differs by engine" bullet (pwsh 7 3-arg Move, the 5.1
+  unlink+fail-if-exists-Move ladder with the claim-guarded absent window =
+  fairness loss never a clobber, the File.Replace rejection, the Q4
+  classic-rename deferral residual). No hard-link notes remained in the doc
+  (they were header-only).
+- Knobs table: + `AGENT_LOCK_CLAIM_STALE_SECS` (60); the MAX_WAIT note now
+  states the STALE + CLAIM_STALE relation and the left-default warning gate;
+  the AGENT_LOCK_PATH row notes the claim lives at `<lock>.next`.
+- Golden rule: the crash-recovery-under-contention paragraph rewritten —
+  recovery is claim-serialized, the recovering waiter keeps the lock, the
+  narrow residuals surface as the documented 98 redo; the untrappable-death
+  residual stated accurately (orphaned claim normally ages out at the claim
+  window; worst case via a suspended rival's rename is an unowned lock =
+  bounded <= STALE stall, same class as a crashed holder's stall, no false
+  success).
+- Tests section: unit-suite description updated to the new coverage
+  (claim-serialized T2b assertions incl. no-grave-ever, claim contention,
+  claim ageout, per-path guard state, contested abort, the discovery-
+  position matrix, the leaked-claim lanes, TERM-mid-claim + foreign-claim
+  survival, the per-attempt-token regression, steal-hold trap parity, the
+  delayed-claim fresh lease, sub-floor claim mtime, blocked-steal immediate
+  claim cleanup, the non-creating-touch static check; the grave-sweep item
+  removed); interop description gains claim-serialized mixed recovery, the
+  cross-impl claim race + staleness tests, the no-File.Replace static
+  check, and the 5.1 steal-ladder leg in the smoke lane.
+- Security section checked: "small set of lock-protocol files at its own
+  names beside the lock" still true of the claim — unchanged.
+
+`README.md`: the "How it works" recovery sentences replaced with the
+claim-serialization clause (one clause, no protocol dump). Grep confirmed
+no other grave/restore references in the README.
+
+Cross-checks: all internal anchors resolve against the (unchanged)
+headings; no new line exceeds ~78 cols (remaining long lines are
+pre-existing code/table/URL lines); the docs' numbers verified against the
+code defaults (60/300/420; exit 96/97/98).

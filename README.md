@@ -64,12 +64,11 @@ from a stuck holder halts the whole run — while a rare collision costs little
 more than a failed commit. So a lock held longer than 5 minutes (configurable)
 is presumed abandoned and can be stolen by a waiter, and a holder that loses
 the lock mid-hold finds out at release (exit code 98) rather than silently
-claiming success. Recovery from a crash is itself guarded: when several
-waiters race to steal the same dead lock, a late stealer can briefly displace
-the waiter that already won the recovery — the tool detects this at steal
-time (the moved-aside file's token isn't the dead holder's) and puts the
-displaced lock back atomically, with the rare unrestorable case surfacing as
-the same loud exit 98. The lock is advisory: it serialises cooperating
+claiming success. Recovery from a crash is itself guarded: stealing is
+serialized through a claim file, so when several waiters race to recover the
+same dead lock exactly one steals it and the recovering waiter keeps the
+lock it recovered — the narrow residual races surface as the same loud
+exit 98. The lock is advisory: it serialises cooperating
 agents and trusts the repo and every process running as the same user — see
 [Security and trust
 assumptions](docs/git-commit-lock.md#security-and-trust-assumptions).
