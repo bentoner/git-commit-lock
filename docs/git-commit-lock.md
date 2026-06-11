@@ -78,7 +78,14 @@ empty nor `tok.`-prefixed is **never** stolen or deleted: a loud one-time
 config warning names the path, and waiters time out (97) until a human
 removes it. The tool never runs `rm -rf` and never deletes anything it cannot
 identify as a lock, so a typo'd `AGENT_LOCK_PATH` — pointing at `$HOME`, or
-at a real user file — is harmless. (bash also refuses the *create* on a
+at a real user file with ordinary content — is harmless. Two accepted
+residuals bound that claim, because the content test is exactly "empty, or
+line 1 starts `tok.`": a stale **empty** user file is indistinguishable from
+the crash orphan and IS stolen, and a stale user file whose first line
+happens to start `tok.` passes the wire test and IS stolen too —
+deliberately, since a fuller shape check would bind the wire format harder
+for near-zero added protection (see ACCEPTED RESIDUALS in
+`git-commit-lock.sh`). (bash also refuses the *create* on a
 non-regular path up front: `noclobber`'s exists⇒fail protection covers
 regular files only, and an open on an existing FIFO would block before any
 timeout logic runs.) One scoped exception: bash delivers this guarantee in

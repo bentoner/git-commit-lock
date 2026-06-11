@@ -204,10 +204,17 @@ high codes that report the lock's own outcomes:
 | 97 | lock acquisition timed out (`AGENT_LOCK_MAX_WAIT`, default 7 minutes) — the command was never run |
 | 98 | lock stolen mid-hold — the command ran but was NOT serialised; verify with `git log` and redo it under the lock |
 
-Anything else is the wrapped command's own exit code; the lock's own failures
-also print a message on stderr. Avoid exiting 96–98 from your own wrapped
-command — those codes are reserved by this contract, and a command exiting 98
-is indistinguishable from a stolen lock. See
+Anything else is the wrapped command's own exit code — with one caveat: when
+ownership is *unverifiable* at release (the lock file still reads **empty**
+while present, e.g. a successor mid-create after a boundary steal — not
+provable theft, but not a verified-exclusive hold either), `run` fails a
+*successful* command with exit **1**; a failing command keeps its own code.
+A lock file that cannot be *deleted* at release (a leftover blocking handle)
+is only a cleanup failure — the hold itself was exclusive — so there the
+command's own exit code is kept. Both lanes warn on stderr. Avoid exiting
+96–98 from your own wrapped command — those codes are reserved by this
+contract, and a command exiting 98 is indistinguishable from a stolen lock.
+See
 [`docs/git-commit-lock.md`](docs/git-commit-lock.md) for the `AGENT_LOCK_*` config
 knobs and how staleness and stealing work.
 
