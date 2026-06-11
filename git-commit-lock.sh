@@ -482,6 +482,13 @@ lock_acquire() {
   local start; start="$(_lock_now)"
   _LOCK_TOKEN="tok.$$.${RANDOM}.$start"
   local waiting_logged=0
+  # Log damper for a squatted stale lock (a no-delete-share handle, or an
+  # unwritable parent dir, makes the steal rename fail every poll with the
+  # file still present): epoch of the last logged failed-steal attempt, 0 when
+  # the last attempt did not fail that way. While the failures persist, the
+  # STALE/steal-FAILED pair is logged at most once per stale window, so the
+  # log growth stays bounded however long the squat lasts.
+  local steal_fail_last=0
 
   while true; do
     # PRE-CREATE TYPE GUARD (mandatory). noclobber's exists=>fail protection
@@ -612,17 +619,42 @@ lock_acquire() {
                 _lock_log "steal aborted: lock file mtime changed underneath us (was $mt, now ${mt2:-<gone>})"
                 continue
               fi
-              _lock_log "STALE (age=${age}s holder=$holder) -> stealing"
+              # Damp the attempt logging while the steal keeps failing on a
+              # squatted file (see steal_fail_last above): first failure, then
+              # at most once per stale window.
+              local now_s log_steal=1
+              now_s="$(_lock_now)"
+              if [ "$steal_fail_last" != 0 ] \
+                 && [ $(( now_s - steal_fail_last )) -lt "$AGENT_LOCK_STALE_SECS" ]; then
+                log_steal=0
+              fi
+              [ "$log_steal" = 1 ] && _lock_log "STALE (age=${age}s holder=$holder) -> stealing"
               # Atomic steal: rename the stale file aside. Only one
               # concurrent stealer wins (the rest get ENOENT); then everyone
               # re-races the create above. The victim (if still alive) will
               # fail at ITS lock_release: gone or foreign token => 98.
-              local grave; grave="$AGENT_LOCK_PATH.dead.$$.$(_lock_now)"
+              local grave; grave="$AGENT_LOCK_PATH.dead.$$.$now_s"
               if mv -- "$AGENT_LOCK_PATH" "$grave" 2>/dev/null; then
                 rm -f -- "$grave" 2>/dev/null || true
                 _lock_log "STOLE stale lock (was held by $holder)"
+                steal_fail_last=0
+                continue   # won the steal: immediately re-race the create
               fi
-              continue
+              if ! [ -e "$AGENT_LOCK_PATH" ] && ! [ -L "$AGENT_LOCK_PATH" ]; then
+                steal_fail_last=0
+                continue   # lost the race (a rival's rename won; ENOENT): re-race the create
+              fi
+              # The rename failed with the file STILL PRESENT: a no-delete-share
+              # handle squatting the file (it blocks rename exactly like the
+              # release unlink — probe D1) or an unwritable parent dir. Nothing
+              # will change until the squatter lets go, so this must NOT skip
+              # the timeout check + poll sleep below: an unconditional
+              # `continue` here busy-spun flat-out and could never reach 97
+              # (review finding, 2026-06-11). Fall through instead.
+              if [ "$log_steal" = 1 ]; then
+                _lock_log "steal FAILED: rename refused with the lock file still present (no-delete-share handle, or unwritable parent dir); re-polling — repeats logged at most once per ${AGENT_LOCK_STALE_SECS}s"
+                steal_fail_last="$now_s"
+              fi
             fi
           fi
         fi

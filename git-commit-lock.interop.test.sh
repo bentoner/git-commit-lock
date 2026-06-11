@@ -18,7 +18,7 @@
 # does) for the full-strength canary. The suite prints which mode ran — a
 # reduced pass must never masquerade as the full one.
 #
-# The blocked-release/blocked-steal tests (T13/T14) are WINDOWS-ONLY by
+# The blocked-release/blocked-steal tests (T13/T14/T14b) are WINDOWS-ONLY by
 # nature: they manufacture blocking via a no-delete-share file handle, and on
 # POSIX open handles never block unlink/rename (.NET's Unix FileShare is
 # advisory among .NET openers and gates no namespace operation), so there
@@ -580,8 +580,52 @@ else
   bad "T14 blocker never signalled its handle open"
 fi
 
+echo "== Test 14b: blocked steal NEVER bypasses MAX_WAIT — squatted stale lock => 97 with bounded logging (regression: busy-spin) =="
+# Regression for the 2026-06-11 review finding: when the steal rename keeps
+# failing with the lock file still present (a no-delete-share handle squatting
+# it), the failed-steal lane used to `continue` past the timeout check AND the
+# poll sleep — the waiter busy-spun flat-out, logged STALE every iteration,
+# and could never reach 97. The squatter here NEVER closes during the wait;
+# each impl's waiter must still exit 97 at MAX_WAIT, with the steal-attempt
+# logging damped (first failure, then at most once per stale window).
+LOCK="$WORK/bs2.lock"; rm -f "$LOCK"
+fabricate_lock "$LOCK" "tok.sh.stale.2" "pid=4243 host=ghost"
+backdate "$LOCK" 9999
+BREADY="$WORK/bs2.bready"; BGO="$WORK/bs2.bgo"; rm -f "$BREADY" "$BGO"
+hold_handle "$LOCK" "$BREADY" "$BGO" &
+blk14b=$!
+if wait_for "$BREADY" 400; then
+  for impl in sh ps; do
+    LOGI="$WORK/bs2-$impl.log"; : > "$LOGI"
+    if [ "$impl" = sh ]; then
+      AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOGI" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=2 \
+        bash "$SH" run -- bash -c 'true' 2>/dev/null; rc=$?
+    else
+      AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOGI" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=2 \
+        pwsh -NoProfile -File "$PS1WIN" run "exit 0" 2>/dev/null; rc=$?
+    fi
+    [ "$rc" = 97 ] && ok "$impl waiter hit MAX_WAIT (97) while the squatter blocked the steal" \
+                   || bad "$impl waiter rc=$rc (want 97 — blocked-steal lane bypassed MAX_WAIT?)"
+    nst="$(grep -c 'STALE (' "$LOGI")"
+    nfail="$(grep -c 'steal FAILED' "$LOGI")"
+    # ~20 stale-eligible polls in 2s at 0.1s; damped to first + once per 1s
+    # stale window => a handful of STALE/steal-FAILED pairs, never per-poll.
+    [ "$nst" -ge 1 ] && [ "$nst" -le 8 ] && [ "$nfail" -ge 1 ] \
+      && ok "$impl steal-attempt logging bounded while squatted ($nst STALE, $nfail steal-FAILED lines)" \
+      || bad "$impl steal logging wrong while squatted: STALE=$nst (want 1..8) steal-FAILED=$nfail (want >=1)"
+  done
+  # Clean up the squatter deterministically: signal it via its go-marker and
+  # reap by ITS exact pid (never a name-based kill).
+  touch "$BGO"
+  wait "$blk14b" 2>/dev/null || kill "$blk14b" 2>/dev/null
 else
-  echo "== Tests 13/14 SKIPPED (POSIX): open handles never block unlink/rename here =="
+  touch "$BGO"; wait "$blk14b" 2>/dev/null
+  bad "T14b squatter never signalled its handle open"
+fi
+rm -f "$LOCK"
+
+else
+  echo "== Tests 13/14/14b SKIPPED (POSIX): open handles never block unlink/rename here =="
   echo "note: the LEFTOVER and blocked-steal lanes are Windows-only by construction (.NET's Unix FileShare gates no namespace operation); the Windows CI leg covers them"
 fi
 

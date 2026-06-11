@@ -546,6 +546,14 @@ function Lock-Acquire {
     $start = script:Lock-Now
     $script:LockToken = "tok.ps.$PID.$(Get-Random).$start"
     $waitingLogged = $false
+    # Log damper for a squatted stale lock (a no-delete-share handle, or an
+    # unwritable parent dir, makes the steal rename fail every poll with the
+    # file still present): epoch of the last logged failed-steal attempt, 0
+    # when the last attempt did not fail that way. While the failures persist,
+    # the STALE/steal-FAILED pair is logged at most once per stale window, so
+    # the log growth stays bounded however long the squat lasts (mirrors
+    # git-commit-lock.sh).
+    $stealFailLast = 0
 
     while ($true) {
         # PRE-CREATE TYPE GUARD (load-bearing on Windows, not just bash
@@ -703,19 +711,49 @@ function Lock-Acquire {
                                 script:Lock-Log "steal aborted: lock file mtime changed underneath us (was $mt, now $now2)"
                                 continue
                             }
-                            script:Lock-Log "STALE (age=${age}s holder=$holder) -> stealing"
+                            # Damp the attempt logging while the steal keeps
+                            # failing on a squatted file (see $stealFailLast
+                            # above): first failure, then at most once per
+                            # stale window.
+                            $nowS = script:Lock-Now
+                            $logSteal = ($stealFailLast -eq 0 -or ($nowS - $stealFailLast) -ge $script:LockStale)
+                            if ($logSteal) { script:Lock-Log "STALE (age=${age}s holder=$holder) -> stealing" }
                             # Atomic steal: rename the stale file aside. Only
                             # one concurrent stealer wins (the rest throw and
                             # re-poll); then everyone re-races the create. The
                             # victim (if still alive) will fail at ITS release:
                             # gone or foreign token => 98.
-                            $grave = "$($script:LockPath).dead.$PID.$(script:Lock-Now)"
+                            $grave = "$($script:LockPath).dead.$PID.$nowS"
+                            $stole = $false
                             try {
                                 [System.IO.File]::Move($script:LockPath, $grave)
+                                $stole = $true
+                            } catch { }
+                            if ($stole) {
                                 try { [System.IO.File]::Delete($grave) } catch { }
                                 script:Lock-Log "STOLE stale lock (was held by $holder)"
-                            } catch { }
-                            continue
+                                $stealFailLast = 0
+                                continue   # won the steal: immediately re-race the create
+                            }
+                            if ($null -eq (script:Lock-GetPathItem)) {
+                                # Lost the race (a rival's rename won; the file
+                                # is gone): re-race the create immediately.
+                                $stealFailLast = 0
+                                continue
+                            }
+                            # The rename failed with the file STILL PRESENT: a
+                            # no-delete-share handle squatting the file (it
+                            # blocks rename exactly like the release unlink -
+                            # probe D1) or an unwritable parent dir. Nothing
+                            # will change until the squatter lets go, so this
+                            # must NOT skip the timeout check + poll sleep
+                            # below: an unconditional `continue` here busy-spun
+                            # flat-out and could never reach 97 (review
+                            # finding, 2026-06-11). Fall through instead.
+                            if ($logSteal) {
+                                script:Lock-Log "steal FAILED: rename refused with the lock file still present (no-delete-share handle, or unwritable parent dir); re-polling - repeats logged at most once per $($script:LockStale)s"
+                                $stealFailLast = $nowS
+                            }
                         }
                     }
                 }
