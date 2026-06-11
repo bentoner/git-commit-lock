@@ -54,6 +54,11 @@ jobs:
           else
             echo "pwsh: NOT FOUND (interop suite will skip; integration runs bash-only)"
           fi
+          if command -v powershell >/dev/null; then
+            powershell -NoProfile -Command '"powershell " + $PSVersionTable.PSVersion.ToString()'
+          else
+            echo "powershell (Windows PowerShell 5.1): NOT FOUND (interop Test 17 skips; expected on POSIX legs)"
+          fi
           stat --version 2>/dev/null | head -1 || echo "stat: BSD variant"
 
       - name: Unit suite
@@ -100,10 +105,10 @@ jobs:
         with:
           persist-credentials: false   # neither job uses the token after fetch
 
-      - name: shellcheck (gate at warning severity)
+      - name: shellcheck (gate at info severity)
         run: |
           shellcheck --version
-          shellcheck -S warning \
+          shellcheck -S info \
             git-commit-lock.sh \
             git-commit-lock.test.sh \
             git-commit-lock.interop.test.sh \

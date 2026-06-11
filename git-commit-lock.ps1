@@ -2,9 +2,10 @@
 # Reachable at runtime as ~/.local/bin/git-commit-lock.ps1
 # (symlinked there by this repo's install.sh).
 #
-# Works on PowerShell 7+ (pwsh); Windows PowerShell 5.1 is known to work
-# (the file is plain ASCII, so the BOM-less encoding parses identically on
-# both engines - keep it ASCII).
+# Works on PowerShell 7+ (pwsh) and on Windows PowerShell 5.1 - 5.1 is
+# covered by an interop smoke lane (git-commit-lock.interop.test.sh Test 17),
+# not just claimed. The file is plain ASCII, so the BOM-less encoding parses
+# identically on both engines - keep it ASCII.
 #
 # PowerShell port of git-commit-lock.sh, for agents whose native shell is PowerShell
 # (notably Codex on Windows). It is WIRE-COMPATIBLE with git-commit-lock.sh: the lock
@@ -96,13 +97,25 @@
 #       non-empty FOREIGN token - both definitive, because acquire's read-back
 #       verified our token at the path. The command DID run but was NOT
 #       serialised - verify with `git log` and redo it under the lock.
-#   1   the command itself threw a terminating error; or (with its own distinct
-#       warning) the lock file still reads EMPTY after the release-time retry
-#       ladder while the file is present: ownership is unverifiable (that is
-#       the create->write window of a successor after a boundary steal, or
-#       external truncation - not proof of theft), the file is left in place,
-#       and success is NOT reported. A failing command keeps its own exit
-#       code. Same verdicts as git-commit-lock.sh for the same on-disk states.
+#   1   the command itself threw a terminating error; or its FINAL statement
+#       failed without setting a native exit code (a failing cmdlet's
+#       non-terminating error never sets $LASTEXITCODE - the full verdict
+#       table is at Invoke-WithLock; a one-line note goes to stderr); or
+#       (with its own distinct warning) the lock file still reads EMPTY after
+#       the release-time retry ladder while the file is present: ownership is
+#       unverifiable (that is the create->write window of a successor after a
+#       boundary steal, or external truncation - not proof of theft), the
+#       file is left in place, and success is NOT reported. A failing command
+#       keeps its own exit code. Same verdicts as git-commit-lock.sh for the
+#       same on-disk states.
+#
+#   KNOWN LIMITATION of the failing-cmdlet mapping: only the command string's
+#   FINAL statement is consulted (via the staged child script's closing $?).
+#   A non-terminating error in the MIDDLE of the command followed by a
+#   succeeding final statement is invisible (exit 0) - the same blind spot as
+#   bash's last-command $?. Chain with `if ($?) { ... }` /
+#   `if ($LASTEXITCODE -eq 0) { ... }` if intermediate failures must gate
+#   later steps.
 #   Avoid exit codes 96-98 as meaningful codes of your own command: they are
 #   reserved by this contract and a wrapped command exiting 98 is
 #   indistinguishable from a stolen lock.
@@ -167,6 +180,8 @@
 
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingEmptyCatchBlock', '',
     Justification = 'Deliberate throughout: lock-path I/O must never abort the holder. Every swallow is conservative (retry, skip, or fall through to a guarded slow path) and the file-mtime stale window is the recovery backstop. See docs/git-commit-lock.md.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '',
+    Justification = 'Deliberate, one variable: $global:__gclRunOk carries the staged child script''s final $? back to the runner - the global scope is the only one shared across the `& file.ps1` boundary (the caller-side $? reads True even when the script''s last cmdlet failed; probed on both engines 2026-06-11). Sentinel-initialised before each run and removed in the finally.')]
 param(
     [Parameter(Position = 0)]
     [string]$Action,
@@ -956,7 +971,27 @@ function Lock-Release {
 #      terminates only that child and lands in $LASTEXITCODE like any native
 #      command, instead of unwinding this script past the release logic;
 #   1  if the command threw a terminating error (mapped in a try/catch so an
-#      in-session caller can never read a stale $LASTEXITCODE as success);
+#      in-session caller can never read a stale $LASTEXITCODE as success), or
+#      if its FINAL statement failed without setting a native exit code (a
+#      cmdlet's non-terminating error - exit-0-on-failure was the verified F2
+#      bug, 2026-06-11);
+#
+#   VERDICT TABLE (in order; decided after the child script returns):
+#     a. the invocation threw a terminating error          -> 1 (stderr note)
+#     b. $LASTEXITCODE was SET by the command and nonzero  -> that code
+#        ("set" is detected against a $null sentinel assigned just before the
+#        invocation, so a stale pre-run value can never be misread)
+#     c. the command's FINAL statement failed              -> 1 (stderr note)
+#        (the staged child script gets a postamble line appended that records
+#        the script-final $? into a global - the caller-side $? after
+#        `& file.ps1` reads True even when the script's last cmdlet failed,
+#        probed on BOTH engines 2026-06-11, so it cannot carry this verdict;
+#        `exit N` skips the postamble, which is fine: lane b already decided)
+#     d. otherwise (incl. $LASTEXITCODE set to 0)          -> 0
+#   So `git ok-thing; Failing-Cmdlet` exits 1 (the string as a whole failed)
+#   while `Failing-Cmdlet; git ok-thing` exits 0 - the documented
+#   final-statement limitation (see the header's KNOWN LIMITATION).
+#   This lane never maps into the reserved 96-98 codes;
 #   then overridden by the release outcome: stolen -> 98; unverifiable
 #      ('unreadable') -> 1 if the command had succeeded (a failing command's
 #      own code is kept); leftover -> the command's code is kept (cleanup
@@ -982,11 +1017,25 @@ function Invoke-WithLock {
         $script:LockRunRc = 96
         return
     }
+    # POSTAMBLE (verdict lane c): append a line that records the child
+    # script's FINAL $? into a global the runner reads back - the only place
+    # that state survives (the caller-side $? after `& file.ps1` is True even
+    # when the script's last cmdlet failed; probed on both engines,
+    # 2026-06-11). The interposed lone `;` is the trailing-backtick guard: a
+    # command string ending in a line-continuation backtick splices our next
+    # line into ITS last statement, and the `;` makes that splice terminate
+    # the statement harmlessly instead of feeding the postamble to it as an
+    # argument; an empty statement executes nothing, so $? is untouched
+    # (probed). If the combined text somehow no longer parses (no known case
+    # - the original already parsed), degrade to the bare command: lane c
+    # then never fires, which is the pre-F2 behaviour, not a new failure.
+    $staged = $CommandString + "`n;`n" + '$global:__gclRunOk = $?'
+    try { $null = [scriptblock]::Create($staged) } catch { $staged = $CommandString }
     $tmpCmd = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "git-commit-lock.cmd.$PID.$(Get-Random).ps1")
     try {
         # UTF-8 WITH BOM: Windows PowerShell 5.1 reads BOM-less files as ANSI,
         # which would corrupt any non-ASCII in the caller's command string.
-        [System.IO.File]::WriteAllText($tmpCmd, $CommandString, (New-Object System.Text.UTF8Encoding $true))
+        [System.IO.File]::WriteAllText($tmpCmd, $staged, (New-Object System.Text.UTF8Encoding $true))
     } catch {
         [Console]::Error.WriteLine("git-commit-lock: cannot stage command file: $($_.Exception.Message)")
         $script:LockRunRc = 96
@@ -1002,17 +1051,42 @@ function Invoke-WithLock {
         }
         try {
             try {
-                $global:LASTEXITCODE = 0
+                # Sentinels for the verdict table (see the function comment):
+                # $null marks "$LASTEXITCODE never set by the command" (a
+                # stale pre-run value must not be misread as the command's),
+                # $true marks "postamble never ran" (an `exit N` skips it;
+                # lane b decides those).
+                $global:LASTEXITCODE = $null
+                $global:__gclRunOk = $true
                 $ErrorActionPreference = 'Continue'
                 & $tmpCmd
-                if ($null -ne $LASTEXITCODE) { $script:LockRunRc = $LASTEXITCODE } else { $script:LockRunRc = 0 }
+                $cmdRc = $LASTEXITCODE
+                $cmdOk = $global:__gclRunOk
+                if ($null -ne $cmdRc -and $cmdRc -ne 0) {
+                    # lane b: a native exit code - the primary contract signal.
+                    $script:LockRunRc = $cmdRc
+                } elseif (-not $cmdOk) {
+                    # lane c: the final statement failed but no native exit
+                    # code says so (a failing cmdlet). The cmdlet's own error
+                    # text is already on stderr above this note.
+                    [Console]::Error.WriteLine('git-commit-lock: command failed without a native exit code (its final statement reported failure); exit 1')
+                    $script:LockRunRc = 1
+                } else {
+                    # lane d: success ($LASTEXITCODE unset, or set to 0 with
+                    # a succeeding final statement).
+                    $script:LockRunRc = 0
+                }
             } catch {
-                # A terminating error must map to a nonzero rc here - never fall
-                # through with $LockRunRc still 0 / a stale $LASTEXITCODE.
+                # lane a: a terminating error must map to a nonzero rc here -
+                # never fall through with $LockRunRc still 0 / a stale
+                # $LASTEXITCODE.
                 [Console]::Error.WriteLine("git-commit-lock: command failed: $($_.Exception.Message)")
                 $script:LockRunRc = 1
             } finally {
                 $ErrorActionPreference = 'Stop'
+                # Drop the postamble's global so repeated in-session use (a
+                # dot-source caller) never reads a previous run's verdict.
+                Remove-Variable -Name __gclRunOk -Scope Global -ErrorAction SilentlyContinue
             }
         } finally {
             if (-not (Lock-Release)) {

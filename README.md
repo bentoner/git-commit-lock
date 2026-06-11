@@ -150,7 +150,9 @@ Requirements:
 
 - Git, and bash for `git-commit-lock.sh`. On Windows use Git Bash/MSYS2 bash,
   not WSL bash — an install done from WSL is only visible inside WSL.
-- PowerShell 7+ (`pwsh`), only for `git-commit-lock.ps1` and the interop tests.
+- PowerShell, only for `git-commit-lock.ps1` and the interop tests:
+  PowerShell 7+ (`pwsh`) recommended; Windows PowerShell 5.1 (`powershell`)
+  also works (covered by a CI smoke test).
 - `~/.local/bin` on `PATH` if you want the installed command names to resolve
   (the installer warns if it isn't).
 
@@ -227,6 +229,11 @@ is only a cleanup failure — the hold itself was exclusive — so there the
 command's own exit code is kept. Both lanes warn on stderr. Avoid exiting
 96–98 from your own wrapped command — those codes are reserved by this
 contract, and a command exiting 98 is indistinguishable from a stolen lock.
+One PowerShell-port caveat: a wrapped command whose *final statement* fails
+without setting a native exit code (a failing cmdlet — non-terminating errors
+never set `$LASTEXITCODE`) exits **1** with a stderr note, but a mid-command
+cmdlet failure followed by a succeeding final statement is not detected
+(exit 0) — the same blind spot as bash's last-command `$?`.
 See
 [`docs/git-commit-lock.md`](docs/git-commit-lock.md) for the `AGENT_LOCK_*` config
 knobs and how staleness and stealing work.

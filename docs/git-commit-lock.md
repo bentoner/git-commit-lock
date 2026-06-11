@@ -316,7 +316,15 @@ The `run` CLI's exit code is the wrapped command's, except for three reserved
 high codes: **96** usage error, **97** lock acquisition timed out (the command
 was never run), **98** lock stolen mid-hold (the command ran but was NOT
 serialised — redo it under the lock). The full table with guidance lives in
-the README's Usage section.
+the README's Usage section. The PowerShell port keeps the same contract with
+one port-specific lane: "the command's own exit code" is `$LASTEXITCODE`
+where the command set one, but a *failing cmdlet* never does (non-terminating
+errors don't set it), so a command whose **final statement** fails without a
+native exit code maps to exit **1** with a stderr note — never into the
+reserved 96–98 range. Only the final statement is consulted; a mid-command
+cmdlet failure followed by a succeeding final statement exits 0, the same
+blind spot as bash's last-command `$?` (the full verdict table lives at
+`Invoke-WithLock` in `git-commit-lock.ps1`).
 
 Config knobs (env, mainly for tests):
 
@@ -472,10 +480,15 @@ pwsh workers serialise on one lock with zero concurrent-holder violations and
 zero spurious steals; a bash holder blocks a pwsh waiter and vice-versa (no
 wrongful steal); each side steals the other's genuinely stale lock; both impls
 agree on the release classification (truncated ⇒ unverifiable, gone ⇒ 98);
-the ps1 never-steal guards get their own parity tests; and the blocked-release
-and blocked-steal lanes are exercised deterministically via a no-delete-share
-handle (Windows-only by nature — POSIX open handles never block
-unlink/rename, so those two skip with a note on non-Windows platforms). Run
+the ps1 never-steal guards get their own parity tests; the `run` verdicts for
+PowerShell-native failures are pinned (a failing final cmdlet ⇒ 1, native
+codes verbatim, the final-statement limitation as contract); the
+blocked-release and blocked-steal lanes are exercised deterministically via a
+no-delete-share handle (Windows-only by nature — POSIX open handles never
+block unlink/rename, so those two skip with a note on non-Windows platforms);
+and a Windows PowerShell 5.1 smoke lane re-runs the exit-code contract and a
+contended acquire on the in-box engine (skipped with a note where
+`powershell` is absent, i.e. the POSIX legs). Run
 it from MINGW/Git-Bash (NOT WSL) so both sides agree on the `C:/…` lock path.
 
 `git-commit-lock.integration.test.sh` drives the real use case end-to-end:

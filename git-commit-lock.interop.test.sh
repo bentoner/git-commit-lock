@@ -10,6 +10,8 @@
 # guards for non-lock objects at the lock path). On Windows, run from
 # MINGW/Git-Bash — NOT from WSL — because both sides must agree on the lock
 # path in `C:/...` form. Spawns pwsh + bash workers, so it needs both on PATH.
+# A Windows PowerShell 5.1 smoke lane (Test 17) additionally runs when
+# `powershell` is on PATH (i.e. on Windows; skipped with a note elsewhere).
 #   bash ~/.local/bin/git-commit-lock.interop.test.sh
 # Exit 0 == all pass. Uses a throwaway temp dir; never touches your repo.
 #
@@ -331,6 +333,44 @@ wait "$p7"; rc7=$?
 [ "$rc0" = 0 ] && ok "pwsh exit 0 propagated" || bad "pwsh exit 0 not propagated (rc=$rc0)"
 [ "$rc7" = 7 ] && ok "pwsh exit 7 propagated" || bad "pwsh exit code not propagated ($rc7)"
 [ -e "$LOCK" ] && bad "lock left held after pwsh run" || ok "lock released after pwsh run (success and failure)"
+
+echo "== Test 7b: ps1 run verdicts for PowerShell-NATIVE failure (regression: F2 — failing cmdlet exited 0) =="
+# A cmdlet's non-terminating error never sets LASTEXITCODE, so the old
+# runner (which reported only LASTEXITCODE) returned 0 for a failed command.
+# The fix consults the staged script's FINAL '$?' when no nonzero native code
+# was set. Verdict pins: failing cmdlet -> 1; succeeding cmdlet -> 0; a
+# native command's nonzero code still propagates verbatim; LASTEXITCODE=0
+# from an earlier native step does NOT mask a failing final cmdlet; and the
+# documented final-statement-only limitation (mid-command cmdlet failure
+# followed by a succeeding final statement -> 0) is pinned as the contract.
+LOCK="$WORK/f2.lock"; LOG="$WORK/f2.log"; : > "$LOG"
+NOSUCH="$WORK/no-such-file-f2"   # portable nonexistent path (POSIX legs included)
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_MAX_WAIT=20 \
+  pwsh -NoProfile -File "$PS1WIN" run "Get-Item -LiteralPath '$NOSUCH'" 2> "$WORK/f2.err"; rc=$?
+[ "$rc" = 1 ] && ok "failing cmdlet -> exit 1 (was 0 pre-fix)" || bad "failing cmdlet rc=$rc (want 1)"
+grep -q "without a native exit code" "$WORK/f2.err" \
+  && ok "stderr carries the one-line no-native-exit-code note" \
+  || bad "missing the no-native-exit-code note on stderr"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_MAX_WAIT=20 \
+  pwsh -NoProfile -File "$PS1WIN" run "Get-Date | Out-Null"; rc=$?
+[ "$rc" = 0 ] && ok "succeeding cmdlet -> exit 0" || bad "succeeding cmdlet rc=$rc (want 0)"
+# Native nonzero still wins: assert the ps1-run code EQUALS what the same git
+# command exits with directly (no hardcoded 128 — git's code, whatever it is).
+git -C "$WORK/definitely-not-a-repo-f2" status >/dev/null 2>&1; want=$?
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_MAX_WAIT=20 \
+  pwsh -NoProfile -File "$PS1WIN" run "git -C '$WORK/definitely-not-a-repo-f2' status" 2>/dev/null; rc=$?
+[ "$rc" = "$want" ] && [ "$want" != 0 ] \
+  && ok "git failure's native code still propagates verbatim ($rc)" \
+  || bad "git-failure propagation: ps1 run rc=$rc, direct git rc=$want (want equal, nonzero)"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_MAX_WAIT=20 \
+  pwsh -NoProfile -File "$PS1WIN" run "git --version | Out-Null; Get-Item -LiteralPath '$NOSUCH'" 2>/dev/null; rc=$?
+[ "$rc" = 1 ] && ok "LASTEXITCODE=0 from an earlier git does not mask a failing final cmdlet (exit 1)" \
+              || bad "git-ok-then-failing-cmdlet rc=$rc (want 1)"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_MAX_WAIT=20 \
+  pwsh -NoProfile -File "$PS1WIN" run "Get-Item -LiteralPath '$NOSUCH'; git --version | Out-Null" 2>/dev/null; rc=$?
+[ "$rc" = 0 ] && ok "mid-command cmdlet failure + succeeding final statement -> 0 (the documented final-statement limitation)" \
+              || bad "limitation pin: rc=$rc (want 0 — has the final-statement contract changed?)"
+[ -e "$LOCK" ] && bad "lock left held after the F2 verdict runs" || ok "no leftover lock after the F2 verdict runs"
 
 echo "== Test 8: a ROBBED holder exits 98 — pwsh victim/bash thief, then bash victim/pwsh thief =="
 # Fail-open ceiling, cross-impl: the victim holds past its 1s stale window
@@ -743,6 +783,49 @@ grep -q "is not a lock file" "$WORK/psuser.err" && ok "ps1: config warning names
                                                 || bad "ps1: no config warning for non-lock content"
 grep -q STOLE "$LOG" && bad "ps1 STOLE the user file" || ok "ps1: no steal of the user file"
 rm -f "$LOCK"
+
+if command -v powershell >/dev/null 2>&1; then
+echo "== Test 17: Windows PowerShell 5.1 smoke lane — the ps1 must run, not just parse, on the in-box engine =="
+# Everything above runs the port under pwsh (7+). 5.1 ships in every Windows
+# 10/11 box and stays supported, so its claim is tested, not asserted: the
+# run lane's exit-code contract (0 / exit 7 / the F2 failing-cmdlet -> 1) and
+# one acquire/release under contention with the bash side (T2's pattern).
+# Guarded by `command -v powershell`: absent on the POSIX CI legs -> the
+# skip note in the else branch below.
+powershell -NoProfile -Command '"engine " + $PSVersionTable.PSVersion.ToString()' 2>/dev/null | tr -d '\r'
+LOCK="$WORK/ps51.lock"; LOG="$WORK/ps51.log"; : > "$LOG"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_MAX_WAIT=30 \
+  powershell -NoProfile -File "$PS1WIN" run "exit 0"; rc=$?
+[ "$rc" = 0 ] && ok "5.1: run exit 0 propagated" || bad "5.1: run exit 0 rc=$rc"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_MAX_WAIT=30 \
+  powershell -NoProfile -File "$PS1WIN" run "exit 7" 2>/dev/null; rc=$?
+[ "$rc" = 7 ] && ok "5.1: run exit 7 propagated" || bad "5.1: run exit 7 rc=$rc"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_MAX_WAIT=30 \
+  powershell -NoProfile -File "$PS1WIN" run "Get-Item -LiteralPath '$WORK/no-such-file-ps51'" 2> "$WORK/ps51.err"; rc=$?
+[ "$rc" = 1 ] && ok "5.1: failing cmdlet -> exit 1 (F2 verdict holds on 5.1)" || bad "5.1: failing cmdlet rc=$rc (want 1)"
+grep -q "without a native exit code" "$WORK/ps51.err" \
+  && ok "5.1: the no-native-exit-code note reaches stderr" \
+  || bad "5.1: missing the no-native-exit-code note"
+# Contention: a bash holder blocks a 5.1 waiter (T2's marker pattern — 5.1
+# cold-start is slow, so the waiter launches only once the holder provably
+# holds, and generous MAX_WAIT absorbs engine startup).
+ORDER="$WORK/ps51.order"; : > "$ORDER"; READY="$WORK/ps51.ready"; rm -f "$READY"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=300 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=60 \
+  bash "$SH" run -- bash -c ': > "$2"; echo sh-start >> "$1"; sleep 2; echo sh-end >> "$1"' _ "$ORDER" "$READY" &
+holder=$!
+wait_for "$READY" || bad "T17 bash holder never signalled ready"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=300 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=60 \
+  powershell -NoProfile -File "$PS1WIN" run "[IO.File]::AppendAllText('$ORDER','ps51-ran' + [char]10)"; rc=$?
+wait "$holder"
+[ "$rc" = 0 ] && ok "5.1: contended run exited 0" || bad "5.1: contended run rc=$rc"
+got="$(tr '\n' ',' < "$ORDER")"
+[ "$got" = "sh-start,sh-end,ps51-ran," ] && ok "5.1: bash-holds / 5.1-waits ordering correct" || bad "5.1 ordering wrong: $got"
+grep -q STOLE "$LOG" && bad "5.1 wrongly STOLE a live bash lock" || ok "5.1 did not steal the live bash lock"
+grep -q "ACQUIRED.*tok=tok\.ps\." "$LOG" && ok "5.1 acquisition logged with the shared wire-format token" || bad "no tok.ps.* ACQUIRED entry from the 5.1 waiter"
+[ -e "$LOCK" ] && bad "lock left held after the 5.1 lane" || ok "no leftover lock after the 5.1 lane"
+else
+  echo "== Test 17 SKIPPED: Windows PowerShell 5.1 (powershell) not on PATH — POSIX leg; the Windows CI leg covers it =="
+fi
 
 echo
 echo "==== INTEROP RESULT: $PASS passed, $FAIL failed (fan-out: $GCL_MODE) ===="
