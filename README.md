@@ -68,10 +68,16 @@ a bash holder and a PowerShell holder in the same tree serialise against
 **each other**:
 
 - `git-commit-lock.sh` — bash (the authoritative implementation)
-- `git-commit-lock.ps1` — PowerShell port, for agents whose native shell is pwsh
+- `git-commit-lock.ps1` — PowerShell port, **for Windows agents** whose native
+  shell is pwsh (e.g. Codex): on Windows a bare `bash` resolves to WSL for
+  some agents, and WSL's git can't reach a Windows-side commit signer
 
-The scripts use only portable primitives, but so far they have been exercised
-mainly on Windows (Git Bash + PowerShell 7).
+On macOS and Linux, use the bash implementation: no agent harness drives
+pwsh there, so PowerShell-on-POSIX is not a supported configuration. CI
+nevertheless runs the two implementations against each other on all three
+OSes — not as platform support, but because two independent implementations
+hammering one lock is cheap adversarial verification of the protocol (it has
+already caught a real bug that single-OS testing missed).
 
 ## Install
 
@@ -244,7 +250,13 @@ so the bash and PowerShell sides resolve the same `C:/...` lock path.
 
 The same three suites run in CI on Linux, macOS, and Windows
 (`.github/workflows/tests.yml`), alongside a shellcheck + PSScriptAnalyzer
-lint job. All three suites copy their logs and work dirs to
+lint job. The POSIX legs exercise the PowerShell implementation purely as
+cross-implementation protocol verification (it is only *supported* on
+Windows — see above). Known issue: that verification is currently doing its
+job — the macOS interop leg is deliberately red on a real protocol gap in
+the PowerShell acquire on POSIX (`TODO-main.md` item 59); a protocol
+revision that closes it is planned, and all suites are green on Windows and
+Linux. All three suites copy their logs and work dirs to
 `$GCL_TEST_PRESERVE_DIR` when it is set, and keep the work dir on disk on any
 failure.
 

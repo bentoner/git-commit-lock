@@ -750,7 +750,15 @@ suites' mode lines confirming full strength ran (58's masquerade guard).
 README "How it works" + docs/git-commit-lock.md "How the lock works" / port
 sections rewritten (mkdir→O_EXCL file, token-as-content, floor rationale now
 file-based, release/steal text); delete the partial-rm/rename-aside/`.new.*`
-prose; update the live TODO-main.md items (11, 48, 53–56, 58) per the table
+prose. **Preserve the README's platform scoping (added 2026-06-11, Ben's
+call): the ps1 implementation is *supported on Windows only* — no harness
+drives pwsh on POSIX, so we ship no claim without a use case — while the
+POSIX interop CI legs are framed as cross-implementation protocol
+verification, not platform support.** The port closes TODO #59, so delete
+the README's known-issue note about the red macOS leg, but keep the scoping
+itself; also fix the ps1 owner line's `$env:COMPUTERNAME` →
+`[Environment]::MachineName` so `host=` is populated on POSIX CI legs
+(cosmetic, log-only); update the live TODO-main.md items (11, 48, 53–56, 58) per the table
 below;
 re-run shellcheck + PSScriptAnalyzer (item 48's residual). Done = docs describe
 only the file protocol; no stale "lock dir(ectory)" wording outside the
