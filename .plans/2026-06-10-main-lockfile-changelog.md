@@ -92,3 +92,80 @@ Suite run 3× back-to-back in REDUCED mode on the dev box:
   in the RESULT line. Markers: holders touch a READY file inside the lock
   and hold until a GO file appears; waiter contention is gated on the
   WAITING log line (`wait_for_grep`).
+
+## Phase 2 — ps1 implementation + interop suite (2026-06-11)
+
+**`git-commit-lock.ps1` rewritten to the file protocol** (commit 4606f92),
+mirroring Phase 1's wire format, knob name and exact log wordings: acquire =
+one `[IO.File]::Open(CreateNew, Write, FileShare ReadWrite|Delete)` with
+token+owner written/flushed/closed THROUGH the creation handle; any open
+exception ⇒ contended ⇒ `$false` (dir-at-path throws
+`UnauthorizedAccessException` — re-verified, arrives wrapped in
+`MethodInvocationException`, so the catch-all is doubly required); path
+read-back verification (8-try 20→320ms ladder) with NEVER-overwrite;
+temp-dir dance / `.new.*` sweep arm / `SetLastWriteTimeUtc` stamp deleted.
+Per-poll type guard via a link-aware `Get-Item -Force` probe (PSIsContainer +
+ReparsePoint attribute; dangling symlink reads as exists-but-wrong-type);
+age-gated content guard with stat-based emptiness (`FileInfo.Length -eq 0`,
+no open — the ps1-on-Unix FIFO hazard; the FIFO/device/socket residual is
+documented in the ps1 header per the bash header's cross-reference) and the
+`tok.` prefix test; unreadable ⇒ skip+log (never the config-warning lane);
+owner read in the same open as line 1, BEFORE the final mtime re-read; steal
+via `File.Move` + grave delete. Release pinned to the bash classification:
+empty-after-ladder ⇒ 'unreadable', no delete — including at the boundary
+re-read (the dir-era proceed-to-delete is gone); gone/foreign ⇒ 'stolen'
+(run ⇒ 98); ours ⇒ `File.Delete` + 5×20ms retry ⇒ 'leftover' (run keeps the
+command's code). ALL lock-file reads (release ladder, content guard, exiting
+backstop) use FileStream with `ReadWrite|Delete` sharing. `PowerShell.Exiting`
+backstop ported (read line 1 via the same shared-stream pattern, compare
+token, `File.Delete`). Folded in: `AGENT_LOCK_PATH` rename (no alias),
+`[Environment]::MachineName`, TODO 53 lazy gitdir with Phase 1's refinement
+(lazy only when BOTH lock path and log are explicit), WAITING line.
+
+**Deviation from the plan text (with why):** the plan calls the ps1
+pre-create type guard "optional symmetry, not load-bearing" — that is true
+only on Unix. Probed 2026-06-11 on Windows: `CreateNew` on a DANGLING
+symlink resolves the link and **creates the target** (CreateFile resolves
+the final component before the disposition check; POSIX `O_CREAT|O_EXCL`
+refuses instead). So the ps1 acquire carries the bash-style pre-create guard
+as a LOAD-BEARING piece on Windows (create attempted only on absent or
+plain-regular-file paths), documented in the header's PORT-SPECIFIC NOTES.
+Interop T15(b) regression-tests exactly this (asserts no target is created
+through the link).
+
+**`git-commit-lock.interop.test.sh` ported** (commit c3594c1): T4/T5
+fabricate/inspect lock files (portable `epoch_to_stamp`/`backdate`
+preserved; T4 adds a cross-impl holder-from-line-2 assertion); T11 re-split
+— truncate ⇒ both impls exit 1 + file left, delete ⇒ both impls 98 (the new
+gone⇒theft agreement). NEW: T13 blocked release via a pwsh `FileShare.Read`
+holder (Windows-gated, skip-note on POSIX) — sourced `lock_release` rc 1 +
+LEFTOVER log, `run` keeps the command's own exit code (5), ps1
+`Lock-Release` ⇒ `$false`/`LockReleaseStatus='leftover'`, then recovery
+after handle-close + stale window (TODO #30's untestable lane now
+deterministic); T14 blocked steal (Windows-gated) — the ps1 stealer's
+`File.Move`-throws⇒re-poll path exercised, acquires once the handle closes;
+T15 ps1 guard parity — dir (97 + warning, no throw), dangling symlink (97,
+link untouched, no tunnel-created target), stale user file (97, content
+intact). TODO 55: T8a/T8b marker-holds, T9 3s→2s, T7 parallelised. TODO 58:
+REDUCED default (T1 4+4, T6 3+3; FULL 8+8/6+6), mode header + RESULT-line
+tag, same convention as the unit suite.
+
+**Verification (this box, REDUCED only — full strength is CI's):** interop
+3× back-to-back `==== INTEROP RESULT: 63 passed, 0 failed (fan-out:
+REDUCED) ====`; unit re-run `==== RESULT: 92 passed, 0 failed (fan-out:
+REDUCED) ====`; `Invoke-ScriptAnalyzer -Severity Warning,Error` clean
+(1.25.0); `shellcheck -S warning` clean (0.11.0) on the interop suite.
+
+**For Phase 3 (integration + full matrix):**
+
+- The integration suite still uses defaults (no `AGENT_LOCK_DIR` refs), so
+  the knob rename should not touch it — but verify, then run all three
+  suites ×3 with `GCL_TEST_FULL=1` (coordinate timing with Ben; live box).
+- CI's POSIX legs will exercise for the first time: the ps1 guards on real
+  Unix symlinks/FIFOs (T15; the .NET-on-Unix O_EXCL-refuses claim is
+  reasoned-not-probed), the T13/T14 skip lanes, and `host=` population via
+  `MachineName`. Watch the ubuntu/macos interop logs for those.
+- The ps1 read ladder (8 tries, 20→320ms) makes interop T11(i)'s pwsh leg
+  take ~1.6s of deliberate retrying — expected, not a hang.
+- Phase 4 must still fix docs/README wording + TODO items (11, 48, 53–56,
+  58, 59 closure per the plan's table).
