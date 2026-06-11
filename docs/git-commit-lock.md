@@ -151,9 +151,14 @@ Both implementations follow the same protocol on the same wire format:
     legitimately be a successor's live lock, and an overwrite would corrupt
     it undetectably.
 - **steal** = `mv <lock> <grave>` — `rename(2)` is atomic, so exactly one
-  concurrent stealer wins; the rest get `ENOENT` and re-race the create. The
-  winner deletes the grave (one `rm -f` of a file; an age-gated sweep clears
-  any grave a crashed stealer left behind).
+  concurrent stealer wins; the rest get `ENOENT` and re-race the create.
+  Before deleting the grave the winner re-reads its token: if it is not the
+  token it judged stale, the rename displaced a *fresh* lock created in the
+  interim (crash recovery under contention — see [the golden
+  rule](#the-golden-rule-hold-the-lock-only-to-commit)), and the file is put
+  back with an atomic fail-if-exists hard link instead of deleted. On a match
+  the winner deletes the grave (one `rm -f` of a file; an age-gated sweep
+  clears any grave a crashed stealer left behind).
 
 **Staleness is judged by the lock file's own mtime** (stamped by the creating
 write). A lock older than `AGENT_LOCK_STALE_SECS` (default **300s / 5 min**)
@@ -367,6 +372,19 @@ the token still matches, release succeeds. The defence is therefore: keep
 commits fast (well under the window), and if you must run something slow under
 the lock, raise `AGENT_LOCK_STALE_SECS` for that invocation.
 
+One scenario can put an *innocent* holder on the receiving end: crash
+recovery under contention. After a holder dies, every waiter judges the dead
+lock stale off the same mtime in the same poll window; the first one steals
+it and acquires legitimately, and a straggler — whose stale judgement predates
+that recovery — can rename the winner's brand-new lock aside moments later.
+The steal therefore verifies its catch: the moved-aside file's token is
+compared with the one judged stale, and on a mismatch the displaced lock is
+restored in place with an atomic fail-if-exists hard link (preserving its
+mtime), so the recovery winner normally never notices. The residual — a third
+waiter re-created the lock path in the instant between the rename and the
+restore — falls back to the detection above: the displaced holder gets the
+loud exit-98 redo, never a silent loss.
+
 Never `git stash` in a shared checkout — it rewrites the working tree on disk and
 clobbers other agents' uncommitted edits.
 
@@ -464,7 +482,10 @@ canary (CI does).
 
 `git-commit-lock.test.sh` covers the bash implementation: mutual exclusion
 under many concurrent workers (clean acquire/release path), stale-lock theft,
-the empty-file-orphan regression (a crash between create and content write),
+crash recovery under contention (several waiters racing one dead lock — a
+straggler displacing the recovery winner must be detected and the displaced
+lock restored, never a misattributed steal or a silent loss), the
+empty-file-orphan regression (a crash between create and content write),
 refusal to steal a *live* lock, the sub-floor (FILETIME-zero) mtime floor
 guard, the never-steal guards (a directory, a symlink, a FIFO, or
 non-lock-shaped content at the lock path is refused with the config warning),
@@ -482,7 +503,9 @@ per-worktree lock scoping.
 `git-commit-lock.interop.test.sh` proves `.ps1` and `.sh` interlock: bash and
 pwsh workers serialise on one lock with zero concurrent-holder violations and
 zero spurious steals; a bash holder blocks a pwsh waiter and vice-versa (no
-wrongful steal); each side steals the other's genuinely stale lock; both impls
+wrongful steal); each side steals the other's genuinely stale lock; mixed
+waiters racing one crashed lock recover it without robbing the recovery
+winner; both impls
 agree on the release classification (truncated ⇒ unverifiable, gone ⇒ 98);
 the ps1 never-steal guards get their own parity tests; the `run` verdicts for
 PowerShell-native failures are pinned (a failing final cmdlet ⇒ 1, native
