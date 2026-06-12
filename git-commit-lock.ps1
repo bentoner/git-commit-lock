@@ -921,8 +921,9 @@ function script:Lock-VerifyStale {
 # Atomic rename-over of the claim onto the lock path. Engine split (probed,
 # see PORT-SPECIFIC NOTES): pwsh 7 / .NET Core has the 3-arg overwrite
 # overload [IO.File]::Move($src,$dst,$true) - one atomic replace, no
-# path-absent window; Windows PowerShell 5.1 / .NET Framework does not (and
-# File.Replace was REJECTED - see the bash header's plan trail), so the 5.1
+# path-absent window; Windows PowerShell 5.1 / .NET Framework does not
+# (File.Replace is deliberately never used: it can throw on read-only files
+# and documents partial-failure states without a backup file), so the 5.1
 # lane is unlink-the-ghost + fail-if-exists Move, whose transient absent
 # window is safe UNDER THE CLAIM: a rival's create landing in it merely wins
 # the lock (our Move fails-if-exists - a fairness loss, never a clobber).

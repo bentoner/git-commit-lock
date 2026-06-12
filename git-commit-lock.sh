@@ -31,8 +31,8 @@
 #                  noclobber redirect — one open+write+close), whose CONTENT
 #                  is the ownership token. Atomic create-or-fail on POSIX and
 #                  NTFS; exactly one creator wins.
-#     * steal   -> CLAIM-SERIALIZED: to
-#                  steal a stale lock you must first win an O_EXCL CLAIM file
+#     * steal   -> CLAIM-SERIALIZED: to steal a stale lock you must first
+#                  win an O_EXCL CLAIM file
 #                  (`${LOCK}.next`) carrying your own token; the claim IS the
 #                  next lock — it is touched fresh and renamed OVER the stale
 #                  lock in one atomic rename(2) replace (ghost destroyed +
@@ -1533,8 +1533,8 @@ lock_acquire() {
         # REGULAR files), so one observation is not evidence of
         # misconfiguration. Hence TWO-CONSECUTIVE-POLL CONFIRMATION: warn
         # only when the SAME concrete type is observed on two consecutive
-        # blocked polls. A
-        # ghost transient makes a same-type repeat across a full poll
+        # blocked polls. A ghost transient makes a same-type repeat across
+        # a full poll
         # interval extremely unlikely (zero in hundreds of churn waiter-runs
         # locally and in probes) though not impossible - two INDEPENDENT
         # ghosts could land same-type on consecutive polls - and the one

@@ -71,7 +71,7 @@ ok()  { echo "PASS: $*"; PASS=$((PASS+1)); }
 bad() { echo "FAIL: $*"; FAIL=$((FAIL+1)); }
 
 # Failure post-mortems need the logs: keep $WORK when anything failed, and
-# honour GCL_TEST_PRESERVE_DIR (the CI plan's preserve-logs knob) by copying
+# honour GCL_TEST_PRESERVE_DIR (the CI preserve-logs knob) by copying
 # the work dir there unconditionally when it is set.
 cleanup() {
   if [ -n "${GCL_TEST_PRESERVE_DIR:-}" ]; then
@@ -1350,7 +1350,7 @@ wait "$holder"
 grep -q STOLE "$LOG" && bad "5.1 wrongly STOLE a live bash lock" || ok "5.1 did not steal the live bash lock"
 grep -q "ACQUIRED.*tok=tok\.ps\." "$LOG" && ok "5.1 acquisition logged with the shared wire-format token" || bad "no tok.ps.* ACQUIRED entry from the 5.1 waiter"
 [ -e "$LOCK" ] && bad "lock left held after the 5.1 lane" || ok "no leftover lock after the 5.1 lane"
-  # 5.1 STEAL LADDER : .NET Framework has no 3-arg overwrite
+# 5.1 STEAL LADDER: .NET Framework has no 3-arg overwrite
 # Move, so ANY 5.1 steal exercises the unlink + fail-if-exists Move ladder.
 # A 5.1 waiter recovers an ancient ghost: rc 0, one STOLE-BY-CLAIM, clean
 # final state (no lock, no claim).

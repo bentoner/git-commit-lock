@@ -390,8 +390,7 @@ echo "== Test 4b: a ROBBED slow holder detects the theft and FAILS with 98 on re
 # stolen-mid-hold code) plus log a WARNING, rather than silently claim a
 # serialised commit. The thief, holding its own fresh lock, must succeed.
 # Note: theft requires an actual contender — a slow but UNCONTENDED holder keeps
-# its lock (Test 4c). Regression guard for the lease bug found in review
-# 2026-05-31; would fail if lock_release skipped the token check.
+# its lock (Test 4c). Would fail if lock_release skipped the token check.
 LOCK="$WORK/robbed.lock"; LOG="$WORK/robbed.log"; : > "$LOG"; OUT="$WORK/robbed-out"; : > "$OUT"
 READY="$WORK/t4b.ready"; TDONE="$WORK/t4b.thief-done"
 # Victim: stale=1s; holds until the test says the thief is done (marker, not a
@@ -1291,7 +1290,7 @@ echo "== Test 25: discovery-position matrix — own-claim-installed discovered o
 # (wrapping a library internal or shadowing mv/rm/touch in a sourced shell)
 # and asserts: the victim DISCOVERS ownership (HOLD), its release returns 0
 # (per-attempt hold token — a per-acquire-token implementation fails this),
-# and nothing is orphaned. The interleavings follow the corrected
+# and nothing is orphaned. The interleavings follow the
 # steering (claimant A passes recheck; clearer clears; victim B claims; A's
 # delayed rename installs B's claim).
 MATRIX_INNER='
@@ -1478,8 +1477,8 @@ echo "== Test 29: BLOCKED steal rename — claim deleted IMMEDIATELY, no CLAIM_S
 # leftover-claim implementation below); immediate deletion yields a fresh
 # CLAIM line per attempt. MAX_WAIT=6 (not 3) is timing HEADROOM for the
 # >=2-CLAIM-lines discriminator under machine load — at 0.2s polls a loaded
-# box could otherwise fit only one attempt before the timeout (flaked in
-# review runs); the discriminator is unaffected (a leftover claim blocks
+# box could otherwise fit only one attempt before the timeout (flakes
+# under machine load); the discriminator is unaffected (a leftover claim blocks
 # attempt 2 however long the window is).
 LOCK="$WORK/blocked.lock"; LOG="$WORK/blocked.log"; : > "$LOG"
 fabricate_lock "$LOCK" "tok.ghost.t29" "pid=9 host=ghost"; backdate "$LOCK" 9999

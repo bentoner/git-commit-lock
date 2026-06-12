@@ -287,8 +287,8 @@ around creation — a ~400-year bogus "age" that would spuriously steal a
 test machine shows plain file creation (both bash- and pwsh-created)
 produces this transient at roughly 0.04–0.5% of readings. Both
 implementations therefore refuse to steal on any mtime below a sane floor
-(2000-01-01), treating a
-sub-floor reading as "just created — wait"; it settles in milliseconds. The
+(2000-01-01), treating a sub-floor reading as "just created — wait"; it
+settles in milliseconds. The
 same floor governs the claim file's ageout: a sub-floor claim mtime reads as
 "just created", never "ancient — clear".
 
@@ -588,9 +588,9 @@ under many concurrent workers (clean acquire/release path), stale-lock theft,
 crash recovery under contention (several waiters racing one dead lock —
 claim-serialized: exactly one steal, zero displacements, zero spurious 98s,
 and no move-aside file ever created), claim contention (many concurrent
-stealers, one claim winner), crashed-claimant and empty-claim orphans ageing
-out at the
-claim window, the claim-path wrong-type guards with independent per-path
+stealers, one claim winner), crashed-claimant and empty-claim orphans
+ageing out at the claim window, the claim-path wrong-type guards with
+independent per-path
 warn-once state, a live-slow holder surviving a claimant's re-verify (abort,
 no steal), the overaged-own-claim contested abort, the discovery-position
 matrix (a rival installs the victim's claim as the lock at every abort
