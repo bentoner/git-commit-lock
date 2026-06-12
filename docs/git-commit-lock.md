@@ -141,7 +141,8 @@ Both implementations follow the same protocol on the same wire format:
     an *empty file with a valid mtime*, recovered by the normal staleness
     rule (a regression test covers it).
   - After winning, the acquirer reads the path back and must find its own
-    token; anything else after the read-retry ladder (up to 8 re-reads with
+    token; anything else after the read-retry ladder (up to 8 read attempts
+    with
     escalating 20→320 ms backoff, ~1.3 s total budget — the same schedule in
     both implementations, enough to ride out a sub-second transient such as
     an AV scanner's handle) — foreign, empty, gone — means it
@@ -160,7 +161,8 @@ Both implementations follow the same protocol on the same wire format:
   its token, still young — a claimant suspended long enough that a waiter
   may have judged its claim abandoned must not proceed on it), touches the
   claim so the new lease starts ~now (rename preserves the source's mtime,
-  so the installed lock's staleness clock *is* the claim's), and then
+  so the installed lock's staleness clock *is* the claim's), re-verifies
+  the lock once more immediately before the install, and then
   renames the claim **over** the lock: the dead lock is destroyed and the
   live one installed in a single `rename(2)`, with no instant at which the
   path is absent for a rival's create to re-race. Serialising stealers
@@ -459,8 +461,11 @@ Crash recovery under contention is the scenario that used to put an
 *innocent* holder on the receiving end: after a holder dies, every waiter
 judges the dead lock stale off the same mtime in the same poll window, and
 an unserialized steal lets a straggler — whose stale judgement predates the
-recovery — displace the waiter that had already won it. The claim protocol
-serializes exactly this: stealers must first win the claim file, the
+recovery — displace the waiter that had already won it. (The old steal also
+briefly vacated the lock path, so after a crash the whole herd's creates
+stampeded the freed name; rename-over hands the recovered lock directly to
+the claimant, so recovery triggers no create storm either.) The claim
+protocol serializes exactly this: stealers must first win the claim file, the
 claimant re-verifies that the lock is *still* stale while holding the
 claim, and the install is one atomic rename-over — so the recovering
 waiter keeps the lock it recovered, and a straggler finds either a rival's
@@ -473,8 +478,9 @@ clobber.) The narrow residual
 interleavings that remain (e.g. a live-slow holder releasing in the
 instant between the claimant's final re-verify and its rename, with a
 waiter's create landing in that same instant — the implementation headers
-carry the full inventory) all surface as the documented exit-98 redo,
-never a silent loss. One bounded residual is deliberately accepted rather
+carry the full inventory) surface at worst as the documented exit-98 redo —
+some are caught even earlier, as a benign not-acquired retry at the
+read-back — never a silent loss. One bounded residual is deliberately accepted rather
 than prevented: a claimant dying *untrappably* (SIGKILL, power loss) in the
 milliseconds between claiming and renaming orphans its claim — normally it
 just ages out at the claim window, but a suspended rival's rename can

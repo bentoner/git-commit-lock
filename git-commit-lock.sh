@@ -894,17 +894,15 @@ _lock_claim_delete() {  # $1 = attempt token; $2 = bounded retries on a blocked 
 
 # Re-judge the LOCK's staleness fresh (the step-2 / step-3.3 re-verify):
 # type, mtime + floor, age, content shape. Sets _LOCK_LV_STATE to one of:
-#   stale     confirmed stale (and _LOCK_LV_TOK/_LOCK_LV_LINE2/_LOCK_LV_AGE)
+#   stale     confirmed stale (and _LOCK_LV_LINE2 for ghost attribution)
 #   gone      path absent
 #   fresh     not confirmable as stale (young mtime, sub-floor/unsettled,
 #             unreadable mtime or content — never steal what we can't prove)
 #   wrongtype not a regular file, or content not lock-shaped
 _LOCK_LV_STATE=""
-_LOCK_LV_TOK=""
 _LOCK_LV_LINE2=""
-_LOCK_LV_AGE=""
 _lock_verify_stale() {
-  _LOCK_LV_STATE=""; _LOCK_LV_TOK=""; _LOCK_LV_LINE2=""; _LOCK_LV_AGE=""
+  _LOCK_LV_STATE=""; _LOCK_LV_LINE2=""
   if ! [ -e "$AGENT_LOCK_PATH" ] && ! [ -L "$AGENT_LOCK_PATH" ]; then
     _LOCK_LV_STATE="gone"; return 0
   fi
@@ -949,7 +947,7 @@ _lock_verify_stale() {
   else
     _LOCK_LV_STATE="wrongtype"             # non-empty but blank line 1
   fi
-  _LOCK_LV_TOK="$line1"; _LOCK_LV_LINE2="$line2"; _LOCK_LV_AGE="$age"
+  _LOCK_LV_LINE2="$line2"
 }
 
 # Atomic rename-over of the claim onto the lock path. Bare `mv` onto a

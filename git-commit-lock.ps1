@@ -863,9 +863,9 @@ function script:Lock-ClaimDelete([string]$Token, [int]$Retries = 0) {
 }
 
 # Re-judge the LOCK's staleness fresh (the step-2 / step-3.3 re-verify):
-# type, mtime + floor, age, content shape. Returns @{ State; Tok; Line2;
-# Age } with State one of:
-#   stale     confirmed stale (Tok/Line2/Age populated)
+# type, mtime + floor, age, content shape. Returns @{ State; Line2 } with
+# State one of:
+#   stale     confirmed stale (Line2 populated for ghost attribution)
 #   gone      path absent
 #   fresh     not confirmable as stale (young mtime, sub-floor/unsettled,
 #             unreadable mtime or content - never steal what we can't prove)
@@ -874,7 +874,7 @@ function script:Lock-ClaimDelete([string]$Token, [int]$Retries = 0) {
 # as the poll-loop content guard).
 function script:Lock-VerifyStale {
     Set-StrictMode -Off
-    $res = @{ State = ''; Tok = ''; Line2 = ''; Age = 0 }
+    $res = @{ State = ''; Line2 = '' }
     $item = script:Lock-GetItemAt $script:LockPath
     if ($null -eq $item) { $res.State = 'gone'; return $res }
     if (-not (script:Lock-IsPlainFile $item)) { $res.State = 'wrongtype'; return $res }
@@ -894,7 +894,7 @@ function script:Lock-VerifyStale {
         if ($null -ne (script:Lock-GetItemAt $script:LockPath)) { $res.State = 'fresh' } else { $res.State = 'gone' }
         return $res
     }
-    if ($len -eq 0) { $res.State = 'stale'; $res.Age = $age; return $res }      # the empty crash-orphan lane
+    if ($len -eq 0) { $res.State = 'stale'; return $res }                       # the empty crash-orphan lane
     $line1 = $null; $line2 = $null
     try {
         $fs = [System.IO.File]::Open($script:LockPath, [System.IO.FileMode]::Open,
@@ -919,7 +919,7 @@ function script:Lock-VerifyStale {
     } else {
         $res.State = 'wrongtype'                                                # non-empty but blank line 1
     }
-    $res.Tok = $line1; $res.Line2 = $line2; $res.Age = $age
+    $res.Line2 = $line2
     return $res
 }
 
