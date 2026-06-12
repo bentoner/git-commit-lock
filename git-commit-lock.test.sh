@@ -1672,7 +1672,9 @@ case "$(uname -s 2>/dev/null)" in
             bad "no deletion-unlink-blocked LEAKED-CLAIM entry"
           fi
           touch "$HG"                    # close the handle
-          sleep 0.5
+          wait "$h31d"                   # pwsh exit = pin verifiably gone (process exit closes the
+                                         # handle); a sleep-based slack here raced under CI load and
+                                         # the arc-end unlink stayed blocked (run 27408940256)
           rm -f "$LOCK"                  # the 'slow holder' releases; claimant now acquires
           wait "$w31d"; rc=$?
           [ "$rc" = 0 ] && ok "leaver acquired normally after the leak (rc 0, leak pending into the hold)" \
@@ -1683,8 +1685,8 @@ case "$(uname -s 2>/dev/null)" in
         else
           bad "T31d pwsh handle holder never signalled ready"
           touch "$T31G"; touch "$HG"; wait "$w31d" 2>/dev/null
+          wait "$h31d" 2>/dev/null
         fi
-        wait "$h31d" 2>/dev/null
       else
         bad "T31d claimant never reached its claim touch"
         kill -9 "$w31d" 2>/dev/null; wait "$w31d" 2>/dev/null
