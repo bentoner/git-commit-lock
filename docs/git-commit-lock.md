@@ -31,11 +31,11 @@ have worktrees, so we need a lock inside the shared tree.
 
 The lock is the **only** thing we automate. The git commands — what to stage,
 what to commit — are run manually by the agent, under the lock. We deliberately
-do **not** ship a commit wrapper: an earlier version shipped one, and teaching
-it as *the* way to commit led agents to treat the wrapper's scope as the limit
-of what was possible. The lesson: the lock is a shared invariant worth
-packaging; a commit is local git that should stay flexible. Keep the automated
-surface minimal.
+do **not** ship a commit wrapper: teaching a wrapper as *the* way to commit
+leads agents to treat the wrapper's scope as the limit of what is possible
+(observed in practice). The lock is a shared invariant worth packaging; a
+commit is local git that should stay flexible. Keep the automated surface
+minimal.
 
 ## How the lock works
 
@@ -166,11 +166,10 @@ Both implementations follow the same protocol on the same wire format:
   renames the claim **over** the lock: the dead lock is destroyed and the
   live one installed in a single `rename(2)`, with no instant at which the
   path is absent for a rival's create to re-race. Serialising stealers
-  through the claim *prevents* the crash-recovery-under-contention race — a
-  straggler whose stale judgement predates the recovery displacing the
-  recovery winner's fresh lock — that the previous design could only detect
-  and repair (see [the golden
-  rule](#the-golden-rule-hold-the-lock-only-to-commit)).
+  through the claim *prevents* the crash-recovery-under-contention race
+  outright: were steals unserialized, a straggler whose stale judgement
+  predates the recovery could displace the recovery winner's fresh lock
+  (see [the golden rule](#the-golden-rule-hold-the-lock-only-to-commit)).
 
 **Staleness is judged by the lock file's own mtime** (stamped by the creating
 write). A lock older than `AGENT_LOCK_STALE_SECS` (default **300s / 5 min**)
@@ -190,8 +189,8 @@ while `MAX_WAIT` was left at its default — a caller who set the knobs
 explicitly chose the relationship).
 
 **The steal refuses anything that is not lock-shaped.** A directory at the
-lock path (a config typo, or a leftover lock from the old directory-based
-protocol), a symlink, a device, or a regular file whose content is neither
+lock path (a config typo, or a directory lock left behind by an older
+release), a symlink, a device, or a regular file whose content is neither
 empty nor `tok.`-prefixed is **never** stolen or deleted: a loud one-time
 config warning names the path, and waiters time out (97) until a human
 removes it. The tool never runs `rm -rf` and never deletes anything it cannot
@@ -249,11 +248,12 @@ behind. The exhaustive lane-by-lane inventory — and the bounded residuals
 outside that arc — live in the implementation headers, like the rest of the
 residual-race inventory.
 
-One deployment note: **upgrade both implementations together.** The
+One deployment note: **upgrade both implementations together.** Older
+releases stole with an unserialized move-aside instead of the claim, so the
 prevention property holds only when every party in a tree runs the claim
-protocol; a mixed-version tree degrades to detection (exit 98), and an
-old-style stealer can leave behind moved-aside lock files (its "graves")
-that the current code no longer sweeps.
+protocol: a mixed-version tree degrades prevention to detection (exit 98),
+and an old-style stealer can leave behind moved-aside lock files (`.dead.*`)
+that current versions don't clean.
 
 **Release** = compare the file's token to ours, then one unlink. A non-empty
 foreign token, or a gone file, means the lease was stolen → fail loudly with
@@ -283,11 +283,11 @@ checkout resolve the same git dir and share one lock.
 **One caveat on the mtime clock.** A just-created lock file can transiently
 report the Windows FILETIME zero (1601-01-01) to an observer in the window
 around creation — a ~400-year bogus "age" that would spuriously steal a
-*live, brand-new* lock and put two holders in the tree. This is not a
-dir-rename artifact of the old protocol: probing on our NTFS test machine
-shows plain file creation (both bash- and pwsh-created) produces the same
-transient at roughly 0.04–0.5% of readings. Both implementations therefore
-refuse to steal on any mtime below a sane floor (2000-01-01), treating a
+*live, brand-new* lock and put two holders in the tree. Probing on our NTFS
+test machine shows plain file creation (both bash- and pwsh-created)
+produces this transient at roughly 0.04–0.5% of readings. Both
+implementations therefore refuse to steal on any mtime below a sane floor
+(2000-01-01), treating a
 sub-floor reading as "just created — wait"; it settles in milliseconds. The
 same floor governs the claim file's ageout: a sub-floor claim mtime reads as
 "just created", never "ancient — clear".
@@ -335,8 +335,8 @@ The port is **wire-compatible** with `git-commit-lock.sh`, so a `.ps1` holder an
 - **The steal's rename-over differs by engine.** PowerShell 7 / .NET Core
   uses the atomic-overwrite `[IO.File]::Move($src, $dst, $true)` overload —
   probed: no absent-path window, like bash's `mv`. Windows PowerShell 5.1 /
-  .NET Framework has no such overload (and `File.Replace` was rejected in
-  design review: it throws on a read-only destination and has
+  .NET Framework has no such overload (and `File.Replace` is deliberately
+  never used: it throws on a read-only destination and has
   partial-failure states when called without a backup file), so the 5.1
   steal completes as unlink-the-ghost, then a fail-if-exists `Move` of the
   claim. The transient absent window between those two steps is safe *under
@@ -457,19 +457,18 @@ the token still matches, release succeeds. The defence is therefore: keep
 commits fast (well under the window), and if you must run something slow under
 the lock, raise `AGENT_LOCK_STALE_SECS` for that invocation.
 
-Crash recovery under contention is the scenario that used to put an
-*innocent* holder on the receiving end: after a holder dies, every waiter
-judges the dead lock stale off the same mtime in the same poll window, and
-an unserialized steal lets a straggler — whose stale judgement predates the
-recovery — displace the waiter that had already won it. (The old steal also
-briefly vacated the lock path, so after a crash the whole herd's creates
-stampeded the freed name; rename-over hands the recovered lock directly to
-the claimant, so recovery triggers no create storm either.) The claim
-protocol serializes exactly this: stealers must first win the claim file, the
-claimant re-verifies that the lock is *still* stale while holding the
-claim, and the install is one atomic rename-over — so the recovering
-waiter keeps the lock it recovered, and a straggler finds either a rival's
-claim (it waits) or a fresh lock (it aborts). (One engine caveat: the
+Crash recovery under contention is the scenario that puts an *innocent*
+holder most at risk: after a holder dies, every waiter judges the dead lock
+stale off the same mtime in the same poll window. Unserialized steals would
+let a straggler — whose stale judgement predates the recovery — displace the
+waiter that had already won it; and a steal that even briefly vacated the
+lock path would invite the whole herd's creates to stampede the freed name
+after every crash. The claim protocol closes both: stealers must first win
+the claim file, the claimant re-verifies that the lock is *still* stale
+while holding the claim, and the install is one atomic rename-over — the
+path stays occupied throughout recovery, the recovering waiter keeps the
+lock it recovered, and a straggler finds either a rival's claim (it waits)
+or a fresh lock (it aborts). (One engine caveat: the
 Windows PowerShell 5.1 lane installs by unlink-then-move rather than one
 atomic rename, so a rival's create can win the recovered path inside that
 window and the claimant backs off cleanly — the fairness loss described in
@@ -588,8 +587,9 @@ canary (CI does).
 under many concurrent workers (clean acquire/release path), stale-lock theft,
 crash recovery under contention (several waiters racing one dead lock —
 claim-serialized: exactly one steal, zero displacements, zero spurious 98s,
-and no grave file ever created), claim contention (many concurrent stealers,
-one claim winner), crashed-claimant and empty-claim orphans ageing out at the
+and no move-aside file ever created), claim contention (many concurrent
+stealers, one claim winner), crashed-claimant and empty-claim orphans ageing
+out at the
 claim window, the claim-path wrong-type guards with independent per-path
 warn-once state, a live-slow holder surviving a claimant's re-verify (abort,
 no steal), the overaged-own-claim contested abort, the discovery-position

@@ -82,7 +82,7 @@
 #       400 replaces under a tight reader loop, ZERO absent reads, ZERO torn
 #       reads - the no-path-absent-window property, like bash's `mv`.
 #     - Windows PowerShell 5.1 / .NET Framework has no such overload (and
-#       File.Replace was REJECTED in design review: it throws on a read-only
+#       File.Replace is deliberately never used: it throws on a read-only
 #       destination and has partial-failure states without a backup file),
 #       so the 5.1 steal completes as: UNLINK the ghost, then 2-arg
 #       fail-if-exists Move the claim in. The transient absent window
@@ -143,7 +143,7 @@
 #     mid-create signal (see the bash header's trap-time rule): a claim
 #     create failing AFTER line 1 reached disk (e.g. ENOSPC mid-write)
 #     leaves an own-token claim the process doesn't know it wrote.
-#   * Future option, this side only (recorded per the plan; NOT implemented):
+#   * Future option, this side only (a recorded design option; NOT implemented):
 #     handle-based ops (open with delete sharing, fstat the mtime / read the
 #     token / delete via FILE_DISPOSITION on that one handle) could close the
 #     residual check-then-act windows outright here. bash has no handle
@@ -175,10 +175,6 @@
 #       succeeds and frees the NAME immediately (POSIX delete on Win11), and
 #       the freed name is immediately re-creatable - the 5.1 ladder is not
 #       blocked by friendly readers.
-#   (SUPERSEDED, kept for history: the wave-1 hard-link probes - New-Item
-#   -ItemType HardLink without -Force refuses an existing destination and
-#   preserves the inode mtime - backed the grave-token restore removed
-#   2026-06-11/12 with the claim protocol.)
 #
 # USAGE (Codex's normal path - run ONE quoted command string under the lock):
 #   & ~/.local/bin/git-commit-lock.ps1 run "git add -- path/a path/b; if (`$LASTEXITCODE -eq 0) { git commit -m 'msg' }"
@@ -395,17 +391,16 @@ $script:LockMaxWait    = [int](script:Get-LockNum -Name 'AGENT_LOCK_MAX_WAIT' -R
 # CLAIM_STALE to be guaranteed a recovery chance before giving up (defaults:
 # 300 + 60 < 420). Warn only in the documented footgun case - knobs raised
 # while MAX_WAIT was left at its default; a caller who set MAX_WAIT chose the
-# relationship deliberately (test suites do this constantly). This warning
-# REPLACES the former STALE >= MAX_WAIT warning (2026-06-11): it strictly
-# subsumes it under the same left-default explicitness gate. (Mirrors
-# git-commit-lock.sh.)
+# relationship deliberately (test suites do this constantly). The stacked
+# relation strictly subsumes a bare STALE >= MAX_WAIT check, so no separate
+# warning for that case is needed. (Mirrors git-commit-lock.sh.)
 if (-not $env:AGENT_LOCK_MAX_WAIT -and $script:LockMaxWait -le ($script:LockStale + $script:LockClaimStale)) {
     [Console]::Error.WriteLine("git-commit-lock: warning - AGENT_LOCK_MAX_WAIT ($($script:LockMaxWait), default) <= AGENT_LOCK_STALE_SECS ($($script:LockStale)) + AGENT_LOCK_CLAIM_STALE_SECS ($($script:LockClaimStale)): waiters may time out before a crashed holder (and a crashed claimant) can be recovered; raise AGENT_LOCK_MAX_WAIT too")
 }
 
 # Floor for a PLAUSIBLE lock mtime (epoch secs; 2000-01-01). A freshly created
 # file can transiently report the Windows FILETIME zero (1601-01-01 -> a NEGATIVE
-# unix epoch) to an observer (probes C/C1b - files, not just the old dirs), which
+# unix epoch) to an observer (probes C/C1b), which
 # would compute as a ~400-year "age" and trigger a spurious steal of a live,
 # just-acquired lock. Any mtime below this floor is an unsettled/garbage reading,
 # not a genuinely stale lock, so we refuse to steal on it and wait instead.
@@ -1366,7 +1361,7 @@ function Lock-Acquire {
     $script:LockStealFailLast = 0
     $script:LockStealLogOk = $true
     # Two-consecutive-poll confirmation state for the wrong-type guards below
-    # (parity with git-commit-lock.sh's round-3 hardening): the concrete
+    # (parity with git-commit-lock.sh's wrong-type confirmation): the concrete
     # classification observed on the PREVIOUS blocked poll, reset to '' when
     # a poll sees the path absent or a plain regular file. PER PATH: the lock
     # path and the claim path each keep their own state (a shared variable
@@ -1406,10 +1401,10 @@ function Lock-Acquire {
             # ACQUIRE VERIFICATION in git-commit-lock.sh): only our own token
             # proves we hold the path. NEVER repair a failed read-back by
             # writing to the path - after a long suspension the path may
-            # legitimately belong to a successor. The wave-1 restore-grace
-            # re-read loop is gone with the graves (SUPERSEDED 2026-06-11):
-            # under the claim protocol a displaced fresh lock is never moved
-            # aside, so there is nothing to wait for.
+            # legitimately belong to a successor. No grace wait precedes the
+            # give-up: a steal installs by rename-over, so a displaced fresh
+            # lock is never moved aside and never comes back - there is
+            # nothing to wait for.
             $rb = script:Lock-ReadCurToken -MaxTries 8
             if ($rb.Status -eq 'ok' -and $rb.Token -eq $tokc) {
                 script:Lock-TakeHold $tokc
@@ -1463,8 +1458,9 @@ function Lock-Acquire {
         if ($null -ne $item) {
             if (-not (script:Lock-IsPlainFile $item)) {
                 # WRONG-TYPE CONFIRMATION (parity with git-commit-lock.sh's
-                # round-3 hardening, 2026-06-11, CI run 27325971668): warn
-                # only when the SAME concrete type is observed on two
+                # two-consecutive-poll rule; the delete-pending-ghost
+                # evidence - CI run 27325971668 - lives with that comment):
+                # warn only when the SAME concrete type is observed on two
                 # consecutive blocked polls. This side has no observed
                 # misfire - the classification is one Get-Item snapshot, and
                 # a delete-pending ghost makes Get-Item throw (-> $null ->
@@ -1729,7 +1725,7 @@ function Lock-Release {
     # ours - and on a match, re-read once more IMMEDIATELY before the delete to
     # shrink the steal-between-check-and-delete window. The boundary re-read is
     # classified by the SAME rules as the first read (empty-at-boundary is the
-    # unverifiable lane, never a delete: in the file era an empty read is
+    # unverifiable lane, never a delete: an empty read is
     # precisely the create->write window of a successor after a boundary
     # steal). The window cannot be closed with these primitives - see KNOWN
     # RESIDUAL RACES in git-commit-lock.sh; the residual case is detected by
@@ -1851,8 +1847,8 @@ function Lock-Release {
 #   1  if the command threw a terminating error (mapped in a try/catch so an
 #      in-session caller can never read a stale $LASTEXITCODE as success), or
 #      if its FINAL statement failed without setting a native exit code (a
-#      cmdlet's non-terminating error - exit-0-on-failure was the verified F2
-#      bug, 2026-06-11);
+#      cmdlet's non-terminating error - a runner that consulted only
+#      $LASTEXITCODE would exit 0 on that failure);
 #
 #   VERDICT TABLE (in order; decided after the child script returns):
 #     a. the invocation threw a terminating error          -> 1 (stderr note)
@@ -1906,7 +1902,8 @@ function Invoke-WithLock {
     # argument; an empty statement executes nothing, so $? is untouched
     # (probed). If the combined text somehow no longer parses (no known case
     # - the original already parsed), degrade to the bare command: lane c
-    # then never fires, which is the pre-F2 behaviour, not a new failure.
+    # then never fires for that command (a failing final cmdlet maps to 0 -
+    # the lane's protection is lost, nothing else breaks).
     $staged = $CommandString + "`n;`n" + '$global:__gclRunOk = $?'
     try { $null = [scriptblock]::Create($staged) } catch { $staged = $CommandString }
     $tmpCmd = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "git-commit-lock.cmd.$PID.$(Get-Random).ps1")

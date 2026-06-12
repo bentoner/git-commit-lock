@@ -31,7 +31,7 @@
 #                  noclobber redirect — one open+write+close), whose CONTENT
 #                  is the ownership token. Atomic create-or-fail on POSIX and
 #                  NTFS; exactly one creator wins.
-#     * steal   -> CLAIM-SERIALIZED (2026-06-11, replaces mv-to-grave): to
+#     * steal   -> CLAIM-SERIALIZED: to
 #                  steal a stale lock you must first win an O_EXCL CLAIM file
 #                  (`${LOCK}.next`) carrying your own token; the claim IS the
 #                  next lock — it is touched fresh and renamed OVER the stale
@@ -47,11 +47,11 @@
 #     line 2: pid=<pid> host=<host>   informational (the STALE log line only).
 #   Readers take line 1 and strip trailing CR/whitespace; they tolerate a
 #   missing line 2 and an entirely empty file. Because creation and the token
-#   write are ONE redirect, the old dir protocol's two worst states cannot
+#   write are ONE redirect, two states a multi-step acquire would risk cannot
 #   exist: there is no acquirer-died-before-metadata orphan with unreadable
 #   ownership (a crash between create and write leaves an EMPTY file with a
 #   valid mtime, which ages into the normal staleness lane), and there is no
-#   partially-failed recursive delete at release (release is one unlink).
+#   partially-failed multi-object cleanup at release (release is one unlink).
 #
 # CLAIM FILE (`${AGENT_LOCK_PATH}.next`)
 #   Identical wire format, the CLAIMANT'S OWN token, written through the
@@ -70,8 +70,7 @@
 #   Judged by the lock FILE's own mtime, stamped by the creating write. A lock
 #   older than AGENT_LOCK_STALE_SECS (default 300s) is assumed crashed and may
 #   be stolen, so one dead agent can never wedge the others forever. Two
-#   defences carry over from the dir era because probing showed files need
-#   them too:
+#   defences are load-bearing here, both grounded in probes on plain files:
 #     * the mtime FLOOR (946684800 = 2000-01-01): a freshly created file can
 #       transiently report FILETIME zero (1601) to an observer on Windows;
 #       sub-floor means "unsettled, wait", never "ancient, steal";
@@ -80,7 +79,7 @@
 #       before classifying (the shared schedule lives at _lock_cur_token and
 #       the ps1 port's Lock-ReadCurToken — keep them in lock-step).
 #
-# THE STEAL PROTOCOL (claim-serialized; 2026-06-11, replaces mv-to-grave)
+# THE STEAL PROTOCOL (claim-serialized)
 #   A poll that judges the lock stale (regular file, lock-shaped content,
 #   plausible mtime >= floor, age >= AGENT_LOCK_STALE_SECS) runs:
 #     1. CLAIM: O_EXCL-create `${LOCK}.next` with a FRESH PER-ATTEMPT token.
@@ -207,10 +206,9 @@
 #   winning create unreadable); like the read-retry ladders it is defence in
 #   depth. Side effect: a verified read-back is what lets release treat a GONE
 #   lock file as definitive theft (98) — our token provably WAS at the path.
-#   (SUPERSEDED 2026-06-11: the wave-1 RESTORE GRACE — a ~0.4s re-read loop
-#   waiting for a straggler's grave-token restore — went with the graves.
-#   Under the claim protocol a displaced fresh lock is never moved aside in
-#   the first place, so there is nothing to wait for.)
+#   No grace wait precedes the give-up: a steal installs by rename-over, so a
+#   displaced lock is never moved aside and never comes back — there is
+#   nothing to wait for.
 #
 # FAIL-OPEN CEILING + the holder's responsibility (important)
 #   The stale window is a LEASE, and the file mtime is stamped once at create
@@ -229,18 +227,19 @@
 #   that invocation.
 #
 # KNOWN RESIDUAL RACES (detected, not silent)
-#   The claim serializes stealers, so the wave-1 displaced-live race (a
-#   straggler's mv-to-grave robbing the recovery winner — probed 5/5 with 4
-#   waiters on one ancient lock) is PREVENTED, not detect-and-repaired; the
-#   grave-token compare / hard-link restore / restore-grace machinery is
-#   gone. What remains (numbering follows the design plan's residuals 1-6):
+#   The claim serializes stealers, so the displaced-live race of crash
+#   recovery under contention (a straggler's steal robbing the recovery
+#   winner — without serialization it fires near-certainly: probed 5/5 with
+#   4 waiters on one ancient lock) is PREVENTED outright, with no
+#   detect-and-repair machinery needed. What remains (residuals 1-6,
+#   referenced by number throughout the code):
 #     1. verify->rename gap: a live-slow holder releases between our final
 #        re-verify (step 3.3) and our rename, and a waiter's create lands in
 #        that same instant; our rename-over then replaces that fresh lock.
 #        The displaced winner detects via the acquire read-back (if still
 #        inside it) or at release (98). A few ms wide (the mtime stat is a
-#        command substitution, mv is an exec) — strictly narrower than the
-#        pre-wave-1 race, same class as wave 1's unrestorable residual.
+#        command substitution, mv is an exec) — far narrower than the whole
+#        poll window an unserialized steal would expose.
 #     2. recheck->rename gap: a clearer whose staleness read predates our
 #        recheck can clear our claim and let a rival claim inside the
 #        recheck->rename gap. Every such two-claimant interleaving is
@@ -260,9 +259,10 @@
 #        worst case an instantly-stale install, self-healing via the next
 #        steal, detected.
 #     4. version skew: prevention holds only when ALL parties in a tree run
-#        the claim protocol. A mixed-version tree (an old mv-to-grave
-#        stealer) degrades to detection (98) and can leave grave litter this
-#        code no longer sweeps — upgrade both implementations together.
+#        the claim protocol. Older releases stole with an unserialized
+#        move-aside; a mixed-version tree degrades prevention to detection
+#        (98) and can leave .dead.* litter current versions don't clean —
+#        upgrade both implementations together.
 #     5. untrappable death inside the claim window (SIGKILL, power loss) —
 #        deliberately ACCEPTED, not prevented: the leftover claim can be
 #        installed by a suspended rival's rename -> an unowned fresh lock
@@ -277,10 +277,10 @@
 #        same magnitude as the tool's FUNDAMENTAL accepted cost (a crashed
 #        holder already stalls a full STALE window) at far lower
 #        probability; the preventing alternative (capture-verify-install, a
-#        two-rename compare-and-swap) reintroduces crash litter at private
-#        names plus an age-gated sweep — the machinery class this redesign
-#        removed — and was rejected.
-#     6. release-side (unchanged from the file era): between the final token
+#        two-rename compare-and-swap) would reintroduce crash litter at
+#        private names plus an age-gated sweep to clean it, and was
+#        rejected.
+#     6. release-side: between the final token
 #        re-read and the unlink, a boundary-stale steal + re-acquire slips
 #        in, so our rm deletes the successor's live file; and the
 #        release-retry gap (the D1 share-mode guarantee holds while the
@@ -388,9 +388,6 @@
 #   R4    (2026-06-11) bare `mv` onto a directory moves the source INTO it
 #         (POSIX mv semantics); GNU `mv -T` refuses (empty or not) — hence
 #         the probed -T fast path + guarded fallback in _lock_rename_over.
-#   (SUPERSEDED, kept for history: the wave-1 hard-link probes — `ln` is an
-#   atomic fail-if-exists restore that preserves the inode mtime — backed
-#   the grave-token restore removed 2026-06-11 with the claim protocol.)
 #
 # EXIT CODES (the published contract — do not repurpose)
 #   `run` exits with the wrapped command's own exit code, EXCEPT three
@@ -508,9 +505,9 @@ AGENT_LOCK_MAX_WAIT="$(_lock_check_num AGENT_LOCK_MAX_WAIT "$AGENT_LOCK_MAX_WAIT
 # CLAIM_STALE to be guaranteed a recovery chance before giving up (defaults:
 # 300 + 60 < 420). Warn only in the documented footgun case — knobs raised
 # while MAX_WAIT was left at its default; a caller who set MAX_WAIT chose
-# the relationship deliberately (test suites do this constantly). This
-# warning REPLACES the former STALE >= MAX_WAIT warning (2026-06-11): it
-# strictly subsumes it under the same left-default explicitness gate.
+# the relationship deliberately (test suites do this constantly). The
+# stacked relation strictly subsumes a bare STALE >= MAX_WAIT check, so no
+# separate warning for that case is needed.
 if [ "$_LOCK_MAXWAIT_EXPLICIT" = 0 ] \
    && [ "$AGENT_LOCK_MAX_WAIT" -le $(( AGENT_LOCK_STALE_SECS + AGENT_LOCK_CLAIM_STALE_SECS )) ]; then
   echo "git-commit-lock: warning — AGENT_LOCK_MAX_WAIT ($AGENT_LOCK_MAX_WAIT, default) <= AGENT_LOCK_STALE_SECS ($AGENT_LOCK_STALE_SECS) + AGENT_LOCK_CLAIM_STALE_SECS ($AGENT_LOCK_CLAIM_STALE_SECS): waiters may time out before a crashed holder (and a crashed claimant) can be recovered; raise AGENT_LOCK_MAX_WAIT too" >&2
@@ -619,7 +616,7 @@ _lock_stat_mtime() {
 # mtime of the lock file itself, stamped by the creating write — the
 # staleness clock. Sets _LOCK_MTIME rather than printing: a
 # command-substitution caller would run this in a SUBSHELL, where the
-# warn-once flag below can never persist, so the broken-stat warning used to
+# warn-once flag below could never persist — the broken-stat warning would
 # repeat on every poll. Empty if the file vanished mid-check. If every probe
 # fails while the file EXISTS, staleness detection is broken on this system —
 # crashed holders can then never be stolen — so say so loudly, once per
@@ -1288,7 +1285,7 @@ lock_acquire() {
   _LOCK_STEAL_FAIL_LAST=0
   _LOCK_STEAL_LOG_OK=1
   # Two-consecutive-poll confirmation state for the wrong-type guards below
-  # (round 3 — see WRONG-TYPE CLASSIFICATION): the concrete classification
+  # (see WRONG-TYPE CLASSIFICATION): the concrete classification
   # observed on the PREVIOUS blocked poll, reset to empty whenever a poll
   # sees the path absent, a regular file, or no concrete type. PER PATH:
   # the lock path and the claim path each keep their own state (a shared
@@ -1345,9 +1342,9 @@ lock_acquire() {
       # VERIFICATION in the header): only our own token proves we hold the
       # path. NEVER repair a failed read-back by writing to the path. The
       # read runs the FULL retry ladder (the shared escalating schedule in
-      # _lock_cur_token). The wave-1 restore-grace re-read loop is gone
-      # with the graves: under the claim protocol a displaced fresh lock is
-      # never moved aside, so there is nothing to wait for.
+      # _lock_cur_token), then gives up with no further grace wait: a steal
+      # installs by rename-over, so a displaced fresh lock is never moved
+      # aside and never comes back — there is nothing to wait for.
       local rb
       rb="$(_lock_cur_token)"
       if [ "$rb" = "$tokc" ]; then
@@ -1515,27 +1512,28 @@ lock_acquire() {
           fi
         fi
       else
-        # WRONG-TYPE CLASSIFICATION (TOCTOU-hardened, three rounds): the
-        # "exists" (-e/-L) and "regular file" (-f && ! -L) checks above are
-        # SEPARATE stats, so a normal contended poll can land here looking
-        # wrong-type and used to fire the loud config warning as a pure
-        # false alarm (reproduced under vanilla contention and
-        # deterministically under create/delete churn, 2026-06-11). Two
-        # transients cause it: a rival's release/steal unlink between the
-        # two stats, and — worse — a Windows DELETE-PENDING ghost (the
-        # unlink is queued until a rival reader's transient handle closes;
-        # for up to ~ms the attribute stats FAIL while a bare -e still
-        # reports existence), which probing showed defeats any immediate
-        # re-check of the same -e/-f pair: the ghost outlives it. Round 2
-        # (2026-06-11) therefore warned only on a CONCRETE wrong type —
+        # WRONG-TYPE CLASSIFICATION (TOCTOU-hardened): the "exists" (-e/-L)
+        # and "regular file" (-f && ! -L) checks above are SEPARATE stats,
+        # so a normal contended poll can land here looking wrong-type with
+        # nothing misconfigured; warning on a bare observation would fire
+        # the loud config warning as a pure false alarm (reproduced under
+        # vanilla contention and deterministically under create/delete
+        # churn). Two transients cause it: a rival's release/steal unlink
+        # between the two stats, and — worse — a Windows DELETE-PENDING
+        # ghost (the unlink is queued until a rival reader's transient
+        # handle closes; for up to ~ms the attribute stats FAIL while a
+        # bare -e still reports existence), which probing showed defeats
+        # any immediate re-check of the same -e/-f pair: the ghost outlives
+        # it. Nor is it enough to warn only on a CONCRETE wrong type —
         # directory, symlink, FIFO, socket, device — on the theory that a
-        # vanished or delete-pending path fails every one of these stats.
-        # CI falsified that theory (windows-2025, run 27325971668, unit
-        # T17d): a delete-pending ghost transiently matched one of the six
-        # concrete stats under Cygwin, firing the warning on a path that
-        # only ever held churned REGULAR files. Round 3 (2026-06-11) adds
-        # TWO-CONSECUTIVE-POLL CONFIRMATION: warn only when the SAME
-        # concrete type is observed on two consecutive blocked polls. A
+        # vanished or delete-pending path fails every one of these stats:
+        # a delete-pending ghost can transiently MATCH one of the six
+        # concrete stats under Cygwin (observed on windows-2025, CI run
+        # 27325971668, unit T17d — a path that only ever held churned
+        # REGULAR files), so one observation is not evidence of
+        # misconfiguration. Hence TWO-CONSECUTIVE-POLL CONFIRMATION: warn
+        # only when the SAME concrete type is observed on two consecutive
+        # blocked polls. A
         # ghost transient makes a same-type repeat across a full poll
         # interval extremely unlikely (zero in hundreds of churn waiter-runs
         # locally and in probes) though not impossible - two INDEPENDENT
@@ -1610,7 +1608,7 @@ lock_release() {
   # ours — and on a match, re-read it once more IMMEDIATELY before the rm to
   # shrink the steal-between-check-and-delete window. The boundary re-read is
   # classified by the SAME rules as the first read (empty-at-boundary is the
-  # rc-2 lane, never a delete: in the file era an empty read is precisely the
+  # rc-2 lane, never a delete: an empty read is precisely the
   # create->write window of a successor after a boundary steal). The window
   # cannot be closed with these primitives — see KNOWN RESIDUAL RACES in the
   # header; the residual case is detected by the displaced party, never
