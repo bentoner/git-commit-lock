@@ -265,12 +265,13 @@ fi
 # 3f. Lock logs: every hold acquired+released cleanly; no stolen leases, no
 # spurious steals, no timeouts (stale=300 over a minutes-long run means any
 # steal would be a real bug). Counts are summed over the CONCATENATION of the
-# per-worker logs (pattern from the interop suite's T1), so the old shared-log
+# per-worker logs (pattern from the interop suite's T1), so the shared-log
 # flake risk — concurrent appends silently dropped on a transient sharing
-# violation — is CLOSED, not watched: one log per worker means no concurrent
-# appends, making exact equality with the worker count a safe gate.
-cat "$LLOGD"/*.log > "$LLOGALL" 2>/dev/null || : > "$LLOGALL"
-a="$(grep -c ACQUIRED "$LLOGALL")"; rl="$(grep -c RELEASED "$LLOGALL")"
+# violation — is designed out, not watched: one log per worker means no
+# concurrent appends, making exact equality with the worker count a safe gate.
+cat "$LLOGD"/*.log >"$LLOGALL" 2>/dev/null || : >"$LLOGALL"
+a="$(grep -c ACQUIRED "$LLOGALL")"
+rl="$(grep -c RELEASED "$LLOGALL")"
 [ "$a" = "$TOTAL" ] && [ "$rl" = "$TOTAL" ] \
   && ok "lock logs balanced: $a acquired, $rl released (== $TOTAL workers)" \
   || bad "lock logs unbalanced: acquired=$a released=$rl want=$TOTAL"
@@ -286,8 +287,16 @@ st="$(git -C "$REPO" status --porcelain)"
 [ -z "$st" ] && ok "working tree clean at end" \
              || { bad "working tree not clean:"; echo "$st" | sed 's/^/  /'; }
 
-# 3h. No leftover lock file.
+# 3h. No leftover lock file — and no leftover CLAIM file (the steal
+# protocol's ${LOCK}.next, plus any *.next.* variants defensively): a clean
+# end state must include the steal protocol's claim path.
 [ -e "$LOCKFILE" ] && bad "leftover lock file: $LOCKFILE" || ok "no leftover lock file"
+n_next=0
+for c in "$LOCKFILE".next "$LOCKFILE".next.*; do
+  [ -e "$c" ] && { n_next=$((n_next+1)); echo "  leftover claim object: $c"; }
+done
+[ "$n_next" = 0 ] && ok "no leftover claim files (*.next / *.next.*)" \
+                  || bad "$n_next leftover claim file(s) beside the lock"
 
 echo
 echo "==== INTEGRATION RESULT: $PASS passed, $FAIL failed (fan-out: $GCL_MODE) ===="
