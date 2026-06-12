@@ -1,0 +1,10 @@
+# Repo-wide shellcheck config. The CI lint job gates at -S style (every
+# severity level); per-finding opt-outs carry an inline rationale at the site.
+#
+# SC2292 (prefer [[ ]] over [ ]): disabled repo-wide. The codebase uses [ ]
+# throughout (~557 sites); a mechanical conversion is not semantics-preserving
+# ([[ ]] treats an unquoted RHS of = / != as a glob PATTERN, and changes
+# empty/word-split behaviour), so the rewrite risk vastly outweighs the
+# stylistic gain on a protocol whose conditionals are individually reasoned
+# about.
+disable=SC2292

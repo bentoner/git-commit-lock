@@ -284,6 +284,7 @@ fi
 
 # 3g. Working tree clean (every written file was committed, nothing half-staged).
 st="$(git -C "$REPO" status --porcelain)"
+# shellcheck disable=SC2001  # multi-line indent: ${st//} can't anchor ^
 [ -z "$st" ] && ok "working tree clean at end" \
              || { bad "working tree not clean:"; echo "$st" | sed 's/^/  /'; }
 

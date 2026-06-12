@@ -233,8 +233,8 @@ HOLDER="$WORK/holder"; : > "$HOLDER"; VIOL="$WORK/violations"; : > "$VIOL"
 # a real imbalance. With a log per worker there are no concurrent appends; the
 # counts are summed over the concatenation.
 pids=()
-for i in $(seq 1 $NSH); do sh_worker "$LOCK" "$WORK/excl-sh$i.log" "$HOLDER" "$VIOL" "sh$i" & pids+=($!); done
-for i in $(seq 1 $NPS); do ps_worker "$LOCK" "$WORK/excl-ps$i.log" "$HOLDER" "$VIOL" "ps$i" & pids+=($!); done
+for i in $(seq 1 "$NSH"); do sh_worker "$LOCK" "$WORK/excl-sh$i.log" "$HOLDER" "$VIOL" "sh$i" & pids+=($!); done
+for i in $(seq 1 "$NPS"); do ps_worker "$LOCK" "$WORK/excl-ps$i.log" "$HOLDER" "$VIOL" "ps$i" & pids+=($!); done
 for p in "${pids[@]}"; do wait "$p"; done
 cat "$WORK"/excl-*.log > "$WORK/excl-all.log" 2>/dev/null || : > "$WORK/excl-all.log"
 a="$(grep -c ACQUIRED "$WORK/excl-all.log")"; rl="$(grep -c RELEASED "$WORK/excl-all.log")"; st="$(grep -c STOLE "$WORK/excl-all.log")"
@@ -363,16 +363,16 @@ count_ps() {  # $1=id
   echo $? > "$WORK/cnt-$1.rc"
 }
 pids=()
-for i in $(seq 1 $NCS); do count_sh "sh$i" & pids+=($!); done
-for i in $(seq 1 $NCP); do count_ps "ps$i" & pids+=($!); done
+for i in $(seq 1 "$NCS"); do count_sh "sh$i" & pids+=($!); done
+for i in $(seq 1 "$NCP"); do count_ps "ps$i" & pids+=($!); done
 for p in "${pids[@]}"; do wait "$p"; done
 rc_fail=0
-for id in $(seq 1 $NCS | sed 's/^/sh/') $(seq 1 $NCP | sed 's/^/ps/'); do
+for id in $(seq 1 "$NCS" | sed 's/^/sh/') $(seq 1 "$NCP" | sed 's/^/ps/'); do
   rc="$(cat "$WORK/cnt-$id.rc" 2>/dev/null || echo missing)"
   [ "$rc" = 0 ] || { rc_fail=1; echo "  worker $id rc=$rc"; }
 done
 [ "$rc_fail" = 0 ] && ok "all $CTOT counter workers ran and exited 0" || bad "counter worker(s) failed (see above)"
-final="$(cat "$CNT" | tr -d '[:space:]')"
+final="$(tr -d '[:space:]' < "$CNT")"
 [ "$final" = "$CTOT" ] && ok "counter = $final == $CTOT increments (no lost updates)" || bad "counter = $final, want $CTOT — lost update(s)"
 cat "$WORK"/cnt-*.log > "$WORK/cnt-all.log" 2>/dev/null || : > "$WORK/cnt-all.log"
 a="$(grep -c ACQUIRED "$WORK/cnt-all.log")"; rl="$(grep -c RELEASED "$WORK/cnt-all.log")"

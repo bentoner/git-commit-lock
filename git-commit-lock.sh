@@ -919,6 +919,9 @@ _lock_verify_stale() {
     fi
     return 0
   fi
+  # shellcheck disable=SC2335  # the negated form is load-bearing: a non-numeric
+  # or empty $mt makes the test itself FAIL, which `!` routes into the sub-floor
+  # lane — the -le rewrite would route read errors to "settled" instead
   if ! [ "$mt" -gt 946684800 ] 2>/dev/null; then
     _LOCK_LV_STATE="fresh"; return 0      # sub-floor: unsettled, never stale
   fi

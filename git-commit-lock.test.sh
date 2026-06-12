@@ -169,10 +169,10 @@ echo "== Test 1: concurrent workers, mutual exclusion (repeated rounds, $GCL_MOD
 # MAX_WAIT caps a regression at 180s per worker instead of the 420s default;
 # STALE stays comfortably above any realistic hold so nothing is ever stolen.
 N=$T1_N; ROUNDS=$T1_ROUNDS; t1_fail=0; T1ERR="$WORK/excl.err"; : > "$T1ERR"
-for r in $(seq 1 $ROUNDS); do
+for r in $(seq 1 "$ROUNDS"); do
   COUNTER="$WORK/counter.$r"; echo 0 > "$COUNTER"
   LOCK="$WORK/excl.$r.lock"; LOG="$WORK/excl.$r.log"; : > "$LOG"; pids=()
-  for _ in $(seq 1 $N); do
+  for _ in $(seq 1 "$N"); do
     AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=120 \
       AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=180 \
       bash "$LIB" run -- bash -c "$INCR" _ "$COUNTER" 2>> "$T1ERR" &
@@ -429,8 +429,10 @@ grep -q solo-done "$OUT" && ok "uncontended slow holder did its work" || bad "wo
 
 echo "== Test 5: run propagates the command's exit code, releases either way =="
 LOCK="$WORK/rc.lock"; LOG="$WORK/rc.log"; : > "$LOG"
-AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" bash "$LIB" run -- bash -c 'exit 0'; [ "$?" = 0 ] && ok "exit 0 propagated" || bad "exit 0 not propagated"
-AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" bash "$LIB" run -- bash -c 'exit 7'; [ "$?" = 7 ] && ok "exit 7 propagated" || bad "exit code not propagated"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" bash "$LIB" run -- bash -c 'exit 0'; rc=$?
+[ "$rc" = 0 ] && ok "exit 0 propagated" || bad "exit 0 not propagated (rc=$rc)"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" bash "$LIB" run -- bash -c 'exit 7'; rc=$?
+[ "$rc" = 7 ] && ok "exit 7 propagated" || bad "exit code not propagated (rc=$rc)"
 [ -e "$LOCK" ] && bad "lock left held after run" || ok "lock released after run (success and failure)"
 
 echo "== Test 6: default lock FILE and log live in the git dir =="
@@ -517,7 +519,8 @@ AGENT_LOCK_PATH="$WORK/warn3.lock" AGENT_LOCK_LOG="$LOG" \
 grep -q "raise AGENT_LOCK_MAX_WAIT" "$WORK/t8.warn3.err" \
   && bad "knob-relation warning fired though MAX_WAIT was set explicitly" \
   || ok "explicit MAX_WAIT silences the knob-relation warning (left-default gate kept)"
-wait "$h8"; [ "$?" = 0 ] && ok "holder unaffected by the timed-out waiter" || bad "holder rc=$? (want 0)"
+wait "$h8"; rc=$?
+[ "$rc" = 0 ] && ok "holder unaffected by the timed-out waiter" || bad "holder rc=$rc (want 0)"
 
 echo "== Test 9: sub-floor (pre-2000) file mtime is NOT treated as stale =="
 # The FILETIME-zero guard: a freshly created file can transiently report a 1601
