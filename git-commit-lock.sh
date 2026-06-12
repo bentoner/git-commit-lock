@@ -682,8 +682,8 @@ _lock_read_tok() {  # $1 = path; $2 = max read attempts (default 8 = the full la
   done
   printf '%s' "$t"
 }
-_lock_cur_token() {  # $1 = max read attempts (default 8 = the full ladder)
-  _lock_read_tok "$AGENT_LOCK_PATH" "${1:-8}"
+_lock_cur_token() {  # full-ladder read (8 attempts) of the lock path
+  _lock_read_tok "$AGENT_LOCK_PATH" 8
 }
 
 # --- leaked-token memory (see the header rule) -------------------------------
@@ -789,8 +789,9 @@ _lock_restore_traps() {
 # is reused instead of hand-parsing.
 _lock_saved_trap_cmd() {
   [ -n "${1:-}" ] || return 0
-  # shellcheck disable=SC2329  # invoked indirectly: the eval of the saved
-  # `trap -p` line below calls this shadow function.
+  # shellcheck disable=SC2329,SC2317
+  # Invoked indirectly: the eval of the saved `trap -p` line below calls this
+  # shadow function (SC2317 is the older linter versions' code for it).
   trap() { printf '%s' "$2"; }
   eval "$1"
   unset -f trap
