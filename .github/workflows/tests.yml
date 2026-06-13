@@ -77,7 +77,7 @@ jobs:
           GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/unit
         run: |
           mkdir -p test-output
-          bash git-commit-lock.test.sh 2>&1 | tee test-output/unit-suite.log
+          bash tests/git-commit-lock.test.sh 2>&1 | tee test-output/unit-suite.log
 
       - name: Interop suite (bash + pwsh)
         if: ${{ !cancelled() && (matrix.leg == 'all' || matrix.leg == 'interop-integration') }}   # run even if an earlier suite failed — every signal is useful
@@ -86,7 +86,7 @@ jobs:
           GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/interop
         run: |
           mkdir -p test-output
-          bash git-commit-lock.interop.test.sh 2>&1 | tee test-output/interop-suite.log
+          bash tests/git-commit-lock.interop.test.sh 2>&1 | tee test-output/interop-suite.log
 
       - name: Integration suite (real concurrent commits)
         if: ${{ !cancelled() && (matrix.leg == 'all' || matrix.leg == 'interop-integration') }}
@@ -95,7 +95,7 @@ jobs:
           GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/integration
         run: |
           mkdir -p test-output
-          bash git-commit-lock.integration.test.sh 2>&1 | tee test-output/integration-suite.log
+          bash tests/git-commit-lock.integration.test.sh 2>&1 | tee test-output/integration-suite.log
 
       - name: Upload failure diagnostics
         if: ${{ failure() || cancelled() }}   # failure() covers step timeouts (they fail the step); cancelled() is best-effort cover for manual cancels / the job-level backstop
@@ -129,9 +129,9 @@ jobs:
           /tmp/shellcheck-v0.11.0/shellcheck --version
           /tmp/shellcheck-v0.11.0/shellcheck -S style \
             git-commit-lock.sh \
-            git-commit-lock.test.sh \
-            git-commit-lock.interop.test.sh \
-            git-commit-lock.integration.test.sh \
+            tests/git-commit-lock.test.sh \
+            tests/git-commit-lock.interop.test.sh \
+            tests/git-commit-lock.integration.test.sh \
             install.sh
 
       - name: PSScriptAnalyzer (gate at warning severity)

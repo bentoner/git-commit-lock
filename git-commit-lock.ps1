@@ -3,7 +3,7 @@
 # (symlinked there by this repo's install.sh).
 #
 # Works on PowerShell 7+ (pwsh) and on Windows PowerShell 5.1 - 5.1 is
-# covered by an interop smoke lane (git-commit-lock.interop.test.sh Test 17),
+# covered by an interop smoke lane (tests/git-commit-lock.interop.test.sh Test 17),
 # not just claimed. The file is plain ASCII, so the BOM-less encoding parses
 # identically on both engines - keep it ASCII.
 #
@@ -313,7 +313,7 @@ function script:Get-LockGitDir {
         # silently fell back to CWD - putting the default lock at
         # <cwd>/commit.lock instead of <gitdir>/commit.lock, so the .ps1 and
         # .sh sides no longer contended on the same lock (caught by
-        # git-commit-lock.integration.test.sh, 2026-06-10).
+        # tests/git-commit-lock.integration.test.sh, 2026-06-10).
         $out = @(& git rev-parse --absolute-git-dir 2>$null)
         if ($LASTEXITCODE -eq 0 -and $out.Count -gt 0) { $gd = [string]$out[0] }
     } catch { $gd = $null }

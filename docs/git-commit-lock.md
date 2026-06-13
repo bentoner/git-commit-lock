@@ -560,9 +560,9 @@ unavailable):
 |------|------|
 | `git-commit-lock.sh`                  | the mutex (bash; the authoritative implementation): source for `lock_acquire/lock_release/lock_run`, or `git-commit-lock.sh run -- <cmd>` |
 | `git-commit-lock.ps1`                 | wire-compatible PowerShell port (see [The PowerShell port](#the-powershell-port-git-commit-lockps1) above): `git-commit-lock.ps1 run "<pwsh cmd>"`, or dot-source for `Lock-Acquire`/`Lock-Release` |
-| `git-commit-lock.test.sh`             | self-contained bash tests (throwaway temp dirs); exit 0 == all pass |
-| `git-commit-lock.interop.test.sh`     | cross-impl tests: pwsh + bash workers share one lock and serialise; run from MINGW/Git-Bash |
-| `git-commit-lock.integration.test.sh` | end-to-end: many concurrent workers make real commits into one shared repo; the history is audited for the tool's guarantees |
+| `tests/git-commit-lock.test.sh`             | self-contained bash tests (throwaway temp dirs); exit 0 == all pass |
+| `tests/git-commit-lock.interop.test.sh`     | cross-impl tests: pwsh + bash workers share one lock and serialise; run from MINGW/Git-Bash |
+| `tests/git-commit-lock.integration.test.sh` | end-to-end: many concurrent workers make real commits into one shared repo; the history is audited for the tool's guarantees |
 
 ## Tests
 
@@ -570,9 +570,9 @@ Run the suites from a clone of this repository (they are not installed to
 `~/.local/bin`):
 
 ```sh
-bash git-commit-lock.test.sh             # bash implementation
-bash git-commit-lock.interop.test.sh     # bash + PowerShell interop (skips if pwsh is absent)
-bash git-commit-lock.integration.test.sh # end-to-end: concurrent real commits into one repo (pwsh half skips if absent)
+bash tests/git-commit-lock.test.sh             # bash implementation
+bash tests/git-commit-lock.interop.test.sh     # bash + PowerShell interop (skips if pwsh is absent)
+bash tests/git-commit-lock.integration.test.sh # end-to-end: concurrent real commits into one repo (pwsh half skips if absent)
 ```
 
 Each suite prints a result summary line and exits 0 when everything passes.
@@ -583,7 +583,7 @@ run doesn't lag a shared development machine; each suite prints a
 check those say `FULL` when you ran `GCL_TEST_FULL=1` for the full-strength
 canary (CI does).
 
-`git-commit-lock.test.sh` covers the bash implementation: mutual exclusion
+`tests/git-commit-lock.test.sh` covers the bash implementation: mutual exclusion
 under many concurrent workers (clean acquire/release path), stale-lock theft,
 crash recovery under contention (several waiters racing one dead lock —
 claim-serialized: exactly one steal, zero displacements, zero spurious 98s,
@@ -618,7 +618,7 @@ without `AGENT_LOCK_PATH`, the release classification (empty-but-present
 unverifiable; gone ⇒ 98), the wire format (token line, owner line), the
 default git-dir location of the lock and log, and per-worktree lock scoping.
 
-`git-commit-lock.interop.test.sh` proves `.ps1` and `.sh` interlock: bash and
+`tests/git-commit-lock.interop.test.sh` proves `.ps1` and `.sh` interlock: bash and
 pwsh workers serialise on one lock with zero concurrent-holder violations and
 zero spurious steals; a bash holder blocks a pwsh waiter and vice-versa (no
 wrongful steal); each side steals the other's genuinely stale lock; mixed
@@ -641,7 +641,7 @@ port](#the-powershell-port-git-commit-lockps1)) — on the in-box engine
 (skipped with a note where `powershell` is absent, i.e. the POSIX legs). Run
 it from MINGW/Git-Bash (NOT WSL) so both sides agree on the `C:/…` lock path.
 
-`git-commit-lock.integration.test.sh` drives the real use case end-to-end:
+`tests/git-commit-lock.integration.test.sh` drives the real use case end-to-end:
 many concurrent workers stage and commit into one shared git repository under
 the lock, exactly as the README instructs agents to, and the resulting history
 is audited for the guarantees this document claims — every commit lands,

@@ -12,7 +12,7 @@
 # path in `C:/...` form. Spawns pwsh + bash workers, so it needs both on PATH.
 # A Windows PowerShell 5.1 smoke lane (Test 17) additionally runs when
 # `powershell` is on PATH (i.e. on Windows; skipped with a note elsewhere).
-#   bash ~/.local/bin/git-commit-lock.interop.test.sh
+#   bash tests/git-commit-lock.interop.test.sh
 # Exit 0 == all pass. Uses a throwaway temp dir; never touches your repo.
 #
 # Fan-out: the heavy concurrency tests (T1/T6) default to REDUCED width so
@@ -41,8 +41,9 @@
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SH="$DIR/git-commit-lock.sh"
-PS1WIN="$(cygpath -w "$DIR/git-commit-lock.ps1" 2>/dev/null || echo "$DIR/git-commit-lock.ps1")"
+ROOT="$(cd "$DIR/.." && pwd)"   # the implementations live at the repo root
+SH="$ROOT/git-commit-lock.sh"
+PS1WIN="$(cygpath -w "$ROOT/git-commit-lock.ps1" 2>/dev/null || echo "$ROOT/git-commit-lock.ps1")"
 PS1WIN="${PS1WIN//\\//}"   # forward slashes: both pwsh and mingw accept C:/...
 
 command -v pwsh >/dev/null 2>&1 || { echo "SKIP: pwsh not on PATH"; exit 0; }
@@ -1136,7 +1137,7 @@ echo "== Test 16d: static checks — no File.Replace in the ps1 port =="
 # File.Replace is deliberately never used: it throws on a
 # read-only destination and has partial-failure states when called without a
 # backup file. The 5.1 lane must stay unlink + fail-if-exists Move.
-if grep -qE 'File\]?::Replace' "$DIR/git-commit-lock.ps1"; then
+if grep -qE 'File\]?::Replace' "$ROOT/git-commit-lock.ps1"; then
   bad "git-commit-lock.ps1 calls File.Replace — the deliberately-avoided primitive is in use"
 else
   ok "git-commit-lock.ps1 contains no File.Replace call"

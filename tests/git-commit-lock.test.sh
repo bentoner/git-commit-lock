@@ -3,7 +3,7 @@
 #
 # Runs entirely against throwaway temp dirs, so it never touches the repo you
 # launch it from. Exit 0 == all pass.
-#   bash ~/.local/bin/git-commit-lock.test.sh
+#   bash tests/git-commit-lock.test.sh
 #
 # Fan-out: heavy concurrency tests default to REDUCED width so routine dev
 # runs don't lag a live shared machine; set GCL_TEST_FULL=1 (CI does) for the
@@ -26,7 +26,8 @@
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LIB="$DIR/git-commit-lock.sh"
+ROOT="$(cd "$DIR/.." && pwd)"   # the implementations live at the repo root
+LIB="$ROOT/git-commit-lock.sh"
 
 if [ "${GCL_TEST_FULL:-0}" = 1 ]; then
   GCL_MODE="FULL"; T1_ROUNDS=8; T1_N=25; T2B_ROUNDS=4; T20_N=10

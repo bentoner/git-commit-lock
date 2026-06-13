@@ -14,7 +14,7 @@
 # Runs entirely against a throwaway temp repo, so it never touches the repo
 # you launch it from. The mixed bash+pwsh section skips cleanly when pwsh is
 # absent; the bash-only section always runs. Exit 0 == all pass.
-#   bash ~/.local/bin/git-commit-lock.integration.test.sh
+#   bash tests/git-commit-lock.integration.test.sh
 #
 # Fan-out: the worker swarms default to REDUCED width so routine dev runs
 # don't lag a live shared machine; set GCL_TEST_FULL=1 (CI does) for the
@@ -37,8 +37,9 @@
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LIB="$DIR/git-commit-lock.sh"
-PS1WIN="$(cygpath -w "$DIR/git-commit-lock.ps1" 2>/dev/null || echo "$DIR/git-commit-lock.ps1")"
+ROOT="$(cd "$DIR/.." && pwd)"   # the implementations live at the repo root
+LIB="$ROOT/git-commit-lock.sh"
+PS1WIN="$(cygpath -w "$ROOT/git-commit-lock.ps1" 2>/dev/null || echo "$ROOT/git-commit-lock.ps1")"
 PS1WIN="${PS1WIN//\\//}"   # forward slashes: both pwsh and mingw accept C:/...
 
 HAVE_PWSH=0
