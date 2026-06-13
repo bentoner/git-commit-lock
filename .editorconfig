@@ -1,0 +1,22 @@
+# Editor defaults (https://editorconfig.org), documenting the existing hand
+# style — the codebase already follows this throughout. Continuation lines
+# deliberately LEAD with && / || and are often column-ALIGNED under the
+# expression they continue (e.g. `|| bad` under `&& ok`); alignment is part
+# of the style and not something editorconfig regulates.
+#
+# switch_case_indent / binary_next_line are shfmt-extension keys. shfmt
+# itself is not adopted: its mandatory one-statement-per-line splitting
+# (rejected upstream as an option, mvdan/sh#1061) would explode the suites'
+# deliberately dense `LOCK=...; LOG=...; : > "$LOG"` setup idiom. The keys
+# still document the style precisely — and drive any ad-hoc `shfmt -d` run.
+root = true
+
+[*.sh]
+indent_style = space
+indent_size = 2
+switch_case_indent = true
+binary_next_line = true
+
+[*.ps1]
+indent_style = space
+indent_size = 4
