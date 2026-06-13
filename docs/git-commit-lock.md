@@ -669,3 +669,26 @@ launch and commit), and the unit suite's counts are exact.
 For debugging, all three suites copy their logs and work dirs to
 `$GCL_TEST_PRESERVE_DIR` when it is set, and keep the work dir on disk on any
 failure.
+
+## Linting
+
+CI's lint job gates the bash files with **shellcheck at style severity** —
+the lowest level, so every default check gates — and the PowerShell port with
+**PSScriptAnalyzer at warning severity**. The shellcheck version is pinned
+(downloaded sha256-verified) because what style severity reports changes
+across shellcheck releases, and the runner image's preinstalled copy would
+silently check less than a current dev box. Repo-wide opt-outs live in
+`.shellcheckrc`; site-specific opt-outs are inline `# shellcheck disable=`
+directives, each carrying its rationale.
+
+**No formatter is adopted, deliberately.** shfmt was trialled (v3.13.1, style
+via `.editorconfig`, flags chosen to minimize churn) and rejected: its
+one-statement-per-line splitting is mandatory — upstream declined to make it
+optional (mvdan/sh#1061) — and it would explode the deliberately dense
+`LOCK=…; LOG=…; : > "$LOG"` setup idiom the suites use, plus the suites'
+column-aligned `&& ok … || bad …` assertion style (~2,500 changed lines,
+~80% in the two big test files). The maintained alternatives don't fit
+either: forks with a never-split option track stale upstreams, and
+indentation-only formatters add nothing here — the hand style is already
+uniform (no tabs, 2-space grid). `.editorconfig` documents that style for
+editors; consistency is maintained by review rather than reformatting.
