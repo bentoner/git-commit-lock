@@ -1,7 +1,8 @@
 # Plan: move the test suites to `tests/` + remove stale install-path headers
 
-Status: awaiting Ben's review. Not yet executed.
-Reviewed: 2 fresh-reviewer round(s); fixes folded in (see changelog).
+Status: DONE — executed in commit e7464cc. Awaiting Ben's review.
+Reviewed: 2 fresh-reviewer rounds on the plan (fixes folded in, see
+changelog); 1 round on the executed commit (Claude + Codex), clean.
 
 ## Goal
 
