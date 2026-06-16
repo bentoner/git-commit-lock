@@ -3,7 +3,33 @@
 Status: DRAFT — awaiting review (Claude reviewer + Codex), then implement.
 
 ## Reviewer notes (add at top; do not renumber)
-_(none yet)_
+Round 1 — fresh Claude reviewer + Codex (both independent), findings verified by me
+against the product code:
+
+1. **[BLOCKING — fixed in plan v2] rc-set `{0,97,98}` is not exhaustive of correct
+   outcomes → must be `{0,1,97,98}`.** Under this churn a clean `true` whose release
+   reads the held lock EMPTY (the churner's create→write window) gets release rc 2,
+   which `lock_run` maps to **rc 1** (`git-commit-lock.sh:1739-1744`). rc 1 is the
+   documented "ownership unverifiable, successful command demoted" outcome — correct,
+   not a defect. Verified. The original `{0,97,98}` was the *same class* of
+   timing-fragile assumption as the bug being fixed. Fixed below.
+2. **[BLOCKING — fixed in plan v2] the `WAITING` canary must not read the SHARED log.**
+   Plan v1 grepped `WAITING` from the single shared `churn.log` (line 916), but the
+   suite itself documents `# per-waiter logs: concurrent appends to one log drop lines`
+   (`tests/git-commit-lock.test.sh:258`) and uses per-waiter logs elsewhere for exactly
+   this reason. A shared-log `WAITING` count can under-count under concurrency and the
+   canary would itself flake. Fixed: give each waiter its OWN `AGENT_LOCK_LOG`
+   (single-writer ⇒ drop-free), count `WAITING` across those, and concatenate them into
+   `churn.log` afterwards so the preserved artifact is unchanged.
+3. **[disposition] Secondary hardenings DROPPED.** Reviewers flagged the
+   start-marker-after-first-cycle and alive-at-reap hardenings as needing care (the
+   alive check can false-fail if the churner's iteration cap is ever hit; both add
+   machinery to a delicate timing path). They are also largely redundant with the
+   drop-free `WAITING>=1` canary, which already proves the churner produced contention.
+   To keep the change minimal and the timing path untouched, v2 drops both. The
+   load-bearing fix is assertions 1-3.
+4. **[non-blocking, adopted] observability buckets** updated to `rc0/rc1/rc97/rc98/other`
+   and emitted unconditionally (pass and fail), so a drift toward an edge is visible.
 
 ## Context
 CI stress test (ci-stress branch, 2026-06-16): 29 identical green runs, then run
@@ -43,20 +69,33 @@ Make Test 17d non-flaky across fast and slow runners **without weakening the
 `warn17d == 0` regression guard**, while keeping a real anti-vacuous-pass canary so a
 dead/absent churner can't let the test pass without exercising the guarded poll path.
 
-## Fix (replaces the single `got97 >= 1` assertion; keeps everything else)
-Within the `for r in 1 2 3` waiter loop, replace the `got97` accumulation and its
-assertion with three assertions:
+## Fix (v2) — replaces the single `got97 >= 1` assertion; keeps everything else
+**Structural A — per-waiter lock logs (drop-free).** Today all 12 waiters share
+`AGENT_LOCK_LOG="$LOG"` (`$LOG=churn.log`, line 916). Change each waiter to its OWN log
+`AGENT_LOCK_LOG="$WORK/t17d.$r.$i.log"` (the churner writes only the lock *file*, never
+the log, so per-waiter logs lose nothing). After the 3 rounds,
+`cat "$WORK"/t17d.*.log > "$LOG"` to rebuild the consolidated `churn.log` artifact.
+`warn17d` is unaffected — it greps the per-waiter `.err` STDERR files, not the log.
+
+Then replace the `got97` accumulation + its assertion with three assertions:
 
 1. **Regression guard — unchanged.** `warn17d == 0` ("12 waiters polled through churn
    with ZERO spurious non-lock warnings"). Keep verbatim.
 
 2. **Every waiter reaches a designed terminal state.** Accumulate each waiter's rc;
-   require all 12 ∈ {0, 97, 98}. Any other rc (crash, 96 config error, 99, …) ⇒ `bad`,
-   listing the offending `round.idx=rc`. This is *stricter* than the old test, which
-   ignored every rc except 97.
+   require all 12 ∈ **{0, 1, 97, 98}**. For `bash -c 'true'` under this churn: `0`
+   acquired+clean release; `1` acquired but release read the held lock EMPTY (churner's
+   create→write window) ⇒ release rc 2 ⇒ `lock_run` demotes the clean command to 1
+   (`git-commit-lock.sh:1739-1744`), ownership-unverifiable/correct; `97` timed out;
+   `98` churner overwrote the hold before release (designed theft detection). Any OTHER
+   rc (crash/139, 96 config error, 99, …) ⇒ `bad`, listing the offending `round.idx=rc`.
+   Stricter than the old test (which ignored every rc but 97) and is the real new
+   product-regression check. Comment must name why rc 1 is correct so a successor does
+   not "tighten" the set back and re-introduce the flake.
 
 3. **Anti-vacuity: contention actually happened (the guarded path ran).** Require
-   `grep -c 'WAITING for lock' "$LOG" >= 1`. `WAITING` is logged **only** after a
+   `cat "$WORK"/t17d.*.log | grep -c 'WAITING for lock' >= 1` (counted from the
+   single-writer per-waiter logs ⇒ drop-free; see reviewer note 2). `WAITING` is logged **only** after a
    waiter's create was blocked by a present file (`git-commit-lock.sh:1363-1370`),
    immediately before the per-poll type-guard loop (`:1388-1570`) that `warn17d`
    guards — so ≥1 `WAITING` proves at least one waiter entered the exact path under
@@ -73,31 +112,25 @@ get 0 WAITING is no contention at all (churner never ran / always absent), which
 exactly the vacuity we want to fail on. So ≥1 has margin on both ends; no threshold
 near the machine-variance band is introduced.
 
-### Secondary hardening (cheap, include if clean)
-- **Churner readiness proves churn began.** Today the start marker is written *before*
-  the loop (`:926`), so "started" doesn't prove a single cycle ran. Move the start-marker
-  write to *after* the churner's first successful write+delete cycle (both pwsh and perl
-  branches) so `wait_for_file "$START"` implies the churn loop is actually turning over.
-- **Churner alive at reap.** Capture `kill -0 "$churn_pid"` right before `touch "$STOP"`;
-  assert it was alive ⇒ catches a churner that crashed mid-test (another vacuity route).
-  This is non-flaky: the churner loops 2,000,000× and the test lasts ~4-6s, so it is
-  always alive at reap unless it actually crashed.
-
-If either hardening proves fiddly or risks its own flake, the plan's load-bearing fix
-is assertions 1-3 alone; the start-marker move and alive-check are defense-in-depth and
-can be dropped without losing the de-flake. (Decide during implementation; record in
-changelog.)
+### Secondary hardening — DROPPED (reviewer note 3)
+v1 proposed two extra hardenings (move the start-marker after the churner's first
+write+delete cycle; assert the churner is alive at reap). Both are dropped in v2: they
+add machinery to a delicate timing path, the alive-check can false-fail if the churner's
+iteration cap is ever hit, and both are largely redundant with the drop-free
+`WAITING>=1` canary (which already proves the churner produced real contention — a
+waiter can only log `WAITING` if the churner had the lock file present). The
+load-bearing fix is the per-waiter logs + assertions 1-3.
 
 ## Observability (per logging practice)
 Keep the data that made this diagnosable: emit a `note:` line with the rc distribution
-and the WAITING count every run, e.g.
-`note: T17d outcomes rc0=$n0 rc97=$n97 rc98=$n98 other=$nother; WAITING=$waited` — so a
-future failure can be classified from the suite log without re-deriving it. (The old
-test discarded this.)
+and the WAITING count **unconditionally** (both pass and fail paths), e.g.
+`note: T17d outcomes rc0=$n0 rc1=$n1 rc97=$n97 rc98=$n98 other=$nother; WAITING=$waited`
+— so a future failure (or a pass drifting toward an edge) can be classified from the
+suite log without re-deriving it. (The old test discarded this.)
 
 ## Out of scope / explicitly NOT changed
 - The `warn17d`/TOCTOU regression logic and its assertion.
-- The churner shapes' core (pwsh on Windows, perl elsewhere) beyond the start-marker move.
+- The churner shapes' core (pwsh on Windows, perl elsewhere) — unchanged in v2.
 - Product code (`git-commit-lock.sh`) — no product defect found.
 - The `.ps1` port and other suites — Test 17d is bash-unit-only.
 
