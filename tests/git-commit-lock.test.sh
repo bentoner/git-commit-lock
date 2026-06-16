@@ -1801,6 +1801,59 @@ grep -q "DISCOVERY-HOLD" "$LOG" && bad "FALSE discovery-HOLD on the abandoned ow
 grep -q "STOLE-BY-CLAIM" "$LOG" && ok "the abandoned lock was then reclaimed by a normal steal" \
                                 || bad "no STOLE-BY-CLAIM of the abandoned lock"
 
+echo "== Test 32b: steal-path read-back FAILED — rename-over WON but the lock did not read back our token (F2) =="
+# The steal-path twin of Test 32. Here the stealer WINS the claim race AND wins
+# the rename-over (STOLE-BY-CLAIM is logged, the ghost is destroyed), but the
+# mandatory post-rename read-back verification (git-commit-lock.sh:1171) comes
+# back wrong. The product must NOT take the hold: it clears its claim token and
+# re-enters the wait loop (git-commit-lock.sh:1176-1179) — never a silent
+# false-hold (which, after a STOLE-BY-CLAIM, would mean a mis-attributed hold of
+# a destroyed-ghost path). We fault-inject the read-back with a one-shot
+# _lock_cur_token shadow gated on the claim token being SET (the INVERSE of Test
+# 32's `-z` gate), so it lands at the STEAL read-back (claim token live, not yet
+# held), not the create one. On firing we also backdate the just-installed
+# abandoned lock stale so the re-steal is immediate (same trick as Test 32 —
+# keeps it fast and deterministic). Attempt 2 (shadow spent) reads back the real
+# token and acquires normally.
+LOCK="$WORK/stealrb.lock"; LOG="$WORK/stealrb.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t32b" "pid=9 host=ghost"; backdate "$LOCK" 9999
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=5 \
+  AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=30 \
+  bash -c '
+    source "$1" || exit 70
+    clone_fn _lock_cur_token _ct_orig
+    SF1="$AGENT_LOCK_PATH.steer1"      # flag FILE: the cur_token shadow runs in subshells
+    _lock_cur_token() {
+      if [ ! -e "$SF1" ] && [ "${_LOCK_HELD:-0}" = 0 ] && [ -n "$_LOCK_CLAIM_TOKEN" ]; then
+        : > "$SF1"
+        backdate "$AGENT_LOCK_PATH" 9999 2>/dev/null || true
+        printf ""
+        return 0
+      fi
+      _ct_orig "$@"
+    }
+    lock_acquire || exit 72
+    lock_release || exit 74
+    exit 0
+  ' _ "$LIB" 2>/dev/null; rc=$?
+[ "$rc" = 0 ] && ok "steal read-back failure re-entered wait; a later steal acquired and released rc 0" \
+              || bad "steal-readback harness rc=$rc"
+grep -q "steal rename completed but read-back" "$LOG" \
+  && ok "the steal-path read-back-verification failure lane ran (F2)" \
+  || bad "F2 lane never ran (the read-back fault did not land at the steal read-back)"
+nstole="$(grep -c "STOLE-BY-CLAIM" "$LOG")"
+[ "$nstole" -ge 2 ] && ok "re-stole after the failed read-back (STOLE-BY-CLAIM x$nstole)" \
+                    || bad "expected >=2 STOLE-BY-CLAIM (won-rename then re-steal), got $nstole"
+warn_line="$(grep -n "steal rename completed but read-back" "$LOG" | head -1 | cut -d: -f1)"
+acq_line="$(grep -n "ACQUIRED " "$LOG" | tail -1 | cut -d: -f1)"
+if [ -n "$warn_line" ] && [ -n "$acq_line" ] && [ "$warn_line" -lt "$acq_line" ]; then
+  ok "no false-hold: the read-back WARNING preceded the eventual ACQUIRED"
+else
+  bad "ordering: expected the F2 WARNING (line $warn_line) before ACQUIRED (line $acq_line)"
+fi
+[ -e "$LOCK" ] && bad "lock leftover after the steal-readback walk" || ok "lock released cleanly"
+[ -e "$LOCK.next" ] && bad "claim leftover after the steal-readback walk" || ok "no claim leftover"
+
 echo "== Test 33: TERM mid-claim — the trap deletes the claim (token-checked), no 98, no ageout penalty =="
 # (a) main: claimant paused inside its claim window (at the touch), TERM'd.
 # The trap must delete OUR claim, run the discovery read (miss: the ghost is
@@ -2116,9 +2169,11 @@ rm -f "$LOCK" "$LOCK.next"
 #   blocker is most naturally a pwsh FileShare.Read holder, so the interop
 #   suite owns that test (on POSIX, unlink never blocks on open handles and
 #   the lane is unreachable).
-# * lock_acquire's read-back-verification failure lane needs fault injection
-#   to make a winning create read back wrong; it is defence in depth (see the
-#   ACQUIRE VERIFICATION header section), not suite-covered.
+# * lock_acquire's read-back-verification failure lanes (defence in depth; see
+#   the ACQUIRE VERIFICATION header section) are covered via _lock_cur_token
+#   fault injection: the create-path lane (create won, read-back wrong) by
+#   Test 32, the steal-path lane (F2 — rename-over won, read-back wrong) by
+#   Test 32b.
 
 echo
 echo "==== RESULT: $PASS passed, $FAIL failed (fan-out: $GCL_MODE) ===="
