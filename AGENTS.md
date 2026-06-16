@@ -103,17 +103,20 @@ don't cap review rounds for cost; a wrong fix that resurfaces is worse than slow
   `_lock_discover` (called one statement after the leak-add: sh:1112 -> sh:1114); under
   load the mv landed first, so 822 adopted instead of the 1382 memory path the assertion
   pinned. Product correct (rc 0, clean release, no leftover all PASSed); test-orchestration
-  race. **FIXED (commit <see git log>):** Fix A — sub-leg (a)'s assertion now accepts EITHER
+  race. **FIXED (commit 51a1753):** Fix A — sub-leg (a)'s assertion now accepts EITHER
   DISCOVERY-HOLD route and records which fired (memory route still pinned deterministically
   by 31(b); direct route by Test 25's 7-position discovery matrix, so no coverage lost).
   Diagnosis converged across 4 independent reviews (code-read + leak.log + fresh Claude
   subagent + Codex); impl reviewed clean by Claude + Codex; local unit suite 207/0. See
   `.plans/2026-06-17-ci-stress-test31a-flake-plan.md`. Real proof pending: CI under load.
 
-## Hunt status (as of 2026-06-17 ~01:15 local)
-- `both`/load=2 hunt reached **16/50 clean** then halted on Test 31(a) above. The driver
-  exited cleanly (sentinel FAIL); no stray dispatcher; no in-flight runs.
-- To RESUME after fixing Test 31(a): `cd .agent-testing && rm -f clean_count sentinel STOP
-  && STRESS_KIND=both STRESS_LOAD=2 TARGET=50 bash ./driver.sh` (background). Expect it to
-  surface further flakes (each is a fresh loop). Load=2 avoids the 8-hog budget artifacts.
-- TWO flakes fixed & pushed this session: Test 17d (58c3741), interop Test 5 (06c6d8e).
+## Hunt status (as of 2026-06-17 ~02:30 local)
+- Test 31(a) FIXED (51a1753) via the full formal loop; clean_count reset to 0 and the
+  `both`/load=2 hunt RESUMED toward 50 clean (the prior 16/50 streak was on pre-fix code,
+  so it does not count — we want 50 clean on the FIXED tree). Expect more flakes; each is a
+  fresh loop. Load=2 (4 hogs/4 cores) avoids the 8-hog budget artifacts (Test 21/22a).
+- To resume after any halt: `cd .agent-testing && rm -f clean_count sentinel STOP &&
+  STRESS_KIND=both STRESS_LOAD=2 TARGET=50 bash ./driver.sh` (background). First verify no
+  stray dispatcher + current HEAD (see Process hygiene).
+- THREE flakes fixed & pushed this session: Test 17d (58c3741), interop Test 5 (06c6d8e),
+  Test 31(a) (51a1753).
