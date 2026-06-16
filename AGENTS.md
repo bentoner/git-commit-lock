@@ -71,9 +71,22 @@ don't cap review rounds for cost; a wrong fix that resurfaces is worse than slow
   (windows-unit flaked at normal load, run 27616343269). FIXED (commit 58c3741): replaced
   with rc∈{0,1,97,98} + drop-free `WAITING>=1` anti-vacuity canary + `note:` meter.
   Diagnosis+plan+impl all reviewed clean by Claude+Codex. See the plan in `.plans/`.
-- **Test 5 (interop, `git-commit-lock.interop.test.sh`)** — FOUND under CPU load
-  (load=4): `FAIL: expected a tok.ps.* token on line 1 of the orphan lock, got ''`. The
-  precondition read (`head -n 1 "$LOCK"` after killing the pwsh holder) is a single
-  non-retrying read that catches the token not-yet-visible under load; the actual
-  cross-impl steal asserts PASS. Looks like a test-flake (fragile precondition read).
-  STATUS: in the formal loop (diagnosis stage) as of this writing.
+- **Test 5 (interop, `git-commit-lock.interop.test.sh`)** — FOUND under CPU load (3/3 cpu
+  runs): `FAIL: expected a tok.ps.* token on line 1 of the orphan lock, got ''`. Mechanism
+  (diagnosis + Codex, NOT "token not-yet-visible"): `kill -9 "$hpid"` missed the native
+  pwsh (MSYS `$!` is a shim), so pwsh ran its full `Start-Sleep 60` and exited gracefully,
+  firing the `PowerShell.Exiting` backstop that DELETED its own lock — so the read hit a
+  gone file; `backdate`(touch) then re-created it empty, making the 3 "steal" PASSes
+  vacuous. Test bug, product correct. FIXED (commit <see git log>): holder now self-exits
+  via `[Environment]::Exit(0)` (bypasses release + backstop) leaving a deterministic
+  token'd orphan — no kill. Reviewed clean Claude+Codex; local interop 141/0.
+- **Calibration finding (load=4 on a 4-core runner):** `cpu` reliably breaks interop Test 5
+  (above) and otherwise the unit suite is fine. `disk` shifts Test 17d toward the acquire
+  regime (rc0 up to 4/12 — Ben's disk instinct was apt) but nothing fails. `both` (8 hogs
+  on 4 cores) is the most extreme and additionally trips TWO unit tests only under that
+  pathological oversubscription: `recovery took 33s (>20s)` (+ "rc=97 behind a crashed
+  claim" / "no STOLE-BY-CLAIM") and `claim-path warning fired 0 times (want 1)`. These two
+  are SUSPECTED load-too-high artifacts (tight internal budgets exceeded by 2x CPU
+  oversubscription + heavy disk), NOT yet confirmed genuine. STATUS: to classify before the
+  50-clean hunt — decide hunt load level (cpu-only vs moderate both) and whether to harden
+  those two budgets. Data: `.agent-testing/calibration.tsv`.

@@ -306,20 +306,25 @@ grep -q "holder=pid=99999 host=ghost" "$LOG" \
   || bad "holder from line 2 missing in pwsh's STALE log line"
 
 echo "== Test 5: bash steals a STALE lock GENUINELY created by pwsh (holder killed mid-hold) =="
-# The stale lock really is pwsh's: a pwsh process dot-sources the lock, acquires,
-# signals ready, then is hard-killed by PID mid-hold (TerminateProcess — no
-# release, no exit event), leaving its live lock FILE (token line 1) behind.
+# The stale lock really is pwsh's: a pwsh process dot-sources the lock, acquires (writing
+# its tok.ps.* token to line 1 and flushing+closing the file), signals ready, then
+# SELF-EXITS via [Environment]::Exit(0) — the port's documented hard-exit that bypasses
+# BOTH Lock-Release AND the PowerShell.Exiting backstop — leaving its live token'd lock
+# FILE behind with no release. This is DETERMINISTIC: the same on-disk state as a holder
+# killed mid-hold, but without an external kill. (An MSYS `kill -9 "$!"` does NOT reliably
+# terminate the native pwsh.exe under load — it survived, ran to completion, and its
+# graceful-exit backstop DELETED the lock, leaving an empty file to steal; observed under
+# CPU load, run 27621668323. See the Test 5 de-flake plan.)
 LOCK="$WORK/b5.lock"; LOG="$WORK/b5.log"; : > "$LOG"; MARK="$WORK/b5.mark"; printf '%s' before > "$MARK"
 READY="$WORK/b5.ready"; rm -f "$READY"
 AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=300 \
-  pwsh -NoProfile -Command ". '$PS1WIN'; Lock-Acquire | Out-Null; [IO.File]::WriteAllText('$READY','r'); Start-Sleep 60" &
+  pwsh -NoProfile -Command ". '$PS1WIN'; if (-not (Lock-Acquire)) { [Environment]::Exit(3) }; [IO.File]::WriteAllText('$READY','r'); [Environment]::Exit(0)" &
 hpid=$!
 if wait_for "$READY"; then
-  kill -9 "$hpid" 2>/dev/null; wait "$hpid" 2>/dev/null
-  sleep 0.3
+  wait "$hpid" 2>/dev/null                          # holder self-exited via [Environment]::Exit (no release); reap it
   tok="$(head -n 1 "$LOCK" 2>/dev/null | tr -d '\r\n')"
   case "$tok" in
-    tok.ps.*) ok "dead pwsh holder left its own lock file behind (token $tok)" ;;
+    tok.ps.*) ok "self-exited pwsh holder left its own token'd lock behind (token $tok)" ;;
     *)        bad "expected a tok.ps.* token on line 1 of the orphan lock, got '$tok'" ;;
   esac
   backdate "$LOCK" 9999                           # age the orphan past any stale window
