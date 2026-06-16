@@ -95,18 +95,20 @@ don't cap review rounds for cost; a wrong fix that resurfaces is worse than slow
   oversubscription + heavy disk), NOT yet confirmed genuine. STATUS: to classify before the
   50-clean hunt — decide hunt load level (cpu-only vs moderate both) and whether to harden
   those two budgets. Data: `.agent-testing/calibration.tsv`.
-- **Test 31(a) (unit, `git-commit-lock.test.sh:1582`)** — FOUND on **ubuntu** under
-  both/load=2 (moderate, likely genuine), run 27626826865: `FAIL: no leaked-token-memory
-  DISCOVERY-HOLD`. DIAGNOSED (not yet fixed): the product has two valid DISCOVERY-HOLD
-  paths — direct `_lock_discover` (sh:822) and the per-poll leaked-token-memory check
-  (sh:1382). 31(a)'s external `mv` (installs the leaked claim at the lock path) RACES the
-  leaver's `_lock_discover`; under load the mv landed first, so 822 adopted the claim
-  instead of the 1382 memory path the assertion pins. Product correct (rc 0, clean
-  release, no leftover all PASSed); test-orchestration race. Sibling 31(b) already covers
-  the memory path DETERMINISTICALLY (internal steering) and passed. Fix options + recommend
-  in `.agent-testing/failures/unit-test31/DIAGNOSIS.md` (recommend A: relax 31a to accept
-  generic DISCOVERY-HOLD since 31b covers memory — but VERIFY via the formal loop it's not
-  vacuous). NEEDS: subagent-diagnosis confirm + Codex review + plan + impl review.
+- **Test 31(a) (unit, `git-commit-lock.test.sh`)** — FOUND on **ubuntu** under both/load=2
+  (moderate, genuine), run 27626826865: `FAIL: no leaked-token-memory DISCOVERY-HOLD`.
+  Mechanism: the product has two valid DISCOVERY-HOLD adoption paths — direct
+  `_lock_discover` (sh:822) and the per-poll leaked-token-memory check (sh:1382). 31(a)'s
+  external `mv` (installs the leaked claim at the lock path) RACES the leaver's inline
+  `_lock_discover` (called one statement after the leak-add: sh:1112 -> sh:1114); under
+  load the mv landed first, so 822 adopted instead of the 1382 memory path the assertion
+  pinned. Product correct (rc 0, clean release, no leftover all PASSed); test-orchestration
+  race. **FIXED (commit <see git log>):** Fix A — sub-leg (a)'s assertion now accepts EITHER
+  DISCOVERY-HOLD route and records which fired (memory route still pinned deterministically
+  by 31(b); direct route by Test 25's 7-position discovery matrix, so no coverage lost).
+  Diagnosis converged across 4 independent reviews (code-read + leak.log + fresh Claude
+  subagent + Codex); impl reviewed clean by Claude + Codex; local unit suite 207/0. See
+  `.plans/2026-06-17-ci-stress-test31a-flake-plan.md`. Real proof pending: CI under load.
 
 ## Hunt status (as of 2026-06-17 ~01:15 local)
 - `both`/load=2 hunt reached **16/50 clean** then halted on Test 31(a) above. The driver

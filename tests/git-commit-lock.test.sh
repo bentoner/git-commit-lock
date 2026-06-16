@@ -1548,8 +1548,18 @@ bad_touch="$(grep 'touch ' "$LIB" | grep '_LOCK_CLAIM_PATH' | grep -v -- '-c')"
 
 echo "== Test 31: LEAKED-claim discovery — the leaked-token memory closes the unverified-claim lanes =="
 # (a) main leg: a recheck-unreadable exit leaks the claim token; a rival
-# later installs that claim as the lock; the leaver's per-poll memory check
-# adopts it (HOLD) and release returns 0.
+# (the external mv below) then installs that claim as the lock; the leaver
+# adopts it (HOLD) and release returns 0. Adoption may go through EITHER of
+# the product's two discovery routes — both correct: the inline
+# ownership-discovery read that is the unreadable branch's final act
+# (git-commit-lock.sh:822, "DISCOVERY-HOLD: ...") if the external mv lands
+# before it, or the per-poll leaked-token-memory check
+# (git-commit-lock.sh:1382, "DISCOVERY-HOLD (leaked-token memory)") on a later
+# poll if it lands after. Which wins is a pure scheduling race — the external
+# mv vs the leaver's inline discover ONE statement later (sh:1112 leak-add ->
+# sh:1114 discover) — and is load-sensitive, so this leg accepts either and
+# records which fired. The memory route is pinned DETERMINISTICALLY by
+# sub-leg (b) below; the direct route by Test 25's discovery-position matrix.
 # NB: _lock_read_tok / _lock_cur_token shadows run inside COMMAND
 # SUBSTITUTIONS (subshells), so their fire-once state must live in flag
 # FILES — a variable assignment would be lost when the subshell exits.
@@ -1579,8 +1589,18 @@ else
 fi
 wait "$w31"; rc=$?
 [ "$rc" = 0 ] && ok "leaver discovered its installed leaked claim and released rc 0" || bad "leaked-discovery harness rc=$rc"
-grep -q "DISCOVERY-HOLD (leaked-token memory)" "$LOG" && ok "adoption went through the leaked-token memory" \
-                                                      || bad "no leaked-token-memory DISCOVERY-HOLD"
+# Either discovery route is correct here (see the leg comment); accept both,
+# record which fired, fail only if NEITHER adopted the leaked claim. ("$LOG"
+# is dedicated to this leg, so there is no cross-talk.) "DISCOVERY-HOLD:"
+# (immediate colon) matches ONLY the direct route; the memory route reads
+# "DISCOVERY-HOLD (leaked-token memory):" — disjoint, and checked first.
+if grep -q "DISCOVERY-HOLD (leaked-token memory)" "$LOG"; then
+  ok "adoption went through the leaked-token memory (per-poll route; the mv landed after the inline discover)"
+elif grep -q "DISCOVERY-HOLD:" "$LOG"; then
+  ok "adoption went through the inline ownership-discovery read (direct route; the mv landed first) — memory route pinned by sub-leg (b)"
+else
+  bad "no DISCOVERY-HOLD adoption of the leaked claim by EITHER route"
+fi
 [ -e "$LOCK" ] && bad "lock leftover after leaked-claim adoption" || ok "lock released cleanly after adoption"
 [ -e "$LOCK.next" ] && bad "claim leftover after leaked-claim adoption" || ok "no claim leftover"
 # Hmm wait: STALE=300 — the ghost is backdated 9999 so it IS stale; fine.
