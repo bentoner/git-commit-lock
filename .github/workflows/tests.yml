@@ -17,6 +17,13 @@ on:
   schedule:
     - cron: '17 3 * * 1'   # weekly Monday run: catches runner-image/tool drift
   workflow_dispatch:
+    inputs:
+      stress_kind:
+        description: 'STRESS BRANCH: artificial load during suites — none|cpu|disk|both'
+        default: both
+      stress_load:
+        description: 'STRESS BRANCH: hogs per kind (blank = runner core count)'
+        default: ''
 
 concurrency:
   # STRESS-BRANCH ONLY — do NOT merge to main. The per-run-unique group + no
@@ -41,17 +48,22 @@ jobs:
         # process-spawn overhead, not the PowerShell engines). Suites must NOT run
         # concurrently inside one runner: they're timing-sensitive on 2-core
         # runners. POSIX legs are fast enough to stay single-job.
-        include:
-          - { os: ubuntu-24.04, leg: all, job_timeout: 35 }
-          - { os: macos-15, leg: all, job_timeout: 35 }
-          - { os: windows-2025, leg: unit, job_timeout: 20 }
-          - { os: windows-2025, leg: interop-integration, job_timeout: 22 }
+        include:                       # STRESS BRANCH: job_timeouts raised to clear the summed step budgets under artificial load
+          - { os: ubuntu-24.04, leg: all, job_timeout: 80 }
+          - { os: macos-15, leg: all, job_timeout: 80 }
+          - { os: windows-2025, leg: unit, job_timeout: 40 }
+          - { os: windows-2025, leg: interop-integration, job_timeout: 50 }
     timeout-minutes: ${{ matrix.job_timeout }}   # backstop only: sum of the leg's step budgets + upload headroom
     defaults:
       run:
         shell: bash                  # on windows-2025 this is Git Bash (MINGW) — what the interop suite requires
     env:
       GCL_TEST_FULL: 1               # full fan-out — CI runners are dedicated; the reduced default protects live dev boxes (TODO 58)
+      # STRESS-BRANCH ONLY (do not merge): artificial CPU/disk load wrapped around each
+      # suite (tests/with-load.sh) to widen timing windows and surface latency/race
+      # flakes. From the workflow_dispatch inputs; empty on push/schedule => 'none'.
+      GCL_STRESS_KIND: ${{ inputs.stress_kind || 'none' }}
+      GCL_STRESS_LOAD: ${{ inputs.stress_load }}
     steps:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0   # v6.0.3, SHA-pinned
         with:
@@ -76,30 +88,30 @@ jobs:
 
       - name: Unit suite
         if: ${{ matrix.leg == 'all' || matrix.leg == 'unit' }}
-        timeout-minutes: ${{ matrix.os == 'windows-2025' && 15 || 10 }}   # a step timeout FAILS the step (not the job), so the upload step reliably runs; sized from run 27325978197 + one internal MAX_WAIT hang
+        timeout-minutes: ${{ matrix.os == 'windows-2025' && 30 || 25 }}   # STRESS BRANCH: raised (15->30 / 10->25) so artificial load slowness doesn't trip the step timeout and masquerade as a flake
         env:
           GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/unit
         run: |
           mkdir -p test-output
-          bash tests/git-commit-lock.test.sh 2>&1 | tee test-output/unit-suite.log
+          bash tests/with-load.sh bash tests/git-commit-lock.test.sh 2>&1 | tee test-output/unit-suite.log
 
       - name: Interop suite (bash + pwsh)
         if: ${{ !cancelled() && (matrix.leg == 'all' || matrix.leg == 'interop-integration') }}   # run even if an earlier suite failed — every signal is useful
-        timeout-minutes: 10
+        timeout-minutes: 25          # STRESS BRANCH: raised 10->25 for artificial load
         env:
           GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/interop
         run: |
           mkdir -p test-output
-          bash tests/git-commit-lock.interop.test.sh 2>&1 | tee test-output/interop-suite.log
+          bash tests/with-load.sh bash tests/git-commit-lock.interop.test.sh 2>&1 | tee test-output/interop-suite.log
 
       - name: Integration suite (real concurrent commits)
         if: ${{ !cancelled() && (matrix.leg == 'all' || matrix.leg == 'interop-integration') }}
-        timeout-minutes: 7           # its internal AGENT_LOCK_MAX_WAIT cap is 240s
+        timeout-minutes: 20          # STRESS BRANCH: raised 7->20 for artificial load (internal AGENT_LOCK_MAX_WAIT cap is 240s)
         env:
           GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/integration
         run: |
           mkdir -p test-output
-          bash tests/git-commit-lock.integration.test.sh 2>&1 | tee test-output/integration-suite.log
+          bash tests/with-load.sh bash tests/git-commit-lock.integration.test.sh 2>&1 | tee test-output/integration-suite.log
 
       - name: Upload failure diagnostics
         if: ${{ failure() || cancelled() }}   # failure() covers step timeouts (they fail the step); cancelled() is best-effort cover for manual cancels / the job-level backstop
