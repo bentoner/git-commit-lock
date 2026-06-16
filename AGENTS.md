@@ -6,11 +6,16 @@
 > A successor instance: read this top-to-bottom, then check `.agent-testing/` for live state.
 
 ## Mission (Ben, 2026-06-16)
-Run the `tests` workflow on `ci-stress` repeatedly until **50 clean runs in a row**, or
-until agent credits run out (tell Ben; GitHub minutes are FREE — public repo — so the
-only budget is agent compute). Each time a run fails, fix the flake with the formal loop
-below, reset the streak to 0 (we want 50 clean on the *fixed* code), and resume. Ben also
-asked to run under **CPU + disk load** to surface load-sensitive flakes faster.
+Run the `tests` workflow on `ci-stress` repeatedly until **50 clean runs in a row**. Each
+time a run fails, fix the flake with the formal loop below, reset the streak to 0 (we want
+50 clean on the *fixed* code), and resume. Ben also asked to run under **CPU + disk load**
+to surface load-sensitive flakes faster.
+
+**NO CREDITS / NO BUDGET LIMIT — DON'T PAUSE FOR "CREDITS".** Ben (2026-06-17, explicit):
+there are no credits to worry about — this is a PUBLIC repo, so we can run UNLIMITED CI,
+capped only by GitHub concurrency (excess just queues — throughput, not cost). Keep going;
+dispatch freely; run full review loops. Only surface a genuine blocker or a real decision
+for Ben.
 
 ## The formal diagnosis→fix loop (run on EVERY failure)
 1. **Capture** the failure: which leg/suite/test, the assertion, logs + preserved
