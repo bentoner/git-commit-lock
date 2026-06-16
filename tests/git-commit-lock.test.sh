@@ -962,26 +962,58 @@ if [ -n "$churn_pid" ]; then
   # never churned, so bash sees it reliably. Budget 60s: pwsh cold start on
   # a loaded box can take >15s.
   if wait_for_file "$START" 60; then
-    warn17d=0; got97=0
+    # Per-waiter lock logs (single-writer => drop-free): a SHARED log drops lines
+    # under concurrent appends (cf. the per-waiter logs at Test 2B), which would make
+    # the WAITING anti-vacuity count below unreliable. Rebuilt into $LOG after the runs.
+    warn17d=0; n0=0; n1=0; n97=0; n98=0; nother=0; rc_bad=""
     for r in 1 2 3; do
       pids=()
       for i in 1 2 3 4; do
-        AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=300 \
+        AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$WORK/t17d.$r.$i.log" AGENT_LOCK_STALE_SECS=300 \
           AGENT_LOCK_POLL_SECS=0.02 AGENT_LOCK_MAX_WAIT=2 \
           bash "$LIB" run -- bash -c 'true' 2> "$WORK/t17d.$r.$i.err" &
         pids+=($!)
       done
       for i in 1 2 3 4; do
         wait "${pids[$((i-1))]}"; rc=$?
-        [ "$rc" = 97 ] && got97=$((got97+1))
+        # A CLEAN command ('true') under this churn has exactly FOUR correct terminal
+        # codes — do NOT tighten this set: rc 1 is the real catch that made the old
+        # got97>=1 assertion flaky (see the Test 17d de-flake plan).
+        #   0  acquired in an absent window, clean release
+        #   1  acquired, but release read the held lock EMPTY (the churner's
+        #      create->write window) -> release rc 2 -> lock_run demotes the clean
+        #      command to 1 (ownership unverifiable; correct, not a defect)
+        #   97 never won an absent window within MAX_WAIT -> timed out
+        #   98 churner overwrote the hold before release -> designed theft detection
+        case "$rc" in
+          0)  n0=$((n0+1)) ;;
+          1)  n1=$((n1+1)) ;;
+          97) n97=$((n97+1)) ;;
+          98) n98=$((n98+1)) ;;
+          *)  nother=$((nother+1)); rc_bad="$rc_bad $r.$i=$rc" ;;
+        esac
         n="$(grep -c 'is not a lock file' "$WORK/t17d.$r.$i.err")"
         warn17d=$((warn17d+n))
       done
     done
+    # Rebuild the consolidated churn.log artifact from the drop-free per-waiter logs.
+    # 'cat glob > file' is a redirect, not a pipe (no SC2002); then count WAITING from
+    # the single rebuilt file.
+    cat "$WORK"/t17d.*.log > "$LOG" 2>/dev/null || :
+    waited="$(grep -c 'WAITING for lock' "$LOG")"
+    echo "note: T17d outcomes rc0=$n0 rc1=$n1 rc97=$n97 rc98=$n98 other=$nother; WAITING=$waited"
     [ "$warn17d" = 0 ] && ok "12 waiters polled through churn with ZERO spurious non-lock warnings" \
                        || bad "churned regular file fired $warn17d non-lock warning(s) — per-poll guard TOCTOU regression!"
-    [ "$got97" -ge 1 ] && ok "waiters still timed out at 97 under churn ($got97/12)" \
-                       || bad "no waiter reached 97 under churn (got97=$got97/12) — timeout lane bypassed?"
+    # Replaces the old got97>=1 assertion (timeout is only ONE of the correct outcomes;
+    # which one occurs is machine-speed luck). Assert each waiter reached a DESIGNED
+    # terminal state instead — catches a real product regression (crash/139, 96, …).
+    [ "$nother" = 0 ] && ok "all 12 waiters reached a designed terminal state (rc in {0,1,97,98})" \
+                      || bad "waiter(s) hit an undesigned rc under churn:$rc_bad (rc0=$n0 rc1=$n1 rc97=$n97 rc98=$n98)"
+    # Anti-vacuity: WAITING is logged only after a create was blocked by a PRESENT lock,
+    # immediately before the per-poll type guard that warn17d guards — so >=1 proves the
+    # churn produced real contention and the guarded path ran. 0 => dead/absent churner.
+    [ "$waited" -ge 1 ] && ok "churn exercised the blocked-poll type-guard lane ($waited WAITING line(s))" \
+                        || bad "no WAITING logged under churn — contention never happened; test ran vacuously"
   else
     bad "T17d churner never signalled its start marker"
     echo "  diag: churner pid=$churn_pid alive=$(kill -0 "$churn_pid" 2>/dev/null && echo yes || echo no)"

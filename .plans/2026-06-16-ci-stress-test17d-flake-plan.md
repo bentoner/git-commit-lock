@@ -1,6 +1,7 @@
 # Plan: de-flake Test 17d (`got97 >= 1`) in the unit suite
 
-Status: DRAFT — awaiting review (Claude reviewer + Codex), then implement.
+Status: **DONE** (implemented + reviewed clean by Claude and Codex; local unit suite
+214/0; awaiting CI-stress confirmation toward 50 clean in a row).
 
 ## Reviewer notes (add at top; do not renumber)
 Round 1 — fresh Claude reviewer + Codex (both independent), findings verified by me
@@ -30,6 +31,17 @@ against the product code:
    load-bearing fix is assertions 1-3.
 4. **[non-blocking, adopted] observability buckets** updated to `rc0/rc1/rc97/rc98/other`
    and emitted unconditionally (pass and fail), so a drift toward an edge is visible.
+
+Round 2 — confirming review (fresh Claude + Codex, both independent): **CONVERGED, ok to
+implement.** Both verified against the product code that the rc-set {0,1,97,98} is
+exhaustive and tight (release rc 2 is remapped to 1, never leaks; acquire exposes only
+0/97; reentrant-1 unreachable from a fresh CLI process), per-waiter `AGENT_LOCK_LOG`
+auto-creates and breaks nothing, and `WAITING>=1` is a sound non-flaky floor. Two
+implementation reminders adopted: (a) `bad` is a function — name the "other" rc bucket
+something else (e.g. `nother`) and an offenders string; (b) avoid `cat … | grep -c`
+(ShellCheck SC2002 fires at the CI style gate). Resolution for (b): rebuild churn.log via
+`cat "$WORK"/t17d.*.log > "$LOG"` (a redirect, not a pipe — no SC2002), then
+`grep -c 'WAITING for lock' "$LOG"` on the single rebuilt file.
 
 ## Context
 CI stress test (ci-stress branch, 2026-06-16): 29 identical green runs, then run
@@ -153,4 +165,22 @@ mergeable fix (unlike the stress-only concurrency commit 980856b). Reset
 `clean_count`, relaunch the driver, continue toward 50 clean in a row.
 
 ## Changelog (implementation)
-_(to be appended during implementation)_
+- Implemented exactly the Fix v2 design in `tests/git-commit-lock.test.sh` Test 17d
+  (the `if wait_for_file "$START" 60` block): per-waiter `AGENT_LOCK_LOG`, rc `case`
+  bucketing into `n0/n1/n97/n98/nother` + `rc_bad` offender list, `cat glob > "$LOG"`
+  rebuild, `grep -c 'WAITING for lock' "$LOG"` count, unconditional `note:` line, and
+  the three assertions (warn17d==0 kept verbatim; rc∈{0,1,97,98}; WAITING>=1). Removed
+  `got97`. No product code or other test touched.
+- Static: `bash -n` clean; `shellcheck -S style` v0.11.0 (the CI-pinned gate version)
+  clean.
+- Local run (Windows, this box, REDUCED fan-out — Test 17d is not fan-out-gated so it
+  runs identically): full unit suite **214 passed / 0 failed**. Test 17d emitted
+  `note: T17d outcomes rc0=0 rc1=0 rc97=12 rc98=0 other=0; WAITING=12` and all three
+  assertions PASS. (Idle box ⇒ present-dominant ⇒ all 12 timed out at 97 — the opposite
+  extreme to the CI failure's rc0-heavy distribution; both now accepted.)
+- Implementation review: fresh Claude reviewer — "IMPLEMENTATION OK" (confirmed
+  set -uo pipefail / no errexit so `grep -c` exit-1 is harmless; empty-glob rebuild
+  handled; no `bad`/`rc_bad` collision; `warn17d` guard intact). Codex
+  `exec review --uncommitted` — no blocking bug. Both in `.agent-testing/`.
+- Real proof pending: the windows-2025 (unit) leg under CI load. Resuming the stress
+  driver with the streak reset to 0.
