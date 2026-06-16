@@ -110,13 +110,28 @@ don't cap review rounds for cost; a wrong fix that resurfaces is worse than slow
   subagent + Codex); impl reviewed clean by Claude + Codex; local unit suite 207/0. See
   `.plans/2026-06-17-ci-stress-test31a-flake-plan.md`. Real proof pending: CI under load.
 
-## Hunt status (as of 2026-06-17 ~02:30 local)
-- Test 31(a) FIXED (51a1753) via the full formal loop; clean_count reset to 0 and the
-  `both`/load=2 hunt RESUMED toward 50 clean (the prior 16/50 streak was on pre-fix code,
-  so it does not count — we want 50 clean on the FIXED tree). Expect more flakes; each is a
-  fresh loop. Load=2 (4 hogs/4 cores) avoids the 8-hog budget artifacts (Test 21/22a).
+## Coverage work (not a flake — Ben asked, 2026-06-17)
+- **F2 read-back lane (commit 19a28fd):** a coverage audit (subagent + my code verification)
+  found the steal-path acquire read-back-verification failure lane uncovered — the stealer
+  WINS the claim race AND the rename-over (`STOLE-BY-CLAIM` logged, ghost destroyed) but the
+  post-rename read-back (`git-commit-lock.sh:1171`) reads the wrong token → must re-enter wait,
+  not false-hold. Its create-path twin (`:1358`) was covered by Test 32; F2 was not. Added
+  **Test 32b** (deterministic; mirrors Test 32 with the inverse `[ -n "$_LOCK_CLAIM_TOKEN" ]`
+  gate to land the fault at the steal read-back). Reviewed clean by fresh Claude + Codex;
+  suite 0-failed; F2 lane empirically exercised. Plan:
+  `.plans/2026-06-17-ci-stress-test-f2-coverage-plan.md`. Product unchanged (F2 reads correct;
+  this was regression-exposure, not a bug). Audit also flagged LOWER-priority gaps left for
+  Ben: A2/G2 (a non-file appearing AT the lock path mid-steal — `CLAIM-ABORT (wrong-type)` /
+  `(rename-refused)`), and that feeder-#3/blocked-unlink legs are Windows+pwsh-only.
+
+## Hunt status (as of 2026-06-17 ~03:20 local)
+- The `both`/load=2 hunt reached **40/50 clean** on the post-31(a)-fix tree (810ee41) with
+  ZERO failures, then I gracefully STOPped it to fold in the Test 32b coverage addition.
+  Restarted at **0/50 on the final tree 19a28fd** (with Test 32b) — a test-only change resets
+  the streak per the "50 clean on the current tree" rule, so the contiguous-50 is measured on
+  the final suite. Load=2 (4 hogs/4 cores) avoids the 8-hog budget artifacts (Test 21/22a).
 - To resume after any halt: `cd .agent-testing && rm -f clean_count sentinel STOP &&
   STRESS_KIND=both STRESS_LOAD=2 TARGET=50 bash ./driver.sh` (background). First verify no
   stray dispatcher + current HEAD (see Process hygiene).
 - THREE flakes fixed & pushed this session: Test 17d (58c3741), interop Test 5 (06c6d8e),
-  Test 31(a) (51a1753).
+  Test 31(a) (51a1753). Plus one coverage addition: Test 32b / F2 (19a28fd).
