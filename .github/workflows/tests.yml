@@ -19,8 +19,12 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # STRESS-BRANCH ONLY — do NOT merge to main. The per-run-unique group + no
+  # cancellation lets many workflow_dispatch runs execute in parallel on this one
+  # branch (flakiness stress test). On main the group is
+  # `${{ github.workflow }}-${{ github.ref }}` with cancel-in-progress: true.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
