@@ -108,12 +108,6 @@ LK_ENV=(AGENT_LOCK_STALE_SECS=300 AGENT_LOCK_POLL_SECS=0.2 AGENT_LOCK_MAX_WAIT=2
 if [ -n "$GCL_TEST_ONLY" ]; then
     echo "NOTE: integration suite ignores GCL_TEST_ONLY=\"$GCL_TEST_ONLY\" — Tests 1-3 are one indivisible scenario (shared repo + ALL_IDS audit); running the whole suite." >&2
 fi
-# Same for the CI shard selector (read by _harness.sh, pre-set to "" so no set -u
-# trap). This suite calls no section(), so the harness never parses/bails the var
-# — note it loudly and run the whole indivisible scenario as normal.
-if [ -n "$GCL_TEST_SHARD" ]; then
-    echo "NOTE: integration suite ignores GCL_TEST_SHARD=\"$GCL_TEST_SHARD\" — Tests 1-3 are one indivisible scenario (no section() blocks to shard); running the whole suite." >&2
-fi
 
 # --- scratch repo ------------------------------------------------------------
 REPO="$WORK/repo"; OUTD="$WORK/out"; NOHOOKS="$WORK/nohooks"
