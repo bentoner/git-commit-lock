@@ -2229,19 +2229,19 @@ AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
   AGENT_LOCK_CLAIM_STALE_SECS=600 AGENT_LOCK_POLL_SECS=0.2 AGENT_LOCK_MAX_WAIT=3 \
   bash -c '
     source "$1" || exit 70
-    # Shadow mv: on the claim->lock rename (the only mv touching ".next"),
-    # replace the stale lock file with a directory, then run the real mv -T,
-    # which refuses to overwrite a directory with a non-directory. The mv -T
-    # capability probe inside _lock_rename_over operates on its own temp paths
-    # (never ".next"), so it is unaffected.
-    mv() {
-      case "$*" in
-        *".next"*)
-          command rm -f -- "$AGENT_LOCK_PATH" 2>/dev/null
-          command mkdir -- "$AGENT_LOCK_PATH" 2>/dev/null
-          ;;
-      esac
-      command mv "$@"
+    # Make a DIRECTORY appear at the lock path BEFORE the real rename-over runs,
+    # by wrapping _lock_rename_over (NOT by shadowing mv). It is refused PORTABLY:
+    # GNU "mv -T" refuses to overwrite a directory with a non-directory, AND the
+    # no-mv-T fallback [ -d ] guard (BSD/macOS) refuses it too. A mv shadow that
+    # mkdirs the dir INSIDE the mv call works only on GNU: it lands AFTER the
+    # fallback [ -d ] check, and BSD "mv file dir" MOVES the file INTO the dir
+    # rather than erroring (this failed the macOS CI leg). NB: no apostrophes
+    # here -- this comment lives inside the bash -c single-quoted steering shell.
+    clone_fn _lock_rename_over _ro_orig
+    _lock_rename_over() {
+      command rm -f -- "$AGENT_LOCK_PATH" 2>/dev/null
+      command mkdir -- "$AGENT_LOCK_PATH" 2>/dev/null
+      _ro_orig
     }
     lock_acquire
     exit $?
