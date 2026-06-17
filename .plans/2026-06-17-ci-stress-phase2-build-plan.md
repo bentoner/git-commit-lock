@@ -276,7 +276,11 @@ calibrated envelope leg (IO throttling experimental — don't rely on it); emit 
 **load-manifest** artifact (`{kind, R, nproc, achieved-slowdown, tool versions, os/arch,
 sha}`) uploaded on success too.
 
-**What lands on `main` vs stays scaffolding (refines Bucket 5 / D-d):**
+**What lands on `main` vs stays scaffolding (refines Bucket 5 / D-d):** *(This lists the
+mergeable **content**; it is mechanism-agnostic. The merge **mechanism** — cherry-pick vs
+tidy-rebase+ff-merge vs squash — was **reopened 2026-06-18**; see the guarantees-and-coverage
+plan's Bucket 5. Note that after this Bucket 6 lands, ci-stress's tree already excludes the
+stress wiring, so "what graduates" is mostly a history-curation question, not a tree one.)*
 - **Graduate to `main`:** the calibrated `with-load.sh` (strip the do-not-merge banner;
   add ratio calibration + load-manifest); `ok_envelope`/`bad_envelope` + the 3
   reassigned assertions; `GCL_TEST_SWEEP` + Axis-A loop (default-off → per-PR identical

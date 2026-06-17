@@ -74,13 +74,41 @@ Ben's box).
   don't hard-fail on? (Recommend the latter — it makes the envelope explicit and stops
   future stress runs re-raising these as "flakes".)
 
-### Bucket 5 — Branch hygiene (standing, NOT part of this workflow unless wanted)
-- The mergeable commits (the 4 test fixes 58c3741/06c6d8e/51a1753/19a28fd + the docs) vs the
-  **stress-only, do-not-merge** commits (980856b concurrency tweak, b430d73 load wrapper).
-  When this lands on `main`, cherry-pick the mergeable set and leave the stress scaffolding.
-  *Open decision D-d:* do this work on `ci-stress` and cherry-pick later, or branch a clean
-  `failure-modes` off `main` now? (Recommend: keep working on `ci-stress`; cherry-pick at the
-  end — the stress wrapper is useful for CI-verifying the new tests under load.)
+### Bucket 5 — Merge-to-`main` strategy (**D-d REOPENED 2026-06-18**)
+Ben reopened this: cherry-picking may not be the best path — "tidying up and preserving
+history" is a live alternative. **Git facts (verified 2026-06-18):**
+- **`main` has not diverged** — `merge-base(main, ci-stress) == main HEAD (fa43f30)`. So
+  ci-stress is strictly **34 commits ahead**, and a cleaned-up branch can **fast-forward**
+  onto `main` (no merge commit).
+- The 34 commits are a mix: genuine product/test/doc work; **pure stress-only scaffolding**
+  (`980856b` concurrency tweak; `b430d73`'s `tests.yml` load-wiring + raised timeouts — *but
+  `b430d73` also adds `tests/with-load.sh`, which graduates*, so it is a **mixed** commit);
+  intermediate **plan / AGENTS.md churn**; and the **`/c` commit+revert pairs**
+  (`534a007` → `959cca9` → `a5df9d9`).
+- **Bucket 6 itself rewrites the CI workflows** (3 new files) and reverts the stress wiring.
+  So after Bucket 6 lands, **ci-stress's final *tree* is already main-worthy** — the
+  stress-only commits are a *history* concern, not a tree concern. **The decision is therefore
+  mostly about what history `main` should carry, not about keeping bad code out of the tree.**
+
+Options:
+- **(A) Cherry-pick a curated subset** onto `main` (the prior plan). Surgical, but ~20
+  interdependent picks (later commits edit the same test file repeatedly → conflict-prone),
+  new SHAs disconnected from the branch, and `b430d73` must be split by hand. Drops the
+  review/decision narrative.
+- **(B) Tidy-rebase `ci-stress`, then `--ff-only` merge** ("tidy up + preserve history").
+  Interactively rewrite the branch: squash the `/c` commit+revert pairs and the intermediate
+  plan/changelog churn into their content commits, excise the pure scaffolding (or rely on
+  Bucket 6 having already removed the wiring from the tree), curate messages; then `git -C
+  <main> merge ci-stress --ff-only` lands a clean linear history in one operation. Keeps a
+  curated narrative; **rewrites history** — gotcha: `rebase.updateRefs=true` moves any branch
+  pointing into the range, so back up with a **raw SHA/tag, never a branch**.
+- **(C) Squash-merge** to one (or a few) curated commit(s). Cleanest `main` log, trivially
+  excludes scaffolding (final tree only), but discards all granular history.
+
+*Recommendation:* **(B)** — enabled cleanly by `main` not having diverged; gives a
+curated-but-real history (which (C) discards and (A) reconstructs laboriously) and matches
+"tidy up and preserve." **Still Ben's call** (it's about `main`'s permanent history); settle it
+before the merge step. **Not a blocker for the rest of Phase 3 — the merge is last.**
 
 ### Bucket 6 — Principled load-&-matrix testing STRATEGY (Ben "f", 2026-06-17) — RECOMMENDATION DOC, not code
 The current load injection (`tests/with-load.sh`: N CPU spin-loops + N disk write/fsync/delete
@@ -181,8 +209,9 @@ the agreed CI matrix (Bucket 6). Commit incrementally under the commit-lock. **V
 
 **Phase 4 — Review.** Review the diff (Claude + Codex); run the full suite via CI **across the
 agreed matrix** to confirm new tests pass + are non-flaky, the scoped bounds hold, and the
-matrix surfaces no new flakes. Iterate to clean. → Ben's final review. Then (D-d) cherry-pick
-the mergeable commits to `main`.
+matrix surfaces no new flakes. Iterate to clean. → Ben's final review. Then land on `main`
+per **D-d** (merge strategy reopened 2026-06-18 — cherry-pick vs tidy-rebase+ff-merge vs
+squash; see Bucket 5).
 
 ## Decisions (settled 2026-06-17)
 - **D-a → new `docs/guarantees.md`** (dedicated normative doc).
@@ -190,7 +219,10 @@ the mergeable commits to `main`.
   gaps (#7 wrong-type-mid-steal, #8 Windows blocked-unlink) as a second tier.
 - **D-c → split the suite** into a strict-correctness tier (always enforced) and a
   latency/envelope tier (not hard-failed by extreme-stress runs).
-- **D-d → keep on `ci-stress`**, cherry-pick the mergeable commits to `main` at the end.
+- **D-d → REOPENED 2026-06-18** (was: keep on `ci-stress`, cherry-pick mergeable commits at
+  the end). Work continues on `ci-stress`; the *merge-to-`main` mechanism* is now an **open
+  decision** — cherry-pick (A) vs tidy-rebase + ff-merge (B, recommended) vs squash (C). See
+  **Bucket 5** for the analysis. Settle before the merge step (it's the last step).
 - **D-e → my choice:** hand-run Phases 1-2; decide Phase 3-4 (hand vs Workflow) once the
   test/matrix count is known.
 - **"f" → Bucket 6**, above: a considered, first-principles load-&-matrix testing
