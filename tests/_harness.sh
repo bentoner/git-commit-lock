@@ -34,6 +34,14 @@
 PASS=0; FAIL=0; TAPN=0; DONE=0; SECTIONS_RUN=0
 GCL_TAP="${GCL_TAP:-0}"           # CI sets GCL_TAP=1 for machine-readable TAP13 output
 GCL_TEST_ONLY="${GCL_TEST_ONLY:-}"  # if set, run ONLY test blocks whose label REGEX-matches (single-test selector)
+# Opt-in CI shard selector GCL_TEST_SHARD=<i>/<n> (round-robin over file-order
+# section index). Parsed LAZILY on the first section() call (see _shard_init) so
+# non-section() suites (integration) just note-and-ignore it; unset/empty is a
+# no-op so all unsharded runs stay byte-identical. SHARD_I/SHARD_N hold the parsed
+# pair; SECTION_IDX is the stable file-order shard key; SHARD_PARSED is the
+# once-only parse guard.
+GCL_TEST_SHARD="${GCL_TEST_SHARD:-}"
+SHARD_I=0; SHARD_N=0; SECTION_IDX=0; SHARD_PARSED=0
 
 # Axis-A waiter-count sweep (Bucket 6). GCL_TEST_SWEEP=1 (nightly/deep CI) widens
 # the fan-out/contention tests over several waiter counts to wring more coverage
@@ -61,17 +69,54 @@ ok()  { PASS=$((PASS+1)); TAPN=$((TAPN+1)); echo "PASS: $*"
 bad() { FAIL=$((FAIL+1)); TAPN=$((TAPN+1)); echo "FAIL: $*"
         [ "$GCL_TAP" = 1 ] && echo "not ok $TAPN - $*"; return 0; }
 
-# Per-test gate: echoes the block header (so a normal run is byte-unchanged) and
-# returns success iff GCL_TEST_ONLY is unset/empty OR its regex matches the label.
-# Each top-level `== Test N: <desc> ==` block is wrapped `if section "..."; then ... fi`.
-# Bumps SECTIONS_RUN on a match so the verdict's zero-match guard (selector_report)
-# can catch a selector regex that matched nothing.
-section() {
-  echo "== $1 =="
-  if [ -z "${GCL_TEST_ONLY:-}" ] || [[ "$1" =~ $GCL_TEST_ONLY ]]; then
-    SECTIONS_RUN=$((SECTIONS_RUN + 1)); return 0
+# Lazy one-time parse+validate of GCL_TEST_SHARD. Called from section() (NOT at
+# source time) so suites that never call section() (integration) neither parse
+# nor bail — they only note-and-ignore the var. An empty/unset var is a no-op.
+# Validation bails LOUDLY (exit 1) on any malformed input so a typo can never
+# silently run a partial suite green:
+#   * GCL_TEST_ONLY + GCL_TEST_SHARD are mutually exclusive (no real combined use
+#     case, and exclusivity makes the per-shard count guard always valid).
+#   * The single regex ^([1-9][0-9]*)/([1-9][0-9]*)$ rejects empty components,
+#     non-digits, leading zeros (a bash-arithmetic octal trap), and extra slashes
+#     in one shot; BASH_REMATCH then yields i and n.
+#   * i <= n range check.
+_shard_init() {
+  SHARD_PARSED=1
+  [ -z "$GCL_TEST_SHARD" ] && return 0
+  if [ -n "${GCL_TEST_ONLY:-}" ]; then
+    echo "Bail out! GCL_TEST_ONLY and GCL_TEST_SHARD are mutually exclusive" >&2; exit 1
   fi
-  return 1
+  if [[ "$GCL_TEST_SHARD" =~ ^([1-9][0-9]*)/([1-9][0-9]*)$ ]]; then
+    SHARD_I=${BASH_REMATCH[1]}; SHARD_N=${BASH_REMATCH[2]}
+  else
+    echo "Bail out! GCL_TEST_SHARD must be i/n positive integers (got '$GCL_TEST_SHARD')" >&2; exit 1
+  fi
+  if [ "$SHARD_I" -gt "$SHARD_N" ]; then
+    echo "Bail out! GCL_TEST_SHARD=$GCL_TEST_SHARD out of range (need i<=n)" >&2; exit 1
+  fi
+}
+
+# Per-test gate: echoes the block header (so a normal run is byte-unchanged) and
+# returns success iff the test is selected. Each top-level `== Test N: <desc> ==`
+# block is wrapped `if section "..."; then ... fi`. SECTION_IDX bumps for EVERY
+# section in file order (before any gating) — it is the stable shard-assignment
+# key, independent of GCL_TEST_ONLY/SWEEP/FULL. SECTIONS_RUN bumps only when the
+# block actually runs, so the verdict guards (selector_report) can catch a
+# zero-match selector or a miscounted shard. Two gates compose: the GCL_TEST_ONLY
+# regex selector, then the GCL_TEST_SHARD round-robin (mutually exclusive, so at
+# most one is active). Both are no-ops when their var is empty, so unsharded /
+# unselected runs are byte-identical (the RAN: marker is emitted ONLY in shard
+# mode for the same reason).
+section() {
+  [ "$SHARD_PARSED" = 1 ] || _shard_init        # lazy: only section()-using suites parse
+  SECTION_IDX=$((SECTION_IDX + 1))              # file-order index, bumped for EVERY test before gating
+  echo "== $1 =="
+  if [ -n "${GCL_TEST_ONLY:-}" ] && ! [[ "$1" =~ $GCL_TEST_ONLY ]]; then return 1; fi
+  if [ -n "$GCL_TEST_SHARD" ] && [ $(( (SECTION_IDX - 1) % SHARD_N )) -ne $(( SHARD_I - 1 )) ]; then
+    return 1
+  fi
+  [ -n "$GCL_TEST_SHARD" ] && echo "RAN: $1"    # run-only attribution marker (shard mode only — keeps unsharded byte-identical)
+  SECTIONS_RUN=$((SECTIONS_RUN + 1)); return 0
 }
 
 # Sentinel: the suite reaching its end sets DONE=1. If the EXIT trap fires with
@@ -104,6 +149,21 @@ selector_report() {
     exit 1
   fi
   [ -n "${GCL_TEST_ONLY:-}" ] && echo "selector GCL_TEST_ONLY=\"$GCL_TEST_ONLY\" ran $SECTIONS_RUN test block(s)"
+  # Shard mode (gated so unsharded runs are byte-identical and never hit % SHARD_N=0):
+  # recompute the expected run-count from the SAME one-based residue mapping the
+  # section() gate uses, log one greppable verdict line, and bail loudly if the
+  # actual run-count disagrees OR the shard is empty (expected < 1 — e.g. n >
+  # section-count like 58/58 — which would otherwise pass vacuously green).
+  if [ -n "$GCL_TEST_SHARD" ]; then
+    local exp=0 k=1
+    while [ "$k" -le "$SECTION_IDX" ]; do
+      [ $(( (k - 1) % SHARD_N )) -eq $(( SHARD_I - 1 )) ] && exp=$((exp + 1)); k=$((k + 1))
+    done
+    echo "GCL_TEST_SHARD=$SHARD_I/$SHARD_N: ran $SECTIONS_RUN of $SECTION_IDX sections (expected $exp)"
+    if [ "$SECTIONS_RUN" -ne "$exp" ] || [ "$exp" -lt 1 ]; then
+      echo "Bail out! shard $SHARD_I/$SHARD_N ran $SECTIONS_RUN, expected $exp" >&2; exit 1
+    fi
+  fi
   return 0
 }
 
