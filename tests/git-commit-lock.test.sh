@@ -76,6 +76,26 @@ ok()  { PASS=$((PASS+1)); TAPN=$((TAPN+1)); echo "PASS: $*"
 bad() { FAIL=$((FAIL+1)); TAPN=$((TAPN+1)); echo "FAIL: $*"
         [ "$GCL_TAP" = 1 ] && echo "not ok $TAPN - $*"; return 0; }
 
+# Envelope-tier assertions (Bucket 4 / decision D-c). A wall-clock or poll-count
+# bound is a Tier-2 (best-effort latency) property, NOT a correctness one (see
+# guarantees.md BE-1). In the default 'strict' tier these behave exactly like
+# ok/bad. Under GCL_ENVELOPE_TIER=relax (nightly/deep stress runs) an envelope FAIL
+# becomes a WARN that does NOT increment FAIL — so an oversubscribed runner can't
+# turn a latency miss into a red — while every CORRECTNESS assertion keeps ok/bad
+# and stays hard in both tiers. TAP-aware so envelope assertions still count toward 1..N.
+ENVELOPE_TIER="${GCL_ENVELOPE_TIER:-strict}"
+ENV_WARN=0
+ok_envelope()  { PASS=$((PASS+1)); TAPN=$((TAPN+1)); echo "PASS[env]: $*"
+                 [ "$GCL_TAP" = 1 ] && echo "ok $TAPN - $*"; return 0; }
+bad_envelope() {
+  if [ "$ENVELOPE_TIER" = relax ]; then
+    ENV_WARN=$((ENV_WARN+1)); TAPN=$((TAPN+1)); echo "WARN[env-relaxed]: $*"
+    [ "$GCL_TAP" = 1 ] && echo "ok $TAPN - $* # env-relaxed"
+  else
+    FAIL=$((FAIL+1)); TAPN=$((TAPN+1)); echo "FAIL: $*"
+    [ "$GCL_TAP" = 1 ] && echo "not ok $TAPN - $*"
+  fi; return 0; }
+
 # Backdate a path's mtime by $2 seconds — the lock's staleness clock is the
 # lock FILE's own mtime (stamped by the creating write), so this is how a
 # test fakes a stale lock. Portable: BSD touch has no `-d @epoch`, so convert
@@ -1160,7 +1180,7 @@ t21_t1=$(date +%s)
 [ "$rc" = 0 ] && ok "waiter recovered through a crashed claimant's claim (rc 0)" || bad "rc=$rc behind a crashed claim"
 grep -q "CLAIM-STALE-CLEARED" "$LOG" && ok "aged claim cleared (CLAIM-STALE-CLEARED logged, with age)" || bad "no CLAIM-STALE-CLEARED entry"
 grep -q "STOLE-BY-CLAIM" "$LOG" && ok "steal completed after the clear" || bad "no STOLE-BY-CLAIM after clearing the crashed claim"
-[ $((t21_t1 - t21_t0)) -le 20 ] && ok "recovery latency bounded ($((t21_t1 - t21_t0))s)" || bad "recovery took $((t21_t1 - t21_t0))s (>20s)"
+[ $((t21_t1 - t21_t0)) -le 20 ] && ok_envelope "recovery latency bounded ($((t21_t1 - t21_t0))s)" || bad_envelope "recovery took $((t21_t1 - t21_t0))s (>20s)"
 [ -e "$LOCK.next" ] && bad "claim leftover after recovery" || ok "claim path clean after recovery"
 # (b) an EMPTY claim file (claimant died between create and write): same lane.
 LOCK="$WORK/ccempty.lock"; LOG="$WORK/ccempty.log"; : > "$LOG"
@@ -1183,10 +1203,16 @@ AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
   bash "$LIB" run -- bash -c 'true' 2> "$WORK/t22a.err"; rc=$?
 [ "$rc" = 97 ] && ok "dir at claim path: steals blocked, waiter timed out (97)" || bad "dir at claim path: rc=$rc (want 97)"
 [ -f "$LOCK.next/sub/f" ] && ok "directory at claim path untouched" || bad "directory at claim path was damaged!"
-grep -q "is not a claim file" "$WORK/t22a.err" && ok "loud claim-path config warning on stderr" || bad "no claim-path config warning"
-grep -q "it is a directory" "$WORK/t22a.err" && ok "claim warning names the detected type (directory)" || bad "claim warning does not name the type"
 n="$(grep -c "is not a claim file" "$WORK/t22a.err")"
-[ "$n" = 1 ] && ok "claim-path warning fired exactly once (got $n)" || bad "claim-path warning fired $n times (want 1)"
+# "warning fired at all" is timing-dependent (the two-poll confirmation needs poll
+# headroom before MAX_WAIT, which an oversubscribed runner can starve) -> envelope.
+# The warn-once dedup (never >1) and the type-naming are CORRECTNESS -> strict (the
+# latter only asserted when a warning actually fired).
+[ "$n" -ge 1 ] && ok_envelope "claim-path config warning fired (got $n)" || bad_envelope "no claim-path config warning (n=$n)"
+[ "$n" -le 1 ] && ok "claim-path warning not duplicated (n=$n)" || bad "claim-path warning fired $n times (warn-once broken)"
+if [ "$n" -ge 1 ]; then
+  grep -q "it is a directory" "$WORK/t22a.err" && ok "claim warning names the detected type (directory)" || bad "claim warning does not name the type"
+fi
 grep -q "STOLE-BY-CLAIM" "$LOG" && bad "stole despite a squatted claim path" || ok "no steal through a squatted claim path"
 [ -f "$LOCK" ] && ok "stale lock left in place (cannot be stolen safely)" || bad "lock vanished behind a squatted claim path"
 # (b) a free LOCK path is UNaffected by claim-path junk: normal acquire works.
@@ -1547,8 +1573,8 @@ AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
   ' _ "$LIB" 2>/dev/null; rc=$?
 [ "$rc" = 97 ] && ok "blocked-steal waiter honoured MAX_WAIT (97)" || bad "blocked-steal rc=$rc (want 97)"
 nclaim="$(grep -c "] CLAIM " "$LOG")"
-[ "$nclaim" -ge 2 ] && ok "claim re-created on later attempts (x$nclaim) — deleted immediately, no ageout penalty" \
-                    || bad "only $nclaim CLAIM line(s) — the failed steal's claim was left to age out (60s-class penalty)"
+[ "$nclaim" -ge 2 ] && ok_envelope "claim re-created on later attempts (x$nclaim) — deleted immediately, no ageout penalty" \
+                    || bad_envelope "only $nclaim CLAIM line(s) — the failed steal's claim was left to age out (60s-class penalty)"
 grep -q "steal FAILED" "$LOG" && ok "blocked rename logged (damped steal FAILED)" || bad "no steal FAILED log line"
 [ -e "$LOCK.next" ] && bad "claim leftover after the blocked steal attempts" || ok "no claim leftover at exit"
 [ -f "$LOCK" ] && ok "squatted lock left in place" || bad "lock vanished in the blocked lane"
@@ -2196,6 +2222,6 @@ rm -f "$LOCK" "$LOCK.next"
 
 DONE=1
 echo
-echo "==== RESULT: $PASS passed, $FAIL failed (fan-out: $GCL_MODE) ===="
+echo "==== RESULT: $PASS passed, $FAIL failed, $ENV_WARN envelope warning(s) (fan-out: $GCL_MODE) ===="
 [ "$GCL_TAP" = 1 ] && echo "1..$TAPN"
 [ "$FAIL" = 0 ]
