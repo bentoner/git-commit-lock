@@ -196,6 +196,22 @@ bad_envelope() {
 
 ## Bucket 6 — CI matrix wiring (the accepted load-strategy §9 decisions)
 
+> **DECISION (Ben, 2026-06-18): NO branch protection — single-dev project.** We will not
+> enforce required status checks. Consequences for this bucket:
+> 1. **The `tests-passed` aggregator and the per-job doc-only path-filter (the `changes`
+>    job) are DROPPED.** Both existed only to make a *required* check behave well (one
+>    green context to require; doc-only PRs not blocked by it). With nothing required,
+>    `tests.yml` keeps the simple **workflow-level `paths-ignore`** and reports the per-cell
+>    matrix contexts directly. So **Bucket 6a = the de-stress revert only** (revert
+>    `980856b` + `b430d73`'s `tests.yml` half; restore original concurrency/timeouts; drop
+>    the stress `workflow_dispatch` inputs; suites run un-wrapped).
+> 2. The 3-workflow file split (`tests.yml` / `nightly.yml` / `deep-sweep.yml`) is **kept**,
+>    but now purely for separation of concerns (per-PR no-load gate vs scheduled load vs
+>    on-demand deep) — not to stop `workflow_dispatch` publishing gating contexts (moot
+>    without protection). The "distinct `deep-*` job names" detail is likewise now cosmetic.
+> The paragraphs below that describe the aggregator / path-filter / required-context gotchas
+> are **SUPERSEDED** by this note; keep them only as the rationale for why they're unneeded.
+
 **Three-workflow structure** (revised after review — a `workflow_dispatch` run
 publishes check contexts on the head SHA, so keeping Deep in `tests.yml` under shared
 job names risks a failed Deep run gating a PR; separate files + a stable required
