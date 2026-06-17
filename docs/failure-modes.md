@@ -27,24 +27,41 @@ flags the boundaries the headers state but a reader might skip.
 
 ## 1. The core guarantee (what must hold under ANY conditions)
 
-**Mutual exclusion + detectable failure.** At most one process at a time
-believes it holds the lock *and* is right about it. The lock cannot be silently
-lost: a holder whose lease was taken from it learns so — `lock_release` returns
-**98** and logs a loud WARNING — rather than reporting a serialized commit that
-wasn't (`git-commit-lock.sh:1607-1688`; `git-commit-lock.ps1:1700-1845`). The
-two reserved failure codes mean the wrapped command was provably *not* run
-(96 usage, 97 timeout) or provably *not serialized* (98)
-(`git-commit-lock.sh:392-415`). There is no fourth outcome in which two
-processes both believe they hold an exclusive lock and both are wrong.
+**No silent lost update — given cooperative wrapper unwind.** The absolute safety
+property is that the tool never reports a *serialized* critical section that
+wasn't: a holder whose lease was taken from it learns so — `lock_release` returns
+**98** and logs a loud WARNING — rather than exiting success
+(`git-commit-lock.sh:1607-1688`; `git-commit-lock.ps1:1717-1837`). The two
+reserved failure codes mean the wrapped command was provably *not* run (96 usage,
+97 timeout) or provably *not serialized* (98) (`git-commit-lock.sh:392-415`).
 
-This is a **lease, not a kernel lock** (`docs/git-commit-lock.md:60-126`
-explains why no OS primitive spans bash-on-MINGW and PowerShell/.NET). The
-deliberate consequence: a hold longer than the staleness window (default 300s)
-*can* be stolen mid-work — "fail-open." That is accepted by design and made
-*detectable* (the 98 path), not prevented (`git-commit-lock.sh:213-227`). So the
-core guarantee is precisely: **no silent lost update.** Liveness (eventual
-recovery from any crash) and bounded stalls are best-effort within an operating
-envelope (Tier 2), not absolute.
+Two honest qualifications make this a precise property rather than a slogan, and
+both matter for the scope decision:
+
+- **It is a lease, not a kernel lock** (`docs/git-commit-lock.md:60-126` explains
+  why no OS primitive spans bash-on-MINGW and PowerShell/.NET). **Strict mutual
+  exclusion holds only *within* the staleness window** (default 300s): a hold that
+  overruns it *can* be stolen mid-work — "fail-open" — so two processes can
+  briefly *both* believe they hold the lock. That overlap is accepted by design
+  and made *detectable* (the displaced holder's 98 at release), not prevented
+  (`git-commit-lock.sh:213-227`). At most one process is ever the *legitimate*
+  holder; a displaced believer finds out at release. So "mutual exclusion" is a
+  Tier-1 guarantee **within the envelope (commits faster than STALE)**, not an
+  unconditional one.
+- **Detection requires the wrapper to actually reach release.** The 98 path fires
+  on normal return and on trapped signals. It does **not** fire if the held
+  process is *hard-killed* (SIGKILL) or if the wrapped command terminates the
+  process abruptly — notably PowerShell `[Environment]::Exit()`, which bypasses
+  both `Lock-Release` and the `PowerShell.Exiting` backstop
+  (`git-commit-lock.ps1:221-245`). Such an abrupt exit can report success without
+  the 98 (see **§H4**). The *next* holder still recovers via staleness, but the
+  abruptly-exiting one is not warned. Hence the precise statement: **no silent
+  lost update, provided the wrapper unwinds cooperatively.**
+
+Liveness (eventual recovery) and bounded stalls are best-effort within an
+operating envelope (Tier 2), not absolute — and "recovery" means lock-shaped
+orphans get reclaimed, **not** that every bad state self-heals (a foreign object
+at the path is deliberately never auto-removed; see the tier split).
 
 The integration suite is the end-to-end witness for this guarantee on the real
 use case: many workers committing into one repo, audited for "every commit
@@ -54,8 +71,22 @@ clean tree" (`tests/git-commit-lock.integration.test.sh:10-12, 226-283`).
 ### The three tiers used throughout
 
 1. **Correctness guarantee** — must hold under *any* conditions (load, slow FS,
-   adversarial scheduling): mutual exclusion, no corruption, no silent loss,
-   eventual recovery. If one of these can break, it is a bug.
+   adversarial scheduling). Two kinds, and the distinction matters:
+   - **Safety (unconditional):** no corruption, and **no silent lost update** —
+     the displaced holder detects the loss (98) *provided its wrapper reaches
+     release* (§1's hard-kill/`Exit()` caveat). Strict **mutual exclusion holds
+     within the staleness window**; beyond it the lease is
+     fail-open-but-detectable.
+   - **Recovery (for lock-shaped stale state, under the supported FS/clock/tooling
+     envelope):** a crashed holder's stale lock, an orphaned claim, and an empty
+     crash-orphan are eventually reclaimed. This does **not** extend to *foreign*
+     objects at the path — a directory, a real user file, or non-`tok.` junk
+     content are deliberately *never* auto-removed; they wait at 97 for an
+     operator. "Eventual recovery" means lock-shaped orphans self-clear, not that
+     every bad state self-heals.
+   If a *safety* property can break, it is a bug; a *recovery* property failing
+   outside its envelope (e.g. a foreign object, an unreadable clock) is a
+   classified Tier-2/3 degradation, not a Tier-1 violation.
 2. **Best-effort within a stated envelope** — holds under normal/expected
    conditions, degrades gracefully (and *detectably*) under pathological ones.
    Everything wall-clock-bounded lives here, because wall-clock bounds depend on
@@ -93,6 +124,7 @@ robust-by-code-but-unverified · S static/grep check · (plat) platform-gated.
 | D5 | Case-insensitive FS path collision | Not handled explicitly | 3 | ✗ | **Likely non-issue;** see §D5. Decide. |
 | E1 | Network/shared FS (NFS/SMB/9p/Dropbox) | Outside design guarantees (stated) | 3 | ✗ | **Out of scope** (stated). See §E — decide whether to *enforce*. |
 | E2 | Multi-host clock skew / NTP jump | Implicitly single-clock; **not** addressed in docs | 3 (and a doc gap) | ✗ | **Out of scope** but UNDER-documented. See §E2. |
+| E3 | mtime probe unreadable (staleness clock broken) | Warns loudly once; treats as not-stale → safe, recovery disabled → 97 | 2 | ○ | **Accept** — fails safe + announced. See §E3. |
 | F1 | Disk full (ENOSPC) during create/write | Create fails → wait; torn write ages out | 2/3 | ○ (reasoned, not tested) | **Accept**, document. See §F1. |
 | F2 | ENOSPC during LOG write | Swallowed (`|| true`); silent log loss | 2 | ○ | **Accept;** logging is best-effort by design. |
 | F3 | Inode / FD exhaustion | Create fails → wait → 97 | 2 | ○ | **Accept**, document. |
@@ -104,6 +136,7 @@ robust-by-code-but-unverified · S static/grep check · (plat) platform-gated.
 | H1 | SIGINT/SIGTERM mid-hold | Release + re-raise (143); traps restored | 1 | ✓ U:577-600/1989-2011 | **In scope.** Keep (bash). ps1 = §H. |
 | H2 | EXIT-while-holding | Release + chain caller's EXIT trap | 1 | ✓ U:633-648 | **In scope.** Keep. |
 | H3 | ps1 process death under `-File` | `PowerShell.Exiting` does NOT fire; relies on stale window | 2 | ○ (limit documented) | **Accept;** `run` path is covered. See §H. |
+| H4 | Hard kill / `[Environment]::Exit()` while held | Bypasses release → a displaced holder is unwarned (no 98) | 2 | ~ (I:308-334 indirect) | **Document** the no-silent-loss boundary. See §H4. |
 | I1 | bash⇄pwsh wire/format compatibility | Shared format; token grammar tightened to match | 1 | ✓ I:* throughout | **In scope.** Keep. |
 | I2 | Mixed-VERSION tree (old unserialized steal) | Prevention degrades to detection (98); `.dead.*` litter | 3 | ✗ | **Out of scope:** "upgrade both together." Residual 4. |
 | J1 | Logging subsystem failure | All log writes `|| true`; 1 MB self-truncate | 2 | ○ | **Accept;** logging never blocks the lock. |
@@ -240,7 +273,14 @@ rival's rename installed *our* leaked claim as the lock → adopt the hold, or, 
 release, recognise our real hold was displaced, clean the leaked file
 best-effort, and report 98. The result is structural: **no process inside an
 acquire/hold/release arc can leave an *unowned* lock** (per-attempt tokens make
-the discovery read conclusive). *Tier 1.* Tested extensively: Test 31 (the four
+the discovery read conclusive). One scope nuance worth stating, because the
+memory is **process-local**: only the leaking process can *adopt* its own
+installed claim. If that process exits the arc first — times out (97), releases
+cleanly, or dies — *before* adopting, the installed claim becomes an unowned lock
+recovered by the ordinary staleness lane, never adopted by another process (this
+is exactly residual 5 / §B3). Per-attempt-token uniqueness still guarantees that
+lock can never be *mistaken* for owned by anyone, so there is **no false
+success** — the only cost is a bounded stall. *Tier 1.* Tested extensively: Test 31 (the four
 leaked lanes, including a real Windows no-delete-share feeder), Test 35
 (release-time cleanup of a leak installed over a held hold → 98), Test 36
 (inconclusive-read keeps the entry) (`U:1549-1758, 2013-2164`); ps1 parity in
@@ -252,21 +292,27 @@ machinery in the tool and the most thoroughly tested.
 These are the **load-bearing FS assumptions**. Where one does not hold, that is a
 real robustness boundary, not a bug to fix.
 
-**D1 — Atomic rename-over.** The steal installs by replacing the lock in one
-`rename(2)` with no path-absent window. bash uses GNU `mv -T` where available,
-probed once, with a guarded `[ -d ]` + bare-`mv` fallback on BSD/macOS
-(`git-commit-lock.sh:954-979`); pwsh 7 uses the 3-arg `File.Move(src,dst,true)`,
-**Windows PowerShell 5.1 has no such overload** and falls back to unlink-then-
-2-arg-Move (`git-commit-lock.ps1:941-982`). `File.Replace` is *deliberately
-never used* (throws on read-only dest; partial-failure states) — pinned by a
-static grep in interop Test 16d (`I:1141-1149`). **Boundary:** atomic-replace
-rename is guaranteed on local POSIX FS and NTFS (probe R1: 400 replaces, zero
-absent reads, `git-commit-lock.sh:380-382`); it is *not* guaranteed on some
-network filesystems (see §E). The 5.1 unlink+move lane has a real absent window,
-making it the one engine where a rival's create can win the recovered path —
-documented as a fairness loss, never a clobber (`docs/git-commit-lock.md:471-476`).
-*Tier 1 on local FS.* **Recommend: in scope on local FS; the network-FS boundary
-is §E.**
+**D1 — Steal install: atomic overwrite vs. the 5.1 fallback.** The steal installs
+its lock at the path by replacing whatever is there. There are two engine classes
+and they differ in atomicity — so this row is *not* uniformly "atomic rename":
+- **Atomic overwrite (the guaranteed lane):** one `rename(2)`-class replace with
+  no path-absent window. bash uses GNU `mv -T` where available, probed once, with
+  a guarded `[ -d ]` + bare-`mv` fallback on BSD/macOS
+  (`git-commit-lock.sh:954-979`); pwsh 7 uses the 3-arg `File.Move(src,dst,true)`
+  (`git-commit-lock.ps1:941-982`). Atomic replace is guaranteed on local POSIX FS
+  and NTFS (probe R1: 400 replaces, zero absent reads,
+  `git-commit-lock.sh:380-382`); *not* guaranteed on some network FS (§E).
+- **Windows PowerShell 5.1 fallback (NOT atomic, but claim-guarded):** 5.1 has no
+  3-arg overload, so it unlinks then does a 2-arg `Move` (`git-commit-lock.ps1:941-982`).
+  This lane has a real path-absent window in which a rival's *create* can win the
+  recovered path — a **fairness loss, never a clobber** (claim serialization still
+  admits one stealer; the loser re-polls), documented at
+  `docs/git-commit-lock.md:471-476`.
+`File.Replace` is *deliberately never used* (throws on read-only dest;
+partial-failure states) — pinned by a static grep in interop Test 16d
+(`I:1141-1149`). *The atomic lane is Tier 1 on local FS; the 5.1 fallback is Tier
+1 for safety (no clobber) but gives up rename atomicity (fairness only).*
+**Recommend: in scope on local FS; the network-FS boundary is §E.**
 
 **D2 — O_EXCL atomic create.** `set -C` noclobber redirect (bash) /
 `FileMode.CreateNew` with `FileShare.ReadWrite|Delete` (ps1,
@@ -367,12 +413,15 @@ principles about what can go wrong:
   `git-commit-lock.sh:925`) already absorbs the only real local clock glitch:
   the Windows FILETIME-zero (1601) transient on fresh files
   (`docs/git-commit-lock.md:283-293`, probed at 0.04–0.5% of readings).
-- A **backward NTP step / large clock correction** on the one host could make a
-  live lock look stale (premature steal) or a stale lock look fresh (delayed
-  recovery). The first is the dangerous one — but it degrades into the *already
-  handled* B5 lane: a premature steal of a still-live hold is detected at release
-  as 98, never a silent double-commit. So even a local clock jump is
-  **correctness-safe, liveness-degraded** — Tier 2.
+- A **large local clock correction** on the one host splits by sign, because
+  staleness is `age = now - mtime` (`git-commit-lock.sh:928, 1409`): a **forward**
+  jump (now leaps ahead) inflates the computed age, so a *live* lock can look
+  stale → premature steal; a **backward** jump (NTP steps back) shrinks the age,
+  so a genuinely *stale* lock can look fresh → delayed recovery. The
+  forward/premature-steal case is the only worrying one — and it degrades into the
+  *already handled* B5 lane: a premature steal of a still-live hold is detected at
+  release as 98 (given cooperative unwind), never a silent double-commit. So even
+  a local clock jump is **correctness-safe, liveness-degraded** — Tier 2.
 - **Cross-host** use over a shared FS (already E1-out-of-scope) is where skew
   would actually bite: host A's mtime compared against host B's `now` with
   minutes of skew could steal live locks wholesale. But this only arises *on a
@@ -388,6 +437,25 @@ server clock — and that this is *why* network/multi-host is out of scope; the
 current docs imply it but never say "one clock." (b) Note the reassuring part: a
 *local* clock jump is correctness-safe (degrades to the detected-98 lane), so no
 code change is warranted. This is a **doc gap, not a code gap.**
+
+**E3 — mtime probe fails entirely (the staleness clock is unreadable).** Distinct
+from a *wrong* clock (E2): here the lock file's mtime cannot be read at all. Both
+ports retry three times on a *present* file, then warn loudly once per process —
+bash via `stat -c %Y` / `stat -f %m` / `date -r` (`git-commit-lock.sh:629-645`),
+pwsh via `Get-Item.LastWriteTimeUtc` (`git-commit-lock.ps1:531-560`): *"Staleness
+detection is BROKEN: stale locks will never be stolen, so a crashed holder wedges
+waiters until MAX_WAIT."* The stale check then treats an unreadable mtime as **not
+stale** — the floor guard `[ "$mt" -gt 946684800 ]` fails closed to "fresh"
+(`git-commit-lock.sh:925-927`). **Safety is preserved**: the tool never steals a
+lock whose age it cannot establish, so no premature steal and no corruption — but
+**recovery of a genuinely crashed holder is disabled**, and waiters block to
+MAX_WAIT (97). *Tier 2 (safety held, recovery lost — and loudly announced).*
+Untested (no stat-failure injection). **Recommend: accept and document** — it is a
+host/FS-health failure the tool already detects and announces, and it fails *safe*
+(no false steal). Fault injection is low-ROI; the loud warning is the right
+behavior. This is also the clean reason recovery is a *Tier-1-within-envelope*
+property, not unconditional (see the tier split under §1): it presumes a readable
+clock.
 
 ### F. Resource exhaustion
 
@@ -487,6 +555,30 @@ backstop gap as documented** — the stale window recovers it, and the supported
 option is handle-based ops (`git-commit-lock.ps1:146-151`), a larger change not
 worth it for a forgetful-caller edge.
 
+**H4 — Hard process termination / `[Environment]::Exit()` while holding (the
+no-silent-loss boundary).** §1's safety guarantee — a displaced holder reports 98
+rather than a false success — relies on the wrapper *reaching its release path*.
+Two ways that doesn't happen while a lease is held: (a) the held process is
+SIGKILL'd (untrappable; no handler runs in either port); (b) the wrapped command
+itself ends the process abruptly, the sharpest case being PowerShell
+`[Environment]::Exit(n)`, which bypasses `Lock-Release`, the `finally`, *and* the
+`PowerShell.Exiting` backstop (`git-commit-lock.ps1:221-245`). If such a process
+was *already displaced* (its lease stolen past STALE) and exits **0**, its caller
+sees success with no 98 — the one interleaving that defeats "no silent lost
+update." Two bounds keep it narrow: a SIGKILL yields a non-zero wait status, so a
+caller that checks exit codes does *not* see success; and the `run` contract pairs
+acquire/release in `try/finally`, so only a command that *itself* hard-exits the
+process (or an external SIGKILL) skips release — a normal-returning or
+signal-trapped command always reaches it. The *next* holder still recovers via
+staleness; only the abruptly-exiting one is unwarned. *Tier 2 — the residual edge
+of the fail-open lease.* Exercised indirectly: interop Test 5 *uses*
+`[Environment]::Exit()` to fabricate a no-release orphan, confirming the bypass
+(`I:308-334`). **Recommend: document this as the explicit boundary of the
+no-silent-loss guarantee**, alongside the "commits must be fast" golden rule — a
+command that hard-exits mid-critical-section *after being displaced* is exactly
+the fail-open case the STALE budget exists to make rare. No code change closes it
+without the handle-based ops the design rejected (§H3).
+
 ### I. Cross-implementation
 
 **I1 — Wire/format compatibility.** One on-disk format (token line 1, owner line
@@ -499,7 +591,7 @@ lock (T4/T5), robbed-holder 98 both directions (T8), release-classification
 agreement (T11), cross-impl claim staleness clearing (T16c), and a Windows
 PowerShell 5.1 smoke lane (T17). **Recommend: in scope, keep — and keep the
 interop suite as the guard.** Two independent implementations hammering one lock
-is the cheap adversarial verification (`README.md:92-95`).
+is "cheap adversarial verification of the protocol" (`README.md:94`).
 
 **I2 — Mixed-version tree.** Prevention (the claim protocol) holds only when
 *all* parties run it; older releases stole with an unserialized move-aside, so a
@@ -507,8 +599,9 @@ mixed tree degrades prevention to detection (98) and can leave `.dead.*` litter
 current versions don't clean (residual 4, `git-commit-lock.sh:261-265`). *Tier
 3.* Untested (would require shipping an old version into the suite). **Recommend:
 out of scope; keep the "upgrade both implementations together" deployment note**
-(it's in `README.md` and the design doc). Acceptable because the degraded mode is
-still *detected* (98), never silent.
+— currently in the design doc only (`docs/git-commit-lock.md:251-255`), **not** in
+`README.md`; surface it there too, where operators actually look. Acceptable
+because the degraded mode is still *detected* (98), never silent.
 
 ### J. Logging subsystem failure
 
@@ -531,10 +624,15 @@ flakes are real gaps vs harness concerns.
 
 **The clean split: correctness is load-independent; liveness/latency is not.**
 
-- **Load-independent (Tier 1, must always hold):** mutual exclusion, no silent
-  lost update, no corruption, eventual recovery. These rest on O_EXCL create +
-  atomic rename + per-attempt-token discovery — *structural* properties that do
-  not reference the clock for their *correctness*. The mtime floor
+- **Load-independent (Tier 1 *safety*, must always hold):** no silent lost update
+  (given cooperative unwind, §1/§H4), no corruption, and strict mutual exclusion
+  *within the staleness window*. These rest on O_EXCL create + atomic rename +
+  per-attempt-token discovery — *structural* properties that do not reference the
+  clock for their *correctness*. (Recovery of lock-shaped orphans is also
+  load-independent in *correctness* — only its latency degrades — but it presumes
+  a readable clock, §E3, and does not extend to foreign objects, per the tier
+  split under §1.) The mtime
+  floor
   (`:925`) and the read-retry ladder (`:668-684`) exist precisely so that the
   one timing-sensitive input (mtime, and transient empty reads) cannot corrupt a
   correctness decision: a sub-floor or unsettled reading is treated as "wait,"
@@ -582,8 +680,11 @@ concern:**
    fix the TEST, not the code.** Two examples surfaced by the prior stress
    effort (which I verified independently against the code, not adopted):
    - *Test 21's `≤20s` recovery-latency assertion* (`U:1144`) and
-   - *Test 22(a)'s claim-warning timing* (which needs ≥2 blocked polls before
-     MAX_WAIT to fire the two-consecutive-poll-confirmed warning, `U:1162-1168`),
+   - *Test 22(a)'s claim-path warning* — the warning relies on the
+     two-consecutive-poll confirmation (the mechanism Test 17d pins for the lock
+     path) having poll *headroom* before MAX_WAIT, which an oversubscribed runner
+     can starve (`U:1156-1172`); the test asserts the warning fires, not a specific
+     poll count,
    - and *Test 29's `≥2 CLAIM lines` discriminator* (explicitly given `MAX_WAIT=6`
      headroom, `U:1514-1518`).
 
