@@ -436,3 +436,26 @@ Workflow once the final test count is known (plan D-e) — likely a Workflow for
   (`_harness.sh` extraction — also a large harness change) into one validated
   harness-restructure step near the end. **Revised phasing: 8.1 → 3 → 4 → 2A → 2B →
   (8.2 + 8.3 together) → 6.**
+- **Step (commit `4ee5899`) — Bucket 8 item 2 done** (`GCL_TEST_ONLY` selector). Each
+  top-level `== Test N: … ==` header in unit + interop became `if section "Test N: …";
+  then … fi` (each `fi` before the next `if section`, so trailing cleanup stays inside);
+  `section` runs a block iff `GCL_TEST_ONLY` is unset/empty or its regex matches, bumping
+  `SECTIONS_RUN`. Zero-match guard bails loudly (exit 1) on a set-but-non-matching regex
+  (no vacuous green). Integration note-and-ignores (one indivisible scenario). Built by 3
+  parallel sub-agents (one per suite), each self-validating byte-identical + selector
+  precision + the guard; orchestrator re-verified independently. Validated reduced: unit
+  315/0, interop 141/0, integration 12/0; selector precision proven (regex, trailing-colon
+  anchoring); `shellcheck -S style` clean.
+- **Step (commit `b8e2951`) — Bucket 8 item 3 done** (`tests/_harness.sh` extraction, 177
+  lines, net −42). Tier 1 (all three): inits + `GCL_TAP`/`GCL_TEST_ONLY` reads + `ok`/`bad`
+  + `section` + the `finish` sentinel + shared shellcheck disables + a unified
+  `selector_report` (so unit/interop match). Tier 2 (unit+interop, byte-identical-verified
+  first): `epoch_to_stamp`, `backdate`, `backdate_ghost`, `sync_waiting_fresh`,
+  `fabricate_lock`, `wait_for_grep`. Left per-suite: `cleanup` (closes over `$WORK`),
+  `clone_fn`+`export -f` (unit-only), `ok_envelope`/`bad_envelope` (unit-only), both poll
+  helpers (`wait_for_file` secs vs `wait_for` 50ms-iters — Tier 3, not unified), verdict
+  lines. CWD-independent sourcing (`BASH_SOURCE`) + `# shellcheck source=` directive;
+  `tests/_harness.sh` added to the CI lint list. Byte-identical (315/141/12), `shellcheck`
+  clean, selector/guard/integration-note all intact; orchestrator re-verified independently.
+- **(8.2 + 8.3 COMPLETE.) Next: Bucket 6 (CI matrix wiring).** Cross-platform CI verification
+  of these two commits pending (dispatch `tests.yml` on `ci-stress`).
