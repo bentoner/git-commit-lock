@@ -133,6 +133,7 @@ jobs:
             tests/git-commit-lock.test.sh \
             tests/git-commit-lock.interop.test.sh \
             tests/git-commit-lock.integration.test.sh \
+            .github/scripts/nightly-triage.sh \
             install.sh
 
       - name: PSScriptAnalyzer (gate at warning severity)
