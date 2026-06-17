@@ -1,6 +1,6 @@
 # Subplan: split the Windows unit CI leg into parallel shards
 
-Status: **PROPOSAL (Phase 2) — round-1 review folded; confirm round pending.** A small
+Status: **PROPOSAL (Phase 2) — rounds 1-2 review folded; final spot-confirm pending.** A small
 follow-on to the Bucket-6 CI work, building on the `section()`/selector machinery (commit
 `4ee5899`) and the shared `tests/_harness.sh` (`b8e2951`). No implementation until the review
 converges and Ben gives the go.
@@ -47,8 +47,31 @@ independent Codex. Dispositions (all FIXED in the body below; a confirm round st
    jobs; well under the concurrency ceiling.
 
 Round-1 verdicts: Reviewer A *needs-changes (1,2)*; Codex *not-sound-yet (1,2,3)*; Reviewer B
-*sound-to-implement*. All folded. **Confirm round (fresh reviewer) pending before declaring
-converged.**
+*sound-to-implement*. All folded.
+
+**Round 2 — confirm (2026-06-18)** — fresh Claude (*sound-to-implement*) + independent Codex
+(*not-sound-yet*: 2 accuracy defects). All FIXED below:
+
+9. **[Codex — FIXED] Union-proof run-line set understated.** `PASS:`/`FAIL:` alone undercounts:
+   `ok_envelope` emits `PASS[env]:` and (relaxed) `bad_envelope` emits `WARN[env-relaxed]:`,
+   which the "sum to 315" relies on. Run-line set is
+   `^(PASS:|FAIL:|PASS\[env\]:|WARN\[env-relaxed\]:)` (or use `GCL_TAP=1`). (Verification runs
+   already used the full regex; this corrects the prose.)
+10. **[Codex — FIXED] Guard does NOT catch an ungated test (was overclaimed).** A test *outside*
+    a `section()` block bumps neither `SECTION_IDX` nor `SECTIONS_RUN`, so the guard stays
+    balanced. Reframed honestly: the guard's value is the **empty-shard `expected ≥ 1`** check
+    + a cheap modulo cross-check (otherwise near-tautological in shard mode). **An ungated test
+    is caught by the union proof's no-duplicate check** (it runs in *both* shards).
+11. **[Claude — FIXED] `RAN:` marker gated on `GCL_TEST_SHARD` set** (shard logic; an
+    unconditional emit would break unsharded byte-identicality).
+12. **[Claude — FIXED] Explicit `selector_report` shard-guard snippet** added (gated on
+    `[ -n "$GCL_TEST_SHARD" ]`).
+
+Plus a **kcov-interaction** note (Ben asked): the coverage job runs the full suite unsharded;
+the sharding code is inert when `GCL_TEST_SHARD` is unset — no interaction.
+
+**Convergence:** the mechanism is verified sound by 4 reviewers across 2 rounds; round-2 fixes
+are validation-method/accuracy corrections. A final Codex spot-confirm follows before the go.
 
 ---
 
@@ -111,6 +134,23 @@ section() {
 (`SECTION_IDX` bumps unconditionally in file order — independent of `GCL_TEST_ONLY`/
 `GCL_TEST_SWEEP`/`GCL_TEST_FULL` — so it is the stable shard-assignment key.)
 
+The verdict helper `selector_report` (already called by the unit + interop suites) gains a
+shard branch, **gated so unsharded runs are untouched** (no `% SHARD_N=0`):
+
+```sh
+# in selector_report, when sharding is active:
+if [ -n "$GCL_TEST_SHARD" ]; then
+  exp=0; k=1
+  while [ "$k" -le "$SECTION_IDX" ]; do
+    [ $(( (k-1) % SHARD_N )) -eq $(( SHARD_I - 1 )) ] && exp=$((exp+1)); k=$((k+1))
+  done
+  echo "GCL_TEST_SHARD=$SHARD_I/$SHARD_N: ran $SECTIONS_RUN of $SECTION_IDX sections (expected $exp)"
+  if [ "$SECTIONS_RUN" -ne "$exp" ] || [ "$exp" -lt 1 ]; then
+    echo "Bail out! shard $SHARD_I/$SHARD_N ran $SECTIONS_RUN, expected $exp" >&2; exit 1
+  fi
+fi
+```
+
 ## Why round-robin (alternatives rejected)
 - **Round-robin by index (CHOSEN):** auto-balancing, **zero-maintenance** — new tests
   distribute themselves. Measured imbalance ~10% at n=2 (well within "roughly halve"); the
@@ -129,25 +169,31 @@ The risk: a shard scheme that drops a test reads green → silent coverage hole.
   `n`, the shards are a true partition (union == full, no overlap, no drops) — by construction,
   as long as every test goes through `section()` (all 57 do).
 - **Self-contained per-shard guard (belt-and-suspenders).** In the suite verdict (extend
-  `selector_report`), when `GCL_TEST_SHARD` is set, compute the **expected** run-count the
-  shard already has all the info for — `expected = #{k in 1..SECTION_IDX : (k-1)%n == (i-1)}`
-  — and assert `SECTIONS_RUN == expected` **and `expected ≥ 1`**; **bail loudly** otherwise.
-  Because `GCL_TEST_ONLY` and `GCL_TEST_SHARD` are mutually exclusive, this exact-count assert
-  *always* applies in shard mode (no selector-composition fallback needed). **What it actually
-  catches:** a **`section()`-coverage regression** — a test added *outside* the `section()`
-  gate, so it stops bumping `SECTION_IDX` (NOT a "modulo bug": a wrong `%` would be *correlated*
-  between `section()` and this guard, which recomputes the same arithmetic). No cross-job
-  artifacts, no unsharded baseline (each shard sees all `SECTION_IDX` calls). The `expected ≥ 1`
-  clause also catches the `n` > section-count misconfiguration (e.g. `58/58`).
+  `selector_report`), when `GCL_TEST_SHARD` is set, compute
+  `expected = #{k in 1..SECTION_IDX : (k-1)%n == (i-1)}` and assert `SECTIONS_RUN == expected`
+  **and `expected ≥ 1`**; **bail loudly** otherwise. (Mutual exclusion of `GCL_TEST_ONLY`/
+  `GCL_TEST_SHARD` makes this always-valid in shard mode.) **What it actually catches, stated
+  honestly:** the high-value part is the **empty-shard misconfiguration** (`expected==0` when
+  `n` > section-count, e.g. `58/58`) via the `expected ≥ 1` clause; plus a cheap cross-check
+  that the gate's modulo and the verdict's modulo agree. It is otherwise **near-tautological**
+  in pure-shard mode (`SECTIONS_RUN` and `expected` both derive from the same `SECTION_IDX` via
+  the same arithmetic), and it does **NOT** catch a test added *outside* a `section()` block
+  (that bumps neither counter, so the accounting stays balanced) — that case is caught by the
+  union proof's no-duplicate check below. No cross-job artifacts, no unsharded baseline.
 - **Existing guards still apply per shard:** the `finish`/`DONE` sentinel (a shard that dies
   early bails) and the `1..$TAPN` plan line (partial-but-correct per shard). Note the *existing*
   `selector_report` zero-match guard is gated on `GCL_TEST_ONLY` non-empty, so it does NOT fire
   in pure-shard mode — the new `expected ≥ 1` clause is what covers an empty shard.
 - **Local union proof (one-time implementation sanity check; secondary to the by-construction
-  guarantee).** Once during implementation, run `GCL_TEST_SHARD=1/2` and `=2/2` and assert their
-  **`PASS:`/`FAIL:` line sets** (run-only — a *skipped* test emits none; the `== Test N ==`
-  headers do NOT work here because `section()` prints them before gating) union to the full
-  unsharded set with no duplicates. Not a standing CI step.
+  guarantee — and the only thing that catches an ungated test).** Once during implementation,
+  run `GCL_TEST_SHARD=1/2` and `=2/2` and assert their **run-line sets** union to the full
+  unsharded set **with no duplicates**. The run-line set is the assertion lines (run-only — a
+  *skipped* test emits none; the `== Test N ==` headers do NOT work, since `section()` prints
+  them before gating): `^(PASS:|FAIL:|PASS\[env\]:|WARN\[env-relaxed\]:)` — note `ok_envelope`
+  emits `PASS[env]:` and relaxed `bad_envelope` emits `WARN[env-relaxed]:`, so a bare
+  `PASS:`/`FAIL:` grep would undercount the 315 — or simply diff `GCL_TAP=1` TAP counts. The
+  **no-duplicate** half is what catches a test accidentally left *outside* a `section()` gate
+  (it would run in both shards → appear twice). Not a standing CI step.
 
 ## Interaction with existing machinery
 - **`GCL_TEST_ONLY` vs `GCL_TEST_SHARD`: mutually exclusive** (bail if both set). No real use
@@ -175,8 +221,15 @@ The risk: a shard scheme that drops a test reads green → silent coverage hole.
 - **Artifact name** gains the shard: `test-logs-${{ matrix.os }}-${{ matrix.leg }}${{ matrix.shard && format('-{0}', matrix.shard) || '' }}` → `…-unit-1`/`…-unit-2` (v4+ rejects duplicate names); other cells' names are byte-identical to today.
 - The job-name template (already includes `leg`) gains the shard so the two unit jobs are distinguishable.
 - **Scope:** Windows unit **only**. Do NOT shard the fast legs (interop, integration, all of
-  ubuntu/macos), `nightly.yml` (background, not dev-blocking; optional future), or the **kcov**
-  job (coverage needs the whole suite in one process — sharding would break it).
+  ubuntu/macos) or `nightly.yml` (background, not dev-blocking; optional future).
+- **kcov coverage is orthogonal — leave it whole.** The kcov job (`nightly.yml`, Linux) runs
+  the **full unit suite unsharded** in one process, because line coverage of `git-commit-lock.sh`
+  is only meaningful measured across the whole suite in one run, and it's gated on the 0.80
+  floor. It never sets `GCL_TEST_SHARD`, and the sharding code is **inert when `GCL_TEST_SHARD`
+  is unset** (lazy parse → no shard gate), so the kcov run is byte-identical to today — no
+  interaction with this change. (If one ever wanted coverage *from* sharded runs, kcov can merge
+  per-shard output dirs, but that's strictly more machinery for no gain over the single whole
+  run — so we don't.)
 - **Runner budget:** 4 test cells + `lint` = 5 jobs today → 5 test cells + `lint` = 6 jobs;
   well under GitHub's concurrency ceiling — no queueing.
 
@@ -184,9 +237,11 @@ The risk: a shard scheme that drops a test reads green → silent coverage hole.
 - Each sharded run logs one greppable verdict line: `GCL_TEST_SHARD=i/n: ran R of T sections
   (expected E)` — captured in the CI suite log (`tee … unit-suite.log`) and the uploaded
   artifact, so a future agent can reconstruct which shard ran what.
-- For per-test attribution, `section()` emits a **run-only** marker (e.g. `RAN: <label>` inside
-  the `SECTIONS_RUN++` branch) — needed because the `== Test N ==` headers print for *skipped*
-  tests too (header echoed before gating), so they are not a run-set.
+- For per-test attribution in a sharded run, `section()` emits a **run-only** marker
+  (e.g. `RAN: <label>`) **only when `GCL_TEST_SHARD` is set** (it is shard logic — an
+  unconditional emit would add lines to unsharded runs and break byte-identicality) — needed
+  because the `== Test N ==` headers print for *skipped* tests too (echoed before gating), so
+  they are not a run-set.
 - The guard's failure is a loud `Bail out! shard i/n ran R, expected E` → the step fails and
   the per-shard CI job name (`… (unit, shard 1)`) makes the red attributable.
 
@@ -196,9 +251,11 @@ The risk: a shard scheme that drops a test reads green → silent coverage hole.
    the `selector_report` expected-count/`expected ≥ 1` guard. Integration suite: add the
    `GCL_TEST_SHARD` note-and-ignore (no parse).
 2. **Local proof:** confirm (a) default (no shard) byte-identical — unit 315/0, interop 141/0
-   (current counts); (b) `GCL_TEST_SHARD=1/2` + `=2/2` run disjoint halves whose **`PASS:`/`FAIL:`
-   sets** union to the unsharded set (sum to 315) with no dup, and whose section counts sum to
-   57; (c) the guard fires when a test is moved *outside* a `section()` gate, and bails when
+   (current counts); (b) `GCL_TEST_SHARD=1/2` + `=2/2` run disjoint halves whose **run-line
+   sets** (`^(PASS:|FAIL:|PASS\[env\]:|WARN\[env-relaxed\]:)`) union to the unsharded set
+   (sum to 315) with no dup, and whose section counts sum to 57; (c) the **union proof's
+   no-duplicate check** catches a test left *outside* a `section()` gate (it runs in both
+   shards) — the guard does NOT (an ungated test bumps neither counter); the guard bails when
    `expected==0` (`58/58`); (d) malformed `GCL_TEST_SHARD` — `1/0`, `3/2`, `a/b`, `1/`, `/2`,
    `2/3/4`, `08/10` — each bails cleanly, and `GCL_TEST_ONLY`+`GCL_TEST_SHARD` together bails;
    `''` is a no-op; (e) integration with `GCL_TEST_SHARD` set prints the ignore note and runs
