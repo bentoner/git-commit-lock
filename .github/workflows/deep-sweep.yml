@@ -1,0 +1,187 @@
+# deep-sweep — Tier D of the load-testing strategy (docs/load-testing-strategy.md §9).
+#
+# ON-DEMAND ONLY. This workflow is `workflow_dispatch`-only: it NEVER runs on push
+# or pull_request, and it NEVER gates anything (it is not a required check — this is
+# a single-dev project with no branch protection; see the Phase-2 build plan's
+# Bucket 6 decision box). It exists purely as a deep flake-hunting tool — the
+# "50-clean hunt" instrument from the load-testing strategy: dispatch it (often many
+# times in parallel), pick a stress kind/magnitude, and repeat the full suite N
+# times per job to surface intermittent, scheduling-sensitive flakes that a single
+# zero-load per-PR run would never reproduce.
+#
+# Deep + loaded runs are SLOW (heavy CPU/disk oversubscription stretches every
+# wall-clock-derived step), so timeouts here are deliberately generous and the
+# envelope tier defaults to `relax` (an oversubscribed runner must not turn a
+# latency miss into a red — only a real correctness FAIL should).
+#
+# The job names are intentionally distinct (`deep-*`). With no branch protection
+# there is no required `tests-passed` context to avoid publishing, so this is now
+# only cosmetic / for clarity — but kept so a deep run is never confused with the
+# per-PR `tests` matrix in the checks UI.
+
+name: deep-sweep
+
+on:
+  workflow_dispatch:
+    inputs:
+      stress_kind:
+        description: 'Background load kind to apply via tests/with-load.sh'
+        type: choice
+        options: [none, cpu, disk, both]
+        default: both
+      stress_load:
+        description: 'Raw per-kind hog count override (GCL_STRESS_LOAD). Blank = use the ratio.'
+        type: string
+        default: ''
+      repeat:
+        description: 'How many times to repeat the suite run within each job (intermittent-flake hunt).'
+        type: string
+        default: '1'
+      envelope_tier:
+        description: 'GCL_ENVELOPE_TIER — relax (default) warns on latency misses; strict fails them.'
+        type: string
+        default: relax
+
+# Per-run-unique group so MANY parallel dispatches each get their own group and run
+# concurrently (a fresh dispatch never cancels or is cancelled by an in-flight one);
+# cancel-in-progress:false means a re-dispatch into the same run_id (impossible —
+# run_id is unique per run) would still queue rather than cancel. In practice every
+# dispatch is its own run, so the deep sweeps fan out freely and accept queue waves.
+concurrency:
+  group: deep-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deep:
+    name: deep-${{ matrix.os }}${{ matrix.leg != 'all' && format(' ({0})', matrix.leg) || '' }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false               # every cell's verdict is a useful deep signal; let the rest finish
+      matrix:
+        # Mirrors the tests.yml 4-cell set (ubuntu all / macos all / windows unit /
+        # windows interop+integration). Windows stays split because the bash-only
+        # unit suite is the wall-clock bottleneck there and the suites must not run
+        # concurrently inside one timing-sensitive 2-core runner. Generous deep
+        # timeouts: deep + loaded + repeated is far slower than the per-PR gate.
+        include:
+          - { os: ubuntu-24.04, leg: all, job_timeout: 180 }
+          - { os: macos-15, leg: all, job_timeout: 180 }
+          - { os: windows-2025, leg: unit, job_timeout: 120 }
+          - { os: windows-2025, leg: interop-integration, job_timeout: 120 }
+    timeout-minutes: ${{ matrix.job_timeout }}   # backstop only: repeat * (loaded suite budgets) + upload headroom
+    defaults:
+      run:
+        shell: bash                  # on windows-2025 this is Git Bash (MINGW) — what the interop suite requires
+    env:
+      GCL_TEST_FULL: 1               # full fan-out — CI runners are dedicated
+      GCL_TEST_SWEEP: 1              # deep runs exercise the Axis-A waiter-count sweep too
+      GCL_ENVELOPE_TIER: ${{ inputs.envelope_tier }}
+      GCL_STRESS_KIND: ${{ inputs.stress_kind }}
+      GCL_STRESS_LOAD: ${{ inputs.stress_load }}   # blank => with-load.sh falls back to the ratio
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0   # v6.0.3, SHA-pinned
+        with:
+          persist-credentials: false   # no job uses the token after fetch
+
+      - name: Toolchain versions (for reconstructing failures)
+        run: |
+          uname -a
+          bash --version | head -1
+          git --version
+          if command -v pwsh >/dev/null; then
+            pwsh -NoProfile -Command '"pwsh " + $PSVersionTable.PSVersion.ToString()'
+          else
+            echo "pwsh: NOT FOUND (interop suite will skip; integration runs bash-only)"
+          fi
+          if command -v powershell >/dev/null; then
+            powershell -NoProfile -Command '"powershell " + $PSVersionTable.PSVersion.ToString()'
+          else
+            echo "powershell (Windows PowerShell 5.1): NOT FOUND (interop Test 17 skips; expected on POSIX legs)"
+          fi
+          stat --version 2>/dev/null | head -1 || echo "stat: BSD variant"
+          command -v stress-ng >/dev/null && stress-ng --version | head -1 || echo "stress-ng: NOT FOUND (with-load.sh uses the portable spinner)"
+          echo "dispatch inputs: kind=${GCL_STRESS_KIND} load='${GCL_STRESS_LOAD}' repeat=${{ inputs.repeat }} envelope=${GCL_ENVELOPE_TIER}"
+
+      # Each suite is repeated `repeat` times under load. The loop fails fast: the
+      # first failing iteration `exit 1`s the step (so the step — and job — go red on
+      # the earliest flake), and every iteration names its index in the log so a
+      # failure is attributable to a specific repeat. `set -e` is NOT in effect
+      # (default bash here), so we check with-load.sh's propagated rc explicitly.
+      - name: Unit suite (deep, looped x repeat, under load)
+        if: ${{ matrix.leg == 'all' || matrix.leg == 'unit' }}
+        timeout-minutes: ${{ matrix.os == 'windows-2025' && 100 || 90 }}
+        env:
+          GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/unit
+        run: |
+          mkdir -p test-output
+          n='${{ inputs.repeat }}'
+          case "$n" in ''|*[!0-9]*) n=1 ;; esac
+          [ "$n" -lt 1 ] && n=1
+          echo "== unit: repeating $n time(s) under load =="
+          for i in $(seq 1 "$n"); do
+            echo "== unit iteration $i/$n =="
+            bash tests/with-load.sh bash tests/git-commit-lock.test.sh 2>&1 \
+              | tee "test-output/unit-suite.iter$i.log"
+            rc=${PIPESTATUS[0]}
+            if [ "$rc" -ne 0 ]; then
+              echo "== unit iteration $i/$n FAILED (rc=$rc) — stopping deep sweep =="
+              exit 1
+            fi
+          done
+
+      - name: Interop suite (deep, looped x repeat, under load)
+        if: ${{ !cancelled() && (matrix.leg == 'all' || matrix.leg == 'interop-integration') }}   # run even if an earlier suite failed — every signal is useful
+        timeout-minutes: 90
+        env:
+          GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/interop
+        run: |
+          mkdir -p test-output
+          n='${{ inputs.repeat }}'
+          case "$n" in ''|*[!0-9]*) n=1 ;; esac
+          [ "$n" -lt 1 ] && n=1
+          echo "== interop: repeating $n time(s) under load =="
+          for i in $(seq 1 "$n"); do
+            echo "== interop iteration $i/$n =="
+            bash tests/with-load.sh bash tests/git-commit-lock.interop.test.sh 2>&1 \
+              | tee "test-output/interop-suite.iter$i.log"
+            rc=${PIPESTATUS[0]}
+            if [ "$rc" -ne 0 ]; then
+              echo "== interop iteration $i/$n FAILED (rc=$rc) — stopping deep sweep =="
+              exit 1
+            fi
+          done
+
+      - name: Integration suite (deep, looped x repeat, under load)
+        if: ${{ !cancelled() && (matrix.leg == 'all' || matrix.leg == 'interop-integration') }}
+        timeout-minutes: 60           # its internal AGENT_LOCK_MAX_WAIT cap is 240s; x repeat under load
+        env:
+          GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/integration
+        run: |
+          mkdir -p test-output
+          n='${{ inputs.repeat }}'
+          case "$n" in ''|*[!0-9]*) n=1 ;; esac
+          [ "$n" -lt 1 ] && n=1
+          echo "== integration: repeating $n time(s) under load =="
+          for i in $(seq 1 "$n"); do
+            echo "== integration iteration $i/$n =="
+            bash tests/with-load.sh bash tests/git-commit-lock.integration.test.sh 2>&1 \
+              | tee "test-output/integration-suite.iter$i.log"
+            rc=${PIPESTATUS[0]}
+            if [ "$rc" -ne 0 ]; then
+              echo "== integration iteration $i/$n FAILED (rc=$rc) — stopping deep sweep =="
+              exit 1
+            fi
+          done
+
+      - name: Upload deep-sweep artifacts (logs + load manifests, on success too)
+        if: ${{ always() }}   # deep runs want the negatives to read the positives; upload even when green or cancelled
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1, SHA-pinned
+        with:
+          name: deep-logs-${{ matrix.os }}-${{ matrix.leg }}-${{ inputs.stress_kind }}   # unique per (os, leg, kind)
+          path: test-output/
+          include-hidden-files: true   # lock logs + the load-manifest live under the scratch .git/ and test-output/; suite-generated, no secrets
+          if-no-files-found: warn
+          retention-days: 14
