@@ -272,6 +272,28 @@ The risk: a shard scheme that drops a test reads green → silent coverage hole.
 5. Commit incrementally under the lock; ships with `ci-stress` and lands on `main` via the same
    merge PR.
 
+## Results (CI verification, 2026-06-18 — run 27723744798, all green)
+Implemented in `a01a8e3` (harness mechanism) + `2de66ff` (tests.yml). Local proof passed
+(unsharded byte-identical 315/141; shards disjoint, union==unsharded no-dup, 148+167=315 /
+29+28=57; malformed bails; lint clean). CI cross-platform run **succeeded**, both shards green:
+
+| | windows-unit | macos | ubuntu | win-interop | overall (slowest) |
+|---|---|---|---|---|---|
+| **before** (`27716080146`) | **360s** | 194s | 182s | 140s | **360s** |
+| **after** (`27723744798`) | shard1 **242s** ‖ shard2 **99s** | 210s | 181s | 142s | **242s** |
+
+- **Overall CI 360s → 242s (≈33% faster); windows-unit is no longer the ~2× outlier** (242s ≈
+  macos 210s). The stated goal (windows-unit "twice as long as everything else") is met.
+- **Balance was poor: 242 vs 99 (≈2.4×), NOT the planned ~10%.** Root cause: the ~10% estimate
+  used **reduced-mode** per-section timings, but CI runs **full mode** (`GCL_TEST_FULL=1`), where
+  the full-only 8×25 canary (Test 1 → index 1 → shard 1) and other heavies cluster in shard 1.
+  **Lesson: estimate shard balance from the mode CI actually runs.**
+- **Decision — accept as-is (recommended):** a perfectly balanced split (~170/170) could not beat
+  **macos's 210s**, which becomes the floor, so re-balancing would gain only ~32s more (242→210)
+  while reintroducing the maintained cost-table this plan deliberately rejected. The 118s win is
+  already captured; round-robin's imbalance is an acceptable, zero-maintenance trade. (Mechanism
+  is correct + green regardless of balance.)
+
 ## Out of scope
 - Sharding the interop/integration suites or the nightly/deep-sweep tiers; `n>2` or cross-OS
   extension (the harness is already `n`-generic — only the CI string is 2-bound).
