@@ -39,7 +39,7 @@ line anchors are current-tree and may drift (re-locate at build).
 | **A3** | `foreign` claim-recheck branch (`:1103-1106`; kcov hits=0) | shadow the claim read at recheck to return a *foreign* token (a clearer removed our claim, a rival re-claimed) | leave the foreign claim; discovery read; back off; no 98-on-mere-claim | all | MED-HIGH |
 | **A4** | `exec`-bypass / §H4 no-silent-loss boundary (`lock_run` runs `"$@"` in the wrapper shell, `:1733`) | **(corrected, verified empirically)** the exec must run in the lock-holding shell: `run -- exec true` or sourced `lock_acquire; exec true` — **NOT** `run -- bash -c 'exec true'` (that execs a child, releases normally) | (a) benign: no `RELEASED` line / lock left held; (b) displaced (backdated lease + parked contender) + exec 0 → caller sees 0 with **no** 98 — pins `guarantees.md` OOS-5 | all (bash) | **HIGH** — the one silent-loss boundary |
 | **A5** | forward clock-jump → premature steal of a live lock (§E2; `:928,1409`) | `clone_fn _lock_now` to return now+offset on the poll while the live holder's mtime stays current | the live lock is judged stale and stolen; the victim's release hits **98** (clock-driven analogue of Test 4b) | all | MED |
-| **A6** | mtime-unreadable fail-safe (§E3; `:639-645`, consumed `:912-926`) | `clone_fn` the mtime helper (`_lock_path_mtime` / its `stat` shadow) to return empty on a *present* file | warn-once "Staleness detection is BROKEN"; **no steal**; waiter → 97; (closes BE-3's "coverage planned") | all (bash; + ps1 parity if feasible) | MED |
+| **A6** | mtime-unreadable fail-safe (§E3; `:639-645`, consumed `:912-926`) | `clone_fn _lock_stat_mtime` (the **inner** stat probe at `:606`) to return empty on a *present* file — **NOT** `_lock_path_mtime`, which is the function that *emits* the warn-once (`:639-643`); shadowing it would defeat the assertion | warn-once "Staleness detection is BROKEN"; **no steal**; waiter → 97; (closes BE-3's "coverage planned") | all (bash; + ps1 parity if feasible) | MED |
 | **A7** | malformed/unreadable content classification tails (`_lock_verify_stale` `:940-949`; in-acquire steal guard `:1429-1443`; claim-stale-check `:1240-1249`) | fabricate a line-1-whitespace file (non-empty blank line 1 = `#18`); shadow a read-fault (`#17`) | no steal; the right `not a lock/claim file` / `unreadable` warning; covers several sibling branches per test | all | LOW-MED (cheap, multi-branch) |
 | **A8** | socket & device-node wrong-type arms (`:1474-1475` claim, `:1561-1562` lock; kcov-new) | bind a unix socket / reference a device node (`/dev/null`) at the path | refusal (never stolen/deleted); the `-S`/`-b`/`-c` arms execute | POSIX | LOW (cheap; sibling of tested guard) |
 | **A9** | log rotation past 1 MB (`:558-559`; kcov-new) | pre-write a >1 MB `$AGENT_LOCK_LOG`, trigger a log call | truncate-restart (log shrinks; lock unaffected) | all | LOW (trivial, no injection) |
@@ -77,7 +77,10 @@ F3 in the first cut) based on the feasibility results.
   validated. *(Decision point for Ben — see Open decisions.)*
 - **Document-only:** F3 (and F1 if Ben prefers zero root in the suite). Note the validated
   behavior in `failure-modes.md` §F1/§F3 (the empty-orphan→97 path) rather than shipping a
-  flaky/non-portable test.
+  flaky/non-portable test. **This supersedes `steering-coverage.md` §3 B4's "portable POSIX"
+  rating and the failure-modes §4.5/Q5 "`ulimit -n` for FDs" suggestion** — the empirical
+  check shows the create needs ~1 FD, so no `ulimit -n` fails it without first starving
+  bash's own startup (harness corruption). `steering-coverage.md` B4 is corrected to match.
 
 **Implementation notes (match existing idioms):** use the `LOCK`/`LOG`/`AGENT_LOCK_*` env
 vocabulary and the `rc=$?; [ "$rc" = 97 ] && ok … || bad …` + `grep -q "TIMEOUT after"`
@@ -148,11 +151,20 @@ then — same signature, so the later move is mechanical):
 ```bash
 ENVELOPE_TIER="${GCL_ENVELOPE_TIER:-strict}"   # default strict; nightly/deep set relax
 ENV_WARN=0
-ok_envelope()  { echo "PASS[env]: $*"; PASS=$((PASS+1)); }
-bad_envelope() {   # the FAIL branch of a wall-clock/poll-count (Tier-2) assertion only
-  if [ "$ENVELOPE_TIER" = relax ]; then echo "WARN[env-relaxed]: $*"; ENV_WARN=$((ENV_WARN+1))
-  else echo "FAIL: $*"; FAIL=$((FAIL+1)); fi
-}
+# TAP-aware (Bucket 8 item 1 lands FIRST, so TAPN/GCL_TAP already exist — review catch).
+# An envelope PASS is a normal `ok`; an envelope FAIL is a hard `bad` in strict, but in
+# relax it is a TAP-passing line with a `# env-relaxed` directive — it counts toward the
+# 1..N plan and bumps ENV_WARN (for triage), and NEVER reds the run.
+ok_envelope()  { PASS=$((PASS+1)); TAPN=$((TAPN+1)); echo "PASS[env]: $*"
+                 [ "${GCL_TAP:-0}" = 1 ] && echo "ok $TAPN - $*"; return 0; }
+bad_envelope() {
+  if [ "$ENVELOPE_TIER" = relax ]; then
+    ENV_WARN=$((ENV_WARN+1)); TAPN=$((TAPN+1)); echo "WARN[env-relaxed]: $*"
+    [ "${GCL_TAP:-0}" = 1 ] && echo "ok $TAPN - $* # env-relaxed"
+  else
+    FAIL=$((FAIL+1)); TAPN=$((TAPN+1)); echo "FAIL: $*"
+    [ "${GCL_TAP:-0}" = 1 ] && echo "not ok $TAPN - $*"
+  fi; return 0; }
 ```
 
 - **`ok`/`bad` = the strict-correctness tier** (always hard, both tiers);
@@ -163,9 +175,16 @@ bad_envelope() {   # the FAIL branch of a wall-clock/poll-count (Tier-2) asserti
   `*_envelope` on the *wall-clock* assertion only; every neighbouring correctness
   assertion (rc=97, no-steal, dir-untouched, STOLE-BY-CLAIM, …) **keeps `ok`/`bad`**:
   - **Test 21** `:1144` — recovery latency `≤20s`.
-  - **Test 22a** `:1167` (warning fired — relies on two-poll-confirm headroom),
-    `:1170` (fired exactly once), and `:1168` (warning names the type — contingent
-    on the same starved warning). The never-steal / never-delete assertions stay strict.
+  - **Test 22a** — downgrade ONLY the *warning-fired-at-all* assertion (`:1167`,
+    `grep -q "is not a claim file"`, i.e. count `≥1`), which depends on two-poll-confirm
+    headroom under load. Keep the warn-once **correctness** strict: **split** the current
+    `n==1` check (`:1170`) into `n≥1` (→ `bad_envelope`, timing) **+** `n≤1` (→ `bad`,
+    strict — the dedup property: never warns twice), and **guard** "names the type"
+    (`:1168`) on a warning having fired (assert strictly only when `n≥1`). So a real
+    warn-once regression (n≥2, or wrong type) stays a hard FAIL even under `relax`.
+    (Mapping `:1167`/`:1168`/`:1170` verified against the current tree — a reviewer's
+    alternate line numbers were a mislocation; re-confirm at build.) The never-steal /
+    never-delete assertions (`:1171`/`:1172`) stay strict.
   - **Test 29** `:1531` — `≥2` CLAIM lines (poll-count).
 - **Required CI sets `strict` (or leaves it unset)** — at zero artificial load the
   three pass comfortably, so the gate behavior is unchanged; **nightly/deep set
@@ -177,11 +196,24 @@ bad_envelope() {   # the FAIL branch of a wall-clock/poll-count (Tier-2) asserti
 
 ## Bucket 6 — CI matrix wiring (the accepted load-strategy §9 decisions)
 
-**Two-workflow structure:** keep `tests.yml` for **Tier R (required)** + **Tier D
-(deep dispatch)**; add a new `nightly.yml` for **Tier N (nightly)** + the kcov job +
-triage. Rationale: the nightly tier is non-blocking and must never be a required
-check, so a separate workflow keeps its `concurrency`, `issues: write` permission,
-and schedule independent of the gate.
+**Three-workflow structure** (revised after review — a `workflow_dispatch` run
+publishes check contexts on the head SHA, so keeping Deep in `tests.yml` under shared
+job names risks a failed Deep run gating a PR; separate files + a stable required
+aggregator remove that risk *and* the event-conditional concurrency):
+- **`tests.yml`** — Tier R (required): the 4-cell `test` matrix + `lint` + a single
+  stable **`tests-passed` aggregator** (`needs: [test, lint]`, `if: always()`, succeeds
+  iff every needed job *succeeded or was skipped*). **Branch protection requires ONLY
+  `tests-passed`**, not the per-cell matrix contexts. Concurrency: `group: ${{
+  github.workflow }}-${{ github.ref }}` + `cancel-in-progress`.
+- **`nightly.yml`** — Tier N + the kcov job + triage (`issues: write`, `schedule`, its
+  own `concurrency: nightly`).
+- **`deep-sweep.yml`** — Tier D (`workflow_dispatch` only), with **distinct job names**
+  (`deep-*`) so it never publishes the `tests-passed` context, and per-run-unique
+  concurrency.
+This also fixes the **`paths-ignore`-on-required gotcha** cleanly: path-filter the
+expensive `test`/`lint` jobs (they *skip* on doc-only PRs) while `tests-passed` always
+runs and reports green (its needs were skipped, not failed) — so a doc-only PR satisfies
+the one required context without the expensive jobs running.
 
 **Tier R — Required / per-PR (blocking), `tests.yml`.** The current 4 cells
 unchanged (ubuntu all / macos all / windows unit / windows interop+integration),
@@ -203,19 +235,13 @@ ghosts + 5.1 unlink-then-move under churn), N6 windows unit/both. 6 cells + kcov
 triage ≈ 8 jobs → one wave under the ~20/5 ceiling. Nightly steps keep the raised
 timeouts (correct here).
 
-**Tier D — Deep sweep (on-demand, never gates), `tests.yml`.** `workflow_dispatch`
-only, inputs `stress_kind`/`stress_load`/**`repeat`**/`envelope_tier` (default relax).
-**The key mechanism that lets Deep + Required coexist in one file** — an
-event-conditional concurrency group so the per-run-unique group never leaks onto the
-gate:
-```yaml
-concurrency:
-  group: >-
-    ${{ github.event_name == 'workflow_dispatch'
-        && format('{0}-deep-{1}', github.workflow, github.run_id)
-        || format('{0}-{1}', github.workflow, github.ref) }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
-```
+**Tier D — Deep sweep (`deep-sweep.yml`, `workflow_dispatch` only, never gates).**
+Inputs `stress_kind`/`stress_load`/**`repeat`**/`envelope_tier` (default relax). Its
+jobs use **distinct names** (`deep-*`) so a failed dispatch never publishes the
+`tests-passed` required context (the review catch), with per-run-unique concurrency
+(`group: deep-${{ github.run_id }}`, `cancel-in-progress: false`) so many parallel
+dispatches each run and accept queue waves. Living in its own file removes any need for
+an event-conditional concurrency expression.
 
 **Axis-A waiter-count sweep {4,12,24}** under `GCL_TEST_SWEEP=1` (nightly/deep only;
 unset per-PR → today's floor `N=4`, deterministic). A `T_AXIS_A` list read at suite
@@ -262,11 +288,10 @@ sha}`) uploaded on success too.
 
 **§7 GitHub-Actions gotchas the diff MUST honor:**
 - **`paths-ignore` on a *required* check blocks doc-only PRs** (skipped workflow → checks
-  Pending → merge blocked). The current `tests.yml` has both `paths-ignore` and the
-  required jobs. **Fix (required, not optional):** keep the workflow always-running and
-  path-filter only the expensive `test`/`lint` *steps*, with a tiny always-green job
-  satisfying the required check on doc-only PRs (recommended), or make a separate cheap
-  job the required check.
+  Pending → merge blocked). **Fixed** by the `tests-passed` aggregator above: it is the
+  sole required context and always runs (green when the path-filtered `test`/`lint` jobs
+  skip), so doc-only PRs merge. Branch protection must require **`tests-passed`**, NOT the
+  per-cell matrix contexts (else skipped cells sit Pending).
 - **`max-parallel` is intra-matrix only** — bound Deep/Nightly with workflow-level
   `concurrency` groups (done), never `max-parallel`.
 - **`schedule` auto-disables after ~60 days of repo inactivity** — note in `nightly.yml`;
@@ -311,7 +336,10 @@ last assertion before the next header — those lines must move *inside* the `fi
 accumulator (Test 3 audits 1+2's output), so it is one indivisible scenario — it
 must *note-and-ignore* `GCL_TEST_ONLY` (loud stderr note), never per-block select.
 Unit first; interop the same treatment (lower priority). Anchoring tip for docs:
-`'Test 2'` also matches `Test 2b/20/25` — use `'Test 2:'` / `'Test 2b'`.
+`'Test 2'` also matches `Test 2b/20/25` — use `'Test 2:'` / `'Test 2b'`. **Zero-match
+guard (review catch):** `section` bumps a `SECTIONS_RUN` counter when it runs a block;
+at the end, if `GCL_TEST_ONLY` is set and `SECTIONS_RUN==0`, fail loudly — a typo'd regex
+must not report a vacuous `PASS=0 FAIL=0` green (same spirit as the undercount sentinel).
 
 **Item 3 — extract `tests/_harness.sh` (LAST; pure dedup, largest diff).** Source one
 shared file from each suite. Tier 1 (all three): the `PASS/FAIL/TAPN/DONE` inits +

@@ -193,12 +193,17 @@ rather than shipping a flake** (per the §4.5 decision).
 - **B1 — Unwritable lock dir/parent → clean 97** (F4). `chmod` the dir.
   POSIX; the cheapest and highest-value fault-injection test. **High.**
 - **B2 — Unwritable/failing log path → lock still works, log swallowed** (F2/J1).
-  Bad/again-`chmod`'d log path. POSIX. **Medium-high.**
+  *Phase-2 feasibility:* use the **ENOTDIR trick** (`AGENT_LOCK_LOG` under a regular
+  file) — **portable, no chmod/guard**. **First cut.**
 - **B3 — ENOSPC during claim/lock create+write** (F1; the create write-fail branch
-  `#5` and the read-fault lanes `:848,871-873`). Small dedicated tmpfs/quota.
-  Linux-friendliest; flag if not portable. **Medium.**
-- **B4 — FD exhaustion via `ulimit -n`** (F3). Portable POSIX; inode exhaustion
-  only if cleanly injectable. **Medium.**
+  `#5` and the read-fault lanes `:848,871-873`). *Phase-2 feasibility:* real injection
+  needs `mount` (Linux **root**); `ulimit -f` is a SIGXFSZ trap (wrong lane). **Second
+  cut — Linux + `sudo -n` probe-gated, or document-only.**
+- **B4 — FD exhaustion via `ulimit -n`** (F3). **Corrected (Phase-2 feasibility,
+  supersedes the earlier "portable POSIX" rating):** NOT portably/deterministically
+  injectable — the create needs only ~1 FD, so any `ulimit -n` low enough to fail it
+  first starves bash's own startup (machine-dependent harness corruption); inode
+  exhaustion needs root. **Document-only.**
 
 ### Tier C — Platform-only (verify off-Linux; not a Linux gap)
 
