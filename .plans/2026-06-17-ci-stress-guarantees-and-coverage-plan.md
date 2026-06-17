@@ -107,8 +107,17 @@ Options:
 
 *Recommendation:* **(B)** — enabled cleanly by `main` not having diverged; gives a
 curated-but-real history (which (C) discards and (A) reconstructs laboriously) and matches
-"tidy up and preserve." **Still Ben's call** (it's about `main`'s permanent history); settle it
-before the merge step. **Not a blocker for the rest of Phase 3 — the merge is last.**
+"tidy up and preserve."
+
+**RESOLVED (Ben, 2026-06-18): (B) — a *mild* tidy-up, then merge via a GitHub pull request**
+(ci-stress → main), **not** a local ff-merge. Refinements:
+- **Extent of tidy-up is Ben's call.** Keep it mild. Before any history rewrite, propose the
+  specific tidy (candidates: drop the pure scaffolding commits `980856b` + `b430d73`'s
+  required-job wiring; squash the obvious `/c` commit+revert noise `534a007`→`959cca9`→
+  `a5df9d9`; leave the rest) and get Ben's sign-off on the extent — do not decide it autonomously.
+- **Merge via a GitHub PR**, so the PR's CI is the gate and the merge is reviewable. `main`
+  has not diverged, so the PR stays clean.
+- Still the **last** step of Phase 3/4; not a blocker for the harness/CI work.
 
 ### Bucket 6 — Principled load-&-matrix testing STRATEGY (Ben "f", 2026-06-17) — RECOMMENDATION DOC, not code
 The current load injection (`tests/with-load.sh`: N CPU spin-loops + N disk write/fsync/delete
@@ -210,8 +219,8 @@ the agreed CI matrix (Bucket 6). Commit incrementally under the commit-lock. **V
 **Phase 4 — Review.** Review the diff (Claude + Codex); run the full suite via CI **across the
 agreed matrix** to confirm new tests pass + are non-flaky, the scoped bounds hold, and the
 matrix surfaces no new flakes. Iterate to clean. → Ben's final review. Then land on `main`
-per **D-d** (merge strategy reopened 2026-06-18 — cherry-pick vs tidy-rebase+ff-merge vs
-squash; see Bucket 5).
+per **D-d** (resolved 2026-06-18: a mild tidy-up — extent is Ben's call — then merge via a
+GitHub PR; see Bucket 5).
 
 ## Decisions (settled 2026-06-17)
 - **D-a → new `docs/guarantees.md`** (dedicated normative doc).
@@ -219,10 +228,11 @@ squash; see Bucket 5).
   gaps (#7 wrong-type-mid-steal, #8 Windows blocked-unlink) as a second tier.
 - **D-c → split the suite** into a strict-correctness tier (always enforced) and a
   latency/envelope tier (not hard-failed by extreme-stress runs).
-- **D-d → REOPENED 2026-06-18** (was: keep on `ci-stress`, cherry-pick mergeable commits at
-  the end). Work continues on `ci-stress`; the *merge-to-`main` mechanism* is now an **open
-  decision** — cherry-pick (A) vs tidy-rebase + ff-merge (B, recommended) vs squash (C). See
-  **Bucket 5** for the analysis. Settle before the merge step (it's the last step).
+- **D-d → RESOLVED 2026-06-18: (B) mild tidy-up, then merge via a GitHub PR** (ci-stress →
+  main), not a local ff-merge. **Extent of tidy-up is Ben's call** — propose the specific
+  commits to drop/squash and get his sign-off before rewriting history. (Was briefly reopened
+  2026-06-18 across cherry-pick (A) / tidy-rebase (B) / squash (C); see **Bucket 5**.) Still the
+  last step.
 - **D-e → my choice:** hand-run Phases 1-2; decide Phase 3-4 (hand vs Workflow) once the
   test/matrix count is known.
 - **"f" → Bucket 6**, above: a considered, first-principles load-&-matrix testing
