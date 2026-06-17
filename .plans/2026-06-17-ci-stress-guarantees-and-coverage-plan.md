@@ -102,7 +102,46 @@ first-principles rethink** — explicitly **not anchored on the existing approac
   more surface — without adding flakiness. Which tests benefit most.
 - **Considered, not maximalist:** principles for choosing the matrix + a routine cadence.
 Output: `docs/load-testing-strategy.md` (recommendation). Runs EARLY (Phase 1b) because it
-shapes Buckets 2 & 4 and the Phase-2 plan.
+shapes Buckets 2 & 4 and the Phase-2 plan. **§9 open decisions: all accepted by Ben (2026-06-17)
+with the doc's recommendations** — daily ~6-cell nightly (start smaller, grow by earn-the-slot);
+Linux cgroup CPU quota (probe-gated) for the envelope leg + ratio-calibrated stress-ng/spinner
+as the cross-platform race-jitter lane; stress-ng with a Windows spinner fallback;
+parametrization Axis A (waiter count) first; `GCL_ENVELOPE_TIER=relax` as the D-c
+correctness/envelope-split implementation; nightly issue auto-triage (correctness vs envelope).
+
+### Bucket 7 — Complete deterministic-steering coverage (Ben raised 2026-06-17)
+The load-strategy doc establishes deterministic STEERING (in-process function-interposition) —
+not external load — as the primary lever for the protocol's race-critical windows, and "more
+steered scenarios" as the #1 coverage investment. We have **not** scoped what *complete*
+steering coverage requires.
+- **Audit (Phase 1c):** enumerate every window/branch/residual across acquire / steal / hold /
+  release and map each to its deterministic-steering test or a GAP. Inputs: `failure-modes.md`,
+  the load-strategy §2 reachability table, the earlier F2 audit. Known gaps already: residual-
+  1/2/3 (claimant parked between recheck / touch and rename), and the F2-audit #7/#8 (wrong-type
+  appearing at the lock path mid-steal — A2/G2; Windows blocked-unlink legs). Add a **mechanical
+  branch-coverage pass (kcov for bash, on the Linux CI leg)** to find never-executed lines
+  objectively, as an input to the manual window audit.
+- **Output:** a coverage gap-list doc that scopes the steering-test work.
+- **Fill (Phase 3):** write the missing steered tests, bundled with Bucket 2.
+
+### Bucket 8 — Test-harness ergonomics (research done 2026-06-17; small, zero-dep)
+A subagent researched "big bash files vs alternatives." Verdict: **keep the plain-bash, zero-dep,
+custom-harness, steering-friendly design** — do NOT adopt bats-core (its forced `set -e` fights
+the suite's deliberate `set -uo` + exit-code assertions; its Windows/MINGW path quirks add risk
+on this project's most fragile axis) or shunit2 (lateral move, weaker Windows story). But the
+*monolith* (not the harness) costs a single-test selector + machine-readable reporting.
+Recommended incremental, **zero-dependency** additions, priority order:
+  1. **TAP output** from `ok`/`bad` + a `1..N` plan line (~15 lines) — machine-readable CI
+     reporting AND closes the silent-undercount gap (an early `exit`/crash currently drops every
+     later assertion from the count, total still prints "passed").
+  2. **A single-test selector** (`GCL_TEST_ONLY=<regex>`) — the biggest day-to-day pain (today
+     you run all 36 unit tests to iterate on one, on the slowest leg).
+  3. **Extract the duplicated helpers** into `tests/_harness.sh` (ok/bad/backdate/clone_fn/
+     wait — copy-pasted verbatim across all three files).
+  4. (Optional) split the two large files by concern; leave the integration suite whole (its
+     cross-test repo-state audit is an intentional dependency).
+Fold into the Phase-2 plan / Phase-3 build; items 1–2 are an afternoon and pay off every
+iteration (esp. given the local-test ban → faster CI triage from machine-readable output).
 
 ## Workflow (settled: spec → plan → implement → review)
 
@@ -120,6 +159,14 @@ runners; existing-test parametrization), synthesize into `docs/load-testing-stra
 review (Claude + Codex). **Recommendation only — NO implementation.** → Ben reviews; his chosen
 recommendations feed Phase 2. Runs early because it shapes Buckets 2 & 4. (1a and 1b are
 independent and can run in parallel.)
+
+**Phase 1c — Complete-steering-coverage audit (Bucket 7 / Ben raised 2026-06-17).**
+Systematically map every protocol window/branch/residual to its deterministic-steering test or
+a GAP, plus a mechanical kcov branch-coverage pass to find never-executed lines objectively;
+output a coverage gap-list doc. Analytical (read-only), parallel to 1a/1b; its gap-list is a
+major input to the Phase-2 test plan (steering is the #1 race-coverage lever per the
+load-strategy doc). **Audit now; gap-filling is Phase 3.** → Ben gate. (Also folds in the
+Bucket-8 harness-ergonomics items, which the new tests will want.)
 
 **Phase 2 — Plan.** Concrete implementation plan for Buckets 2-4, incorporating Ben's chosen
 load/matrix recommendations: per-test injection method (tmpfs / `ulimit` / chmod) + platform
