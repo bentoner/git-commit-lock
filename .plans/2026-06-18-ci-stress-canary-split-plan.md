@@ -29,6 +29,10 @@ suites; copies the minimal preamble the canary needs and the Test 1 block **verb
 - Tail: `selector_report` + `DONE=1` + the `RESULT`/`1..$TAPN` lines + `[ "$FAIL" = 0 ]` (copy
   from the unit suite's end). (`GCL_TEST_ONLY` is near-pointless in a one-test file but the call
   is zero-cost and keeps the `finish`/zero-match scaffolding uniform.)
+  - **`ENV_WARN` (review catch):** the unit suite's `RESULT` line expands `$ENV_WARN`, which is
+    defined in the envelope section we are NOT copying — so under `set -u` the canary's RESULT
+    line would crash. Fix: define `ENV_WARN=0` near the canary's inits (the canary uses plain
+    `ok`/`bad`, no envelope), so the standard RESULT line works unchanged.
 - **Do NOT copy** the unit-file-local helpers the canary doesn't use: `clone_fn`+`export -f`,
   `wait_for_file`, the `ok_envelope`/`bad_envelope` envelope tier, `T_AXIS_A`/sweep. (Verified
   unused by Test 1.)
@@ -63,6 +67,25 @@ Other CI bookkeeping:
 - Add `tests/git-commit-lock.canary.test.sh` to the **shellcheck file list** in the `lint` job.
 - Update the "Sourced by all three suites" comment in `_harness.sh` (and any "three suites" prose) → **four**.
 
+## Other workflow callers (review catch — the canary is now a 4th suite file)
+The canary currently runs **only** via `tests/git-commit-lock.test.sh`, which three other CI
+spots invoke. After extraction each must also run `tests/git-commit-lock.canary.test.sh`, or it
+silently loses the canary:
+- **`nightly.yml` stress cells** (run the unit suite under load): add the canary so it's still
+  stress-tested under oversubscription (concurrency + load is the highest-value canary scenario).
+  Run it in the relevant cells (sequentially after the unit suite is fine — nightly isn't
+  dev-blocking; no separate parallel cell needed there).
+- **`nightly.yml` kcov job** (measures `git-commit-lock.sh` line coverage from the unit suite,
+  gated at the **0.80** floor with only ~3pp headroom): **run the unit suite AND the canary file
+  under kcov (merged output)** so the canary's coverage contribution is preserved — otherwise
+  the floor could regress. (kcov merges multiple runs into one `--include-path` output dir.)
+- **`deep-sweep.yml`** (on-demand deep flake hunt under load+repeat): add the canary file — the
+  concurrency canary is exactly what a deep hunt should exercise.
+Principle: treat the canary like any new suite file — every workflow/job that enumerates the
+suites (and the shellcheck lint list) must include it. (`tests.yml` is the only one that gets the
+*parallel-cell* treatment, for the per-PR wall-clock win; the others just add the file to what
+they already run.)
+
 ## Coverage-safety
 - **No test is lost or doubled:** Test 1 runs in exactly the `canary` cell on each arch; the
   other 56 run in the `all`/`unit` cells. Union across cells == the original 57 on every arch.
@@ -88,8 +111,14 @@ Other CI bookkeeping:
    fix the "three suites" → "four" comment.
 2. **Local proof** (the coverage-safety checks above) — canary standalone green, unit-minus-canary
    green, counts reconcile to the old 315, lint clean.
-3. Rewire `tests.yml` matrix (the 7 cells + the canary step).
-4. Push + **CI verify** cross-platform (all 7 cells green; the ~174s Windows / macOS-gated overall).
+3. Rewire **all** workflows to include the canary file: `tests.yml` (7-cell matrix + the canary
+   step — the parallel-cell win); `nightly.yml` (add the canary to the stress cells + make the
+   kcov job run unit **and** canary under kcov, merged); `deep-sweep.yml` (add the canary to its
+   cells). `actionlint` clean on all three.
+4. Push + **CI verify** cross-platform: all 7 `tests.yml` cells green; the ~174s Windows /
+   macOS-gated overall. (nightly/deep-sweep can't dispatch until on `main`, but their canary
+   wiring is statically validated; the kcov merged-coverage stays ≥ the 0.80 floor since the
+   same tests run, just split across two files.)
 5. Commit incrementally under the lock; ships on `ci-stress`, lands via the merge PR.
 
 ## Logging / observability
