@@ -25,6 +25,16 @@
 # inside the worker's `bash -c`, not here.
 set -uo pipefail
 
+# Shared harness: PASS/FAIL/TAP counters, GCL_TAP/GCL_TEST_ONLY reads, ok/bad,
+# section, the finish EXIT-trap sentinel (calls our cleanup below), and the
+# shared timing/lock helpers (epoch_to_stamp, backdate, backdate_ghost,
+# sync_waiting_fresh, fabricate_lock, wait_for_grep). Resolved from THIS
+# script's own dir so it sources regardless of CWD; sourced EARLY (before any
+# use of the inits/helpers below).
+_HARNESS_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tests/_harness.sh
+. "$_HARNESS_DIR/_harness.sh"
+
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$DIR/.." && pwd)"   # the implementations live at the repo root
 LIB="$ROOT/git-commit-lock.sh"
@@ -51,43 +61,9 @@ cleanup() {
     rm -rf "$WORK" 2>/dev/null || true
   fi
 }
-# Sentinel: the suite reaching its end sets DONE=1. If the EXIT trap fires with
-# DONE!=1, the suite died early (a stray exit/crash) and the assertion count is
-# unreliable — fail loudly even if the pre-trap code was 0. A bare trap `return`
-# is IGNORED (the script keeps its pre-trap code), so the guard must `exit 1`.
-finish() {
-  cleanup
-  if [ "${DONE:-0}" != 1 ]; then
-    echo "Bail out! suite terminated early before the plan line; ran ${TAPN:-0} assertion(s), count unreliable" >&2
-    exit 1
-  fi
-}
+# The finish EXIT-trap sentinel (defined in _harness.sh) calls the cleanup()
+# above and fails loudly if the suite died before setting DONE=1.
 trap finish EXIT
-
-PASS=0; FAIL=0; TAPN=0; DONE=0; SECTIONS_RUN=0
-GCL_TAP="${GCL_TAP:-0}"           # CI sets GCL_TAP=1 for machine-readable TAP13 output
-GCL_TEST_ONLY="${GCL_TEST_ONLY:-}"  # if set, run ONLY test blocks whose label REGEX-matches (single-test selector)
-# section() replaces each per-test header `echo "== Test N: … =="`: it echoes the
-# header verbatim (visible output unchanged) and returns success — gating the
-# `if section …; then … fi` block — iff GCL_TEST_ONLY is unset/empty OR its regex
-# matches the label. A run-counter (SECTIONS_RUN) backs the zero-match guard below,
-# so a typo'd selector regex can't masquerade as a vacuous PASS=0/FAIL=0 green.
-section() {
-  echo "== $1 =="
-  if [ -z "${GCL_TEST_ONLY:-}" ] || [[ "$1" =~ $GCL_TEST_ONLY ]]; then
-    SECTIONS_RUN=$((SECTIONS_RUN + 1)); return 0
-  fi
-  return 1
-}
-# ok/bad are TAP-aware (gated by GCL_TAP so plain dev runs are byte-unchanged) and
-# bump the running assertion number TAPN. The trailing `1..$TAPN` plan line (emitted
-# just before the verdict) lets a TAP consumer fail on a short count; together with the
-# DONE sentinel above this closes the silent-undercount gap. `return 0` preserves the
-# "ok/bad cannot fail" property the `<assert> && ok ... || bad ...` idiom relies on.
-ok()  { PASS=$((PASS+1)); TAPN=$((TAPN+1)); echo "PASS: $*"
-        [ "$GCL_TAP" = 1 ] && echo "ok $TAPN - $*"; return 0; }
-bad() { FAIL=$((FAIL+1)); TAPN=$((TAPN+1)); echo "FAIL: $*"
-        [ "$GCL_TAP" = 1 ] && echo "not ok $TAPN - $*"; return 0; }
 
 # Envelope-tier assertions (Bucket 4 / decision D-c). A wall-clock or poll-count
 # bound is a Tier-2 (best-effort latency) property, NOT a correctness one (see
@@ -109,72 +85,8 @@ bad_envelope() {
     [ "$GCL_TAP" = 1 ] && echo "not ok $TAPN - $*"
   fi; return 0; }
 
-# Backdate a path's mtime by $2 seconds — the lock's staleness clock is the
-# lock FILE's own mtime (stamped by the creating write), so this is how a
-# test fakes a stale lock. Portable: BSD touch has no `-d @epoch`, so convert
-# the target epoch to a `touch -t` stamp via GNU `date -d @` with BSD
-# `date -r` as fallback.
-epoch_to_stamp() {
-  date -d "@$1" +%Y%m%d%H%M.%S 2>/dev/null || date -r "$1" +%Y%m%d%H%M.%S 2>/dev/null
-}
-backdate() { touch -t "$(epoch_to_stamp "$(( $(date +%s) - $2 ))")" "$1"; }
-
-# Token-guarded backdate for the contended-recovery rounds (T2b). Why: under
-# load a fast waiter can complete its ENTIRE steal (claim -> rename-over ->
-# ACQUIRED) before the harness's `touch` executes, so a blind backdate lands
-# on the WINNER'S freshly installed lock, making it instantly stale for every
-# rival — a legitimate re-steal then fails the round's "zero 98s / exactly
-# one STOLE-BY-CLAIM" assertions although the protocol behaved exactly as
-# designed (observed 2026-06-12 on a loaded box). Verdicts:
-#   * pre-read not the ghost: a waiter stole the ghost BEFORE the touch (it
-#     aged stale naturally during a stalled sync); no touch is performed and
-#     the round premise is gone — invalid, the caller retries the round.
-#   * post-read the ghost: conclusive — nothing ever rewrites the ghost
-#     token at the path, so the touch verifiably hit the ghost; any steal
-#     after the post-read steals an ALREADY-ancient ghost, exactly the
-#     scenario the round wants. Valid.
-#   * post-read anything else: a steal raced the touch->re-read window —
-#     COMMON under load (waiters poll every 0.05s; the post-read costs
-#     subprocess spawns), so it must not blindly invalidate. The lock's
-#     MTIME arbitrates which file the touch hit: a winner's installed lock
-#     is FRESH (the rename carries the claim file's just-created mtime), so
-#     fresh => the touch hit the GHOST and a legitimate steal followed —
-#     valid; ancient => the touch landed on the WINNER'S live lock and
-#     corrupted the round — invalid, retry. Vanished => cannot arbitrate —
-#     invalid, retry.
-backdate_ghost() {  # $1=lock $2=ghost token $3=age-secs -> 0 iff the round premise is intact
-  local pre post now mt
-  pre="$(head -n 1 -- "$1" 2>/dev/null | tr -d '\r')"
-  [ "$pre" = "$2" ] || return 1
-  backdate "$1" "$3" 2>/dev/null || return 1
-  post="$(head -n 1 -- "$1" 2>/dev/null | tr -d '\r')"
-  [ "$post" = "$2" ] && return 0
-  [ -e "$1" ] || return 1
-  now="$(date +%s)"
-  mt="$(stat -c %Y -- "$1" 2>/dev/null || stat -f %m -- "$1" 2>/dev/null)" || return 1
-  [ $(( now - mt )) -lt $(( $3 / 2 )) ]
-}
-
-# Wait for every waiter's WAITING line while keeping the ghost lock FRESH
-# (touch -c to now, no-create so a released path is never resurrected): a
-# fresh ghost cannot be judged stale, so no waiter can steal it before the
-# guarded backdate — without this, a sync stalled past STALE (slow worker
-# cold starts on a loaded box) lets the ghost age stale naturally and a
-# waiter steals it mid-sync. Freshening is race-safe: if a steal slipped in
-# anyway, touching the winner's (already fresh) live lock to "now" is a
-# harmless no-op, and backdate_ghost's pre-read catches the broken premise.
-sync_waiting_fresh() {  # $1=lock $2=timeout-secs $3..=waiter logs -> 0 iff all logged WAITING
-  local lock="$1" deadline f ok=1
-  deadline=$(( $(date +%s) + $2 )); shift 2
-  for f in "$@"; do
-    until grep -q "WAITING for lock" "$f" 2>/dev/null; do
-      touch -c "$lock" 2>/dev/null
-      if [ "$(date +%s)" -ge "$deadline" ]; then ok=0; break; fi
-      sleep 0.2
-    done
-  done
-  [ "$ok" = 1 ]
-}
+# epoch_to_stamp, backdate, backdate_ghost, and sync_waiting_fresh now live in
+# _harness.sh (sourced above) — shared byte-for-byte with the interop suite.
 
 # Clone a shell function under a new name — the steering tests' interposition
 # mechanism: a sourced test shell wraps a library internal (or a command like
@@ -187,29 +99,17 @@ clone_fn() {  # $1=existing function $2=new name
 }
 export -f clone_fn epoch_to_stamp backdate
 
-# Fabricate a lock file the way a real (foreign) holder would have written it:
-# token line + owner line. The token MUST be "tok."-prefixed (wire format) or
-# the steal's content guard will — correctly — refuse to steal it.
-fabricate_lock() {  # $1=path $2=token $3=owner
-  printf '%s\n%s\n' "$2" "$3" > "$1"
-}
+# fabricate_lock and wait_for_grep now live in _harness.sh (sourced above) —
+# shared byte-for-byte with the interop suite.
 
 # Wait (up to $2 seconds, default 15) for a marker file to appear. Holders
 # touch a ready-marker as their first act INSIDE the lock; tests gate on that
-# instead of sleep-margin head starts, which flaked under load.
+# instead of sleep-margin head starts, which flaked under load. Unit-only: the
+# interop suite has its own poll helper (wait_for, 50ms-iteration semantics).
 wait_for_file() {
   local f="$1" tries=$(( ${2:-15} * 20 ))
   while [ ! -e "$f" ] && [ "$tries" -gt 0 ]; do sleep 0.05; tries=$((tries-1)); done
   [ -e "$f" ]
-}
-
-# Wait (up to $3 seconds, default 15) for a pattern to appear in a file.
-# Used to gate on the WAITING log line: proof the waiter actually contended,
-# without a fixed-length hold.
-wait_for_grep() {
-  local pat="$1" f="$2" tries=$(( ${3:-15} * 20 ))
-  while ! grep -q "$pat" "$f" 2>/dev/null && [ "$tries" -gt 0 ]; do sleep 0.05; tries=$((tries-1)); done
-  grep -q "$pat" "$f" 2>/dev/null
 }
 
 # Critical section that loses updates without a mutex: read, gap, write+1.
@@ -3211,14 +3111,14 @@ fi
 #   Test 32, the steal-path lane (F2 — rename-over won, read-back wrong) by
 #   Test 32b.
 
-# Zero-match guard: a set-but-non-matching GCL_TEST_ONLY ran NO test block. Without
-# this, the suite would fall through to a vacuous PASS=0 FAIL=0 "green" — a typo'd
-# selector regex would silently look like success. Fail loudly instead. (The finish
-# EXIT trap also fires here since DONE is still 0; this exit is non-zero regardless.)
-if [ -n "${GCL_TEST_ONLY:-}" ] && [ "$SECTIONS_RUN" = 0 ]; then
-  echo "Bail out! GCL_TEST_ONLY=\"$GCL_TEST_ONLY\" matched no test" >&2
-  exit 1
-fi
+# Zero-match guard + selector-report line (shared helper in _harness.sh): a
+# set-but-non-matching GCL_TEST_ONLY ran NO test block, which without the guard
+# would fall through to a vacuous PASS=0 FAIL=0 "green" — a typo'd selector regex
+# would silently look like success; bail loudly instead. (The finish EXIT trap
+# also fires there since DONE is still 0; that exit is non-zero regardless.) When
+# the selector matched, it reports how many blocks ran. Both are gated on
+# GCL_TEST_ONLY being non-empty, so a default run stays byte-identical.
+selector_report
 
 DONE=1
 echo

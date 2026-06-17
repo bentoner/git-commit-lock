@@ -145,6 +145,7 @@ jobs:
           /tmp/shellcheck-v0.11.0/shellcheck --version
           /tmp/shellcheck-v0.11.0/shellcheck -S style \
             git-commit-lock.sh \
+            tests/_harness.sh \
             tests/git-commit-lock.test.sh \
             tests/git-commit-lock.interop.test.sh \
             tests/git-commit-lock.integration.test.sh \

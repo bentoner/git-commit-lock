@@ -36,6 +36,13 @@
 # they expand inside a worker's `bash -c` invocation, not here.
 set -uo pipefail
 
+# Shared harness: PASS/FAIL/TAP counters, GCL_TAP/GCL_TEST_ONLY reads, ok/bad,
+# section, the finish EXIT-trap sentinel (calls our cleanup below). Resolved from
+# THIS script's own dir so it sources regardless of CWD.
+_HARNESS_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tests/_harness.sh
+. "$_HARNESS_DIR/_harness.sh"
+
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$DIR/.." && pwd)"   # the implementations live at the repo root
 LIB="$ROOT/git-commit-lock.sh"
@@ -59,30 +66,9 @@ cleanup() {
     rm -rf "$WORK" 2>/dev/null || true
   fi
 }
-# Sentinel: the suite reaching its end sets DONE=1. If the EXIT trap fires with
-# DONE!=1, the suite died early (a stray exit/crash) and the assertion count is
-# unreliable — fail loudly even if the pre-trap code was 0. A bare trap `return`
-# is IGNORED (the script keeps its pre-trap code), so the guard must `exit 1`.
-finish() {
-  cleanup
-  if [ "${DONE:-0}" != 1 ]; then
-    echo "Bail out! suite terminated early before the plan line; ran ${TAPN:-0} assertion(s), count unreliable" >&2
-    exit 1
-  fi
-}
+# The finish EXIT-trap sentinel (defined in _harness.sh) calls the cleanup()
+# above and fails loudly if the suite died before setting DONE=1.
 trap finish EXIT
-
-PASS=0; FAIL=0; TAPN=0; DONE=0
-GCL_TAP="${GCL_TAP:-0}"           # CI sets GCL_TAP=1 for machine-readable TAP13 output
-# ok/bad are TAP-aware (gated by GCL_TAP so plain dev runs are byte-unchanged) and
-# bump the running assertion number TAPN. The trailing `1..$TAPN` plan line (emitted
-# just before the verdict) lets a TAP consumer fail on a short count; together with the
-# DONE sentinel above this closes the silent-undercount gap. `return 0` preserves the
-# "ok/bad cannot fail" property the `<assert> && ok ... || bad ...` idiom relies on.
-ok()  { PASS=$((PASS+1)); TAPN=$((TAPN+1)); echo "PASS: $*"
-        [ "$GCL_TAP" = 1 ] && echo "ok $TAPN - $*"; return 0; }
-bad() { FAIL=$((FAIL+1)); TAPN=$((TAPN+1)); echo "FAIL: $*"
-        [ "$GCL_TAP" = 1 ] && echo "not ok $TAPN - $*"; return 0; }
 
 # --- sizing ------------------------------------------------------------------
 # Commits serialise (that's the whole point), so wall time ≈ workers x commit
@@ -117,9 +103,8 @@ LK_ENV=(AGENT_LOCK_STALE_SECS=300 AGENT_LOCK_POLL_SECS=0.2 AGENT_LOCK_MAX_WAIT=2
 # Note-and-ignore the per-test selector the unit/interop suites honour: this
 # suite is ONE indivisible scenario (Tests 1-3 share a single repo + the ALL_IDS
 # accumulator, and Test 3 audits Tests 1+2's output), so a per-block selector
-# can't apply. If GCL_TEST_ONLY is set, say so loudly on stderr and run the
-# whole scenario as normal.
-GCL_TEST_ONLY="${GCL_TEST_ONLY:-}"
+# can't apply. If GCL_TEST_ONLY is set (read by _harness.sh), say so loudly on
+# stderr and run the whole scenario as normal.
 if [ -n "$GCL_TEST_ONLY" ]; then
     echo "NOTE: integration suite ignores GCL_TEST_ONLY=\"$GCL_TEST_ONLY\" — Tests 1-3 are one indivisible scenario (shared repo + ALL_IDS audit); running the whole suite." >&2
 fi
