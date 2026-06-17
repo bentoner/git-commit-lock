@@ -82,40 +82,72 @@ Ben's box).
   `failure-modes` off `main` now? (Recommend: keep working on `ci-stress`; cherry-pick at the
   end — the stress wrapper is useful for CI-verifying the new tests under load.)
 
-## Proposed workflow (our usual approach: spec → plan → implement → review)
+### Bucket 6 — Principled load-&-matrix testing STRATEGY (Ben "f", 2026-06-17) — RECOMMENDATION DOC, not code
+The current load injection (`tests/with-load.sh`: N CPU spin-loops + N disk write/fsync/delete
+loops) was thrown together from a few lines of discussion. Ben wants a **considered,
+first-principles rethink** — explicitly **not anchored on the existing approach** — whose
+**deliverable is a recommendation doc for Ben, NOT an implementation.** Scope:
+- **Is the load injection right?** From first principles: which KINDS of load actually stress
+  *this* tool's timing-critical windows (claim→rename, read-back, discovery, mtime/staleness,
+  fsync durability, scheduler preemption at critical points)? Are CPU-spin + disk-fsync the
+  right proxies, or are better mechanisms warranted (cgroup CPU throttling, `taskset`/`nice`,
+  `ionice`, `stress-ng` stressors, FUSE/FS-latency injection, memory pressure)? Faithfulness,
+  reproducibility, and calibration (load relative to runner core count).
+- **Expand the CI matrix** on free public GitHub runners: run the suite across
+  {OS} × {load level} × {load kind} × {config} in parallel. How many cells is *considered* vs
+  *blowing it up* — diminishing returns, signal-per-cell, GitHub concurrency limits, a small
+  per-PR tier vs a larger nightly tier.
+- **Get more from EXISTING tests, routinely:** parametrize the fan-out/timing tests across
+  waiter counts and knob values (STALE / CLAIM_STALE / POLL / MAX_WAIT) so each run exercises
+  more surface — without adding flakiness. Which tests benefit most.
+- **Considered, not maximalist:** principles for choosing the matrix + a routine cadence.
+Output: `docs/load-testing-strategy.md` (recommendation). Runs EARLY (Phase 1b) because it
+shapes Buckets 2 & 4 and the Phase-2 plan.
+
+## Workflow (settled: spec → plan → implement → review)
 
 Each phase ends with **Claude + Codex review rounds to convergence** and a **Ben gate**.
-Test execution is **CI-only** throughout.
+Test execution is **CI-only** throughout (local runs lag Ben's box).
 
-**Phase 1 — Spec.** Write the Bucket-1 guarantees/scope spec + the precise operating
-envelope. Review (Claude + Codex) against the code and `failure-modes.md`. → Ben approves the
-spec before any implementation. (This is where the new doc Ben asked for gets created.)
+**Phase 1a — Guarantees spec.** Write `docs/guarantees.md` (D-a) — what we guarantee / what's
+out of scope, as a normative contract + the precise operating envelope. Review (Claude +
+Codex) against the code + `failure-modes.md`. → Ben gate.
 
-**Phase 2 — Plan.** A concrete implementation plan for Buckets 2-4: per-test injection method
-(tmpfs / `ulimit` / chmod) + platform guard + CI wiring; the exact doc edits; the test-bound
-scoping approach (per D-c). Include a logging/observability note (what each new test asserts
-in the logs). Record in `.plans/`, review (Claude + Codex). → Ben approves the plan.
+**Phase 1b — Load-&-matrix testing STRATEGY recommendation (Bucket 6 / Ben "f").** Run a
+considered, first-principles process (parallel research agents on distinct facets: the tool's
+timing-window→load-type mapping + critique of the current wrapper; CI-matrix design on free
+runners; existing-test parametrization), synthesize into `docs/load-testing-strategy.md`,
+review (Claude + Codex). **Recommendation only — NO implementation.** → Ben reviews; his chosen
+recommendations feed Phase 2. Runs early because it shapes Buckets 2 & 4. (1a and 1b are
+independent and can run in parallel.)
 
-**Phase 3 — Implementation.** Build the fault-injection tests (Bucket 2), apply the doc edits
-(Bucket 3), scope the wall-clock bounds (Bucket 4). Commit incrementally under the
-commit-lock. **Verify via CI** (dispatch `tests.yml` on `ci-stress`) — never locally.
+**Phase 2 — Plan.** Concrete implementation plan for Buckets 2-4, incorporating Ben's chosen
+load/matrix recommendations: per-test injection method (tmpfs / `ulimit` / chmod) + platform
+guard + CI wiring; the matrix/parametrization to adopt; exact doc edits; the
+correctness/envelope test split (D-c); a logging/observability note. Record in `.plans/`,
+review. → Ben gate.
 
-**Phase 4 — Review.** Review the diff (Claude + Codex); run the full suite via CI **under the
-stress load wrapper** to confirm (a) the new tests pass and are non-flaky, and (b) the scoped
-bounds stop Test 21/22a/29 flaking at extreme load while keeping correctness strict. Iterate
-to clean. → Ben's final review.
+**Phase 3 — Implementation.** Build the fault-injection tests (Bucket 2, tiered per D-b), apply
+the doc edits (Bucket 3), scope the wall-clock bounds + split the tiers (Bucket 4 / D-c), wire
+the agreed CI matrix (Bucket 6). Commit incrementally under the commit-lock. **Verify via CI**
+(dispatch `tests.yml` on `ci-stress`) — never locally.
 
-**Execution mechanics (open decision D-e):** run the phases by hand (subagent review rounds as
-this session has been doing), or drive Phases 3-4 with a Claude Code **Workflow** (multi-agent
-fan-out — one agent per test lane, adversarial verify, etc.)? (Recommend: hand-run Phase 1-2;
-consider a Workflow for Phase 3-4 if the test count grows. Your call.)
+**Phase 4 — Review.** Review the diff (Claude + Codex); run the full suite via CI **across the
+agreed matrix** to confirm new tests pass + are non-flaky, the scoped bounds hold, and the
+matrix surfaces no new flakes. Iterate to clean. → Ben's final review. Then (D-d) cherry-pick
+the mergeable commits to `main`.
 
-## Decisions I need from Ben (summary)
-- **D-a:** new `docs/guarantees.md` vs a section in the design doc. (rec: new doc)
-- **D-b:** test scope — §4.5 set + E3 now, defer #7/#8? (rec: F4/F2/J1/F3 first; F1/E3/#7/#8 second tier)
-- **D-c:** scope test bounds by relaxing numbers vs a correctness/envelope test split. (rec: split)
-- **D-d:** keep on `ci-stress` + cherry-pick later vs clean branch now. (rec: ci-stress)
-- **D-e:** hand-run vs Workflow for Phase 3-4. (rec: hand-run 1-2, decide later for 3-4)
+## Decisions (settled 2026-06-17)
+- **D-a → new `docs/guarantees.md`** (dedicated normative doc).
+- **D-b → accept rec:** F4 / F2-J1 / F3 first tier; F1-ENOSPC, E3, and the deferred F2-audit
+  gaps (#7 wrong-type-mid-steal, #8 Windows blocked-unlink) as a second tier.
+- **D-c → split the suite** into a strict-correctness tier (always enforced) and a
+  latency/envelope tier (not hard-failed by extreme-stress runs).
+- **D-d → keep on `ci-stress`**, cherry-pick the mergeable commits to `main` at the end.
+- **D-e → my choice:** hand-run Phases 1-2; decide Phase 3-4 (hand vs Workflow) once the
+  test/matrix count is known.
+- **"f" → Bucket 6**, above: a considered, first-principles load-&-matrix testing
+  **recommendation doc** (not implementation), run early as Phase 1b.
 
 ## Out of scope for this plan
 - Anything the design already rejected (heartbeat, two-rename CAS, `File.Replace`, supporting
