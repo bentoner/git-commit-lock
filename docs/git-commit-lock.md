@@ -292,6 +292,22 @@ settles in milliseconds. The
 same floor governs the claim file's ageout: a sub-floor claim mtime reads as
 "just created", never "ancient — clear".
 
+**The operating envelope — correctness is load-independent; latency is not.**
+Exclusion, no-silent-loss, and eventual recovery rest on atomic create/rename
+plus per-attempt tokens, and hold under any load. The wall-clock bounds —
+recovery latency (≈ `STALE_SECS` + poll cadence), the `MAX_WAIT` timeout, and the
+~1.3 s read-retry ladder — are best-effort and scale with scheduling: under CPU
+oversubscription or a slow filesystem they stretch, but the protocol still
+recovers and never loses an update. (For the precise guarantee/scope split, see
+[`guarantees.md`](guarantees.md).)
+
+**One time source.** The tool assumes a single clock — single-host use (the
+common case: all contenders share one checkout, hence one machine and one clock),
+or a shared filesystem with one server clock. A local clock jump is
+correctness-safe: a forward jump can make a live lock look stale and be
+prematurely stolen, but that degrades to the detected exit-98 lane (the robbed
+holder's release fails loudly), never a silent double-commit.
+
 ## The PowerShell port (`git-commit-lock.ps1`)
 
 Some agents (Codex on Windows, for example) run their commands in

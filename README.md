@@ -57,7 +57,11 @@ atomic create-or-fail open (`O_CREAT|O_EXCL` / `FileMode.CreateNew`) — atomic
 on local POSIX filesystems and NTFS alike, with no dependency on `flock` —
 whose content is the holder's unique token. Every worktree has its own git
 dir, so independent worktrees get independent locks, while all agents sharing
-one checkout contend on the same lock. The lock is deliberately a stealable
+one checkout contend on the same lock. The protocol's correctness rests on these
+operations being atomic, which holds on local filesystems (ext4, APFS, NTFS, and
+kin) but **not** on network or sync-backed storage — NFS, SMB shares,
+Dropbox/OneDrive-synced directories — where exclusion may silently fail. Keep the
+repo (and so its `.git/`) on a local disk. The lock is deliberately a stealable
 **lease**, not a kernel lock: in unattended agent fleets a hung-but-alive
 holder is at least as common as a crashed one, and a lock that can't be taken
 from a stuck holder halts the whole run — while a rare collision costs little
@@ -93,6 +97,12 @@ use the bash implementation. CI nevertheless runs the two implementations
 against each other on all three OSes — not as platform support, but because
 two independent implementations hammering one lock is cheap adversarial
 verification of the protocol.
+
+**Upgrade both implementations together.** Older releases stole with an
+unserialized move-aside instead of the claim protocol, so the
+no-displacement-during-recovery guarantee holds only when every party in a tree
+runs a current version; a mixed-version tree degrades that prevention to
+detection (exit 98) and can leave `.dead.*` files current versions don't clean.
 
 ## Suggested agent instructions
 

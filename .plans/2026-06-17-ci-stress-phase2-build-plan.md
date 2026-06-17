@@ -420,5 +420,15 @@ Workflow once the final test count is known (plan D-e) — likely a Workflow for
   lean Workflow for the steering batch, hand-run the CI/doc edits.)
 - Anything else needing a call is surfaced inline in the integrated sections.
 
-## Changelog
-(empty — Phase 2 planning; implementation changelog starts in Phase 3.)
+## Changelog (Phase 3 implementation)
+- **Step 1 (commit `3789be9`) — Bucket 8 item 1 done.** TAP + `1..N` + the
+  `DONE`/`finish` undercount sentinel in all three suites. Unit validated locally
+  (220/220 REDUCED + matching plan line, exit 0, sentinel does not false-fire);
+  interop/integration syntax-checked, full runs via CI.
+- **Deviation — defer Bucket 8 item 2 (the `GCL_TEST_ONLY` selector).** Wrapping 43
+  blocks in `if section …; then … fi` is a large, boundary-sensitive change whose only
+  benefit is per-test iteration speed; for this batch the steering tests are validated
+  by a full-suite run, so it doesn't justify front-loading its risk. Bundled with item 3
+  (`_harness.sh` extraction — also a large harness change) into one validated
+  harness-restructure step near the end. **Revised phasing: 8.1 → 3 → 4 → 2A → 2B →
+  (8.2 + 8.3 together) → 6.**
