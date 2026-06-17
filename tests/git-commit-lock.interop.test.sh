@@ -838,18 +838,18 @@ fi
 
 if section "Test 16: crash recovery under CONTENTION, mixed impls — claim-serialized: zero displacement, zero 98s"; then
 # Cross-impl variant of the unit suite's Test 2b (which carries the full
-# rationale): 2 bash + 2 pwsh waiters race ONE crashed lock. Under the claim
-# protocol the straggler-robs-recovery-winner race is PREVENTED (the claim
-# serializes stealers across the wire format), not detected-and-repaired, so
-# the assertions are strict: every waiter exits 0 (zero spurious 98s — an
-# unserialized implementation displaces the recovery winner near-certainly),
-# exactly ONE STOLE-BY-CLAIM, NO move-aside file ever exists (an
-# implementation that staged the steal through an intermediate .dead.* file
-# would re-open the displacement race; a background sampler proves no such
-# file ever appears — and the unserialized "STOLE stale lock" line shape and
-# any STEAL-DISPLACED repair line must never appear), and the final state
-# is clean (no lock, no claim). Sync: waiters launch against a FRESH
-# fabricated lock and only once all four have logged WAITING is it
+# rationale): N waiters split half bash / half pwsh race ONE crashed lock.
+# Under the claim protocol the straggler-robs-recovery-winner race is
+# PREVENTED (the claim serializes stealers across the wire format), not
+# detected-and-repaired, so the assertions are strict: every waiter exits 0
+# (zero spurious 98s — an unserialized implementation displaces the recovery
+# winner near-certainly), exactly ONE STOLE-BY-CLAIM, NO move-aside file ever
+# exists (an implementation that staged the steal through an intermediate
+# .dead.* file would re-open the displacement race; a background sampler proves
+# no such file ever appears — and the unserialized "STOLE stale lock" line
+# shape and any STEAL-DISPLACED repair line must never appear), and the final
+# state is clean (no lock, no claim). Sync: waiters launch against a FRESH
+# fabricated lock and only once all have logged WAITING is it
 # backdated, so all judge stale within one poll window despite pwsh's slow
 # cold start; the sync keeps the ghost fresh while it waits
 # (sync_waiting_fresh) so a stalled sync can't let the ghost age stale on
@@ -861,13 +861,34 @@ if section "Test 16: crash recovery under CONTENTION, mixed impls — claim-seri
 # the run's premise is broken (the touch may have aged the WINNER'S live
 # lock), so the run is discarded and retried (bounded) instead of failing
 # assertions the protocol never violated.
+#
+# Waiter count is swept over $T_AXIS_A (Bucket 6): one iteration at N=4 by
+# default (2 bash + 2 pwsh — byte-identical to today) and at N=4,12,24 under
+# GCL_TEST_SWEEP=1. N is split into a bash half (N/2) and a pwsh half (the
+# remainder); at N=4 that is 2+2 exactly. The correctness invariants stay strict
+# at EVERY N — but that needs STALE >> the winner's EFFECTIVE hold, which grows
+# with N under load (the winner is one of N concurrent processes), so STALE is
+# floored to N when sweeping (t16_stale); at the default floor it is the same 8
+# as today. MAX_WAIT scales too (30*N => 120 at N=4) so a wide, pwsh-cold-start-
+# heavy sweep has time to drain. The per-N tag on the non-count-naming
+# assertions is suppressed in the default run so the messages stay byte-identical.
 LOCK="$WORK/recov.lock"
 T16_TRIES=3
 T16_GRAVESEEN="$WORK/recov.graveseen"; T16_SAMPSTOP="$WORK/recov.sampstop"
+for T16_N in $T_AXIS_A; do
+t16_nsh=$(( T16_N / 2 )); t16_nps=$(( T16_N - t16_nsh ))   # bash half + pwsh half (2+2 at N=4)
+t16_maxwait=$(( 30 * T16_N ))
+# STALE budget: today's 8 in the default (non-sweep) run for byte-identical
+# behaviour; when sweeping, floor it to N so a wide fan-out's load-stretched
+# winner hold can never make its own live lock look stale (a legitimate but
+# unwanted second steal), keeping "exactly one steal" strict at every N.
+if [ "$GCL_TEST_SWEEP" = 1 ] && [ "$T16_N" -gt 8 ]; then t16_stale="$T16_N"; else t16_stale=8; fi
+if [ "$GCL_TEST_SWEEP" = 1 ]; then t16_ntag=" at N=$T16_N"; else t16_ntag=""; fi
 t16_valid=0; t16_sync=1; t16_fail=0; n98=0
 for t16_try in $(seq 1 "$T16_TRIES"); do
-  T16_GHOST="tok.ghost.recov.$t16_try"
-  rm -f "$WORK"/recov.ran.* "$T16_GRAVESEEN" "$T16_SAMPSTOP" "$LOCK" "$LOCK.next" 2>/dev/null
+  T16_GHOST="tok.ghost.recov.$T16_N.$t16_try"
+  rm -f "$WORK"/recov.ran.* "$WORK"/recov-sh*.log "$WORK"/recov-ps*.log \
+        "$T16_GRAVESEEN" "$T16_SAMPSTOP" "$LOCK" "$LOCK.next" 2>/dev/null
   fabricate_lock "$LOCK" "$T16_GHOST" "pid=999 host=ghost"   # fresh mtime: not yet stale
   (
     while [ ! -e "$T16_SAMPSTOP" ]; do
@@ -878,41 +899,45 @@ for t16_try in $(seq 1 "$T16_TRIES"); do
     done
   ) &
   t16_sampler=$!
-  pids=()
-  for i in 1 2; do
+  pids=(); t16_logs=()
+  for i in $(seq 1 "$t16_nsh"); do
     : > "$WORK/recov-sh$i.log"   # per-waiter logs: concurrent appends to one log drop lines
-    AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$WORK/recov-sh$i.log" AGENT_LOCK_STALE_SECS=8 \
-      AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=120 \
+    t16_logs+=("$WORK/recov-sh$i.log")
+    AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$WORK/recov-sh$i.log" AGENT_LOCK_STALE_SECS="$t16_stale" \
+      AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT="$t16_maxwait" \
       bash "$SH" run -- bash -c 'touch "$1"; sleep 0.1' _ "$WORK/recov.ran.sh$i" 2>/dev/null &
     pids+=($!)
   done
-  for i in 1 2; do
+  for i in $(seq 1 "$t16_nps"); do
     : > "$WORK/recov-ps$i.log"
-    AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$WORK/recov-ps$i.log" AGENT_LOCK_STALE_SECS=8 \
-      AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=120 \
+    t16_logs+=("$WORK/recov-ps$i.log")
+    AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$WORK/recov-ps$i.log" AGENT_LOCK_STALE_SECS="$t16_stale" \
+      AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT="$t16_maxwait" \
       pwsh -NoProfile -File "$PS1WIN" run "[IO.File]::WriteAllText('$WORK/recov.ran.ps$i', 'x'); Start-Sleep -Milliseconds 100" 2>/dev/null &
     pids+=($!)
   done
   t16_sync=1
-  if ! sync_waiting_fresh "$LOCK" 90 "$WORK/recov-sh1.log" "$WORK/recov-sh2.log" \
-                          "$WORK/recov-ps1.log" "$WORK/recov-ps2.log"; then
+  if ! sync_waiting_fresh "$LOCK" 90 "${t16_logs[@]}"; then
     t16_sync=0
-    for f in "$WORK/recov-sh1.log" "$WORK/recov-sh2.log" "$WORK/recov-ps1.log" "$WORK/recov-ps2.log"; do
-      grep -q "WAITING for lock" "$f" 2>/dev/null || echo "  T16 waiter never contended (no WAITING in ${f##*/})"
+    for f in "${t16_logs[@]}"; do
+      grep -q "WAITING for lock" "$f" 2>/dev/null || echo "  T16 N=$T16_N waiter never contended (no WAITING in ${f##*/})"
     done
   fi
-  backdate_ghost "$LOCK" "$T16_GHOST" 9999; t16_bd=$?   # all four now judge the ghost stale together
+  backdate_ghost "$LOCK" "$T16_GHOST" 9999; t16_bd=$?   # all waiters now judge the ghost stale together
   t16_fail=0; n98=0
   for p in "${pids[@]}"; do
     wait "$p"; rc=$?
     case "$rc" in
       0)  ;;
-      98) n98=$((n98+1)); echo "  T16 waiter rc=98 — displacement under the claim protocol" ;;
-      *)  t16_fail=1; echo "  T16 waiter rc=$rc (want 0)" ;;
+      98) n98=$((n98+1)); echo "  T16 N=$T16_N waiter rc=98 — displacement under the claim protocol" ;;
+      *)  t16_fail=1; echo "  T16 N=$T16_N waiter rc=$rc (want 0)" ;;
     esac
   done
   touch "$T16_SAMPSTOP"; wait "$t16_sampler" 2>/dev/null
-  cat "$WORK"/recov-*.log > "$WORK/recov-all.log" 2>/dev/null || : > "$WORK/recov-all.log"
+  # Aggregate from the explicit per-waiter log list, NOT a recov-*.log glob: the
+  # glob would also match recov-all.log itself, which now persists across sweep N
+  # iterations, so a glob could self-cat a stale aggregate into the count.
+  cat "${t16_logs[@]}" > "$WORK/recov-all.log" 2>/dev/null || : > "$WORK/recov-all.log"
   if [ "$t16_bd" != 0 ]; then
     # The backdate was NOT conclusively clean (see backdate_ghost; under
     # load the whole steal+release cycle often completes before the
@@ -929,7 +954,7 @@ for t16_try in $(seq 1 "$T16_TRIES"); do
     [ "$(grep -c "lock LOST" "$WORK/recov-all.log")" = 0 ] || t16_dirty=1
     { [ -e "$LOCK" ] || [ -e "$LOCK.next" ]; } && t16_dirty=1
     if [ "$t16_dirty" = 1 ]; then
-      echo "  T16 try $t16_try: non-conclusive backdate AND dirty outcome — attempt discarded, retrying"
+      echo "  T16 N=$T16_N try $t16_try: non-conclusive backdate AND dirty outcome — attempt discarded, retrying"
       rm -f "$LOCK" "$LOCK.next" 2>/dev/null
       continue
     fi
@@ -944,30 +969,31 @@ if [ "$t16_valid" = 1 ]; then
   nold="$(grep -c "STOLE stale lock" "$WORK/recov-all.log")"
   ndisp="$(grep -c "STEAL-DISPLACED" "$WORK/recov-all.log")"
   [ "$t16_fail" = 0 ] && [ "$t16_sync" = 1 ] \
-    && ok "2 bash + 2 pwsh waiters on one crashed lock: every waiter exited 0" \
-    || bad "mixed crash-recovery exits wrong (see above)"
-  [ "$n98" = 0 ] && ok "zero spurious 98s — the claim serialized recovery across implementations" \
-                 || bad "$n98 waiter(s) exited 98 — displacement happened under the claim protocol"
-  [ "$nran" = 4 ] && ok "all 4 waiter commands ran" || bad "only $nran/4 waiter commands ran"
-  [ "$nstole" = 1 ] && ok "exactly ONE STOLE-BY-CLAIM (the claim serialized the cross-impl recovery)" \
-                    || bad "STOLE-BY-CLAIM x$nstole (want exactly 1)"
+    && ok "$t16_nsh bash + $t16_nps pwsh waiters on one crashed lock: every waiter exited 0" \
+    || bad "mixed crash-recovery exits wrong$t16_ntag (see above)"
+  [ "$n98" = 0 ] && ok "zero spurious 98s$t16_ntag — the claim serialized recovery across implementations" \
+                 || bad "$n98 waiter(s) exited 98$t16_ntag — displacement happened under the claim protocol"
+  [ "$nran" = "$T16_N" ] && ok "all $T16_N waiter commands ran" || bad "only $nran/$T16_N waiter commands ran"
+  [ "$nstole" = 1 ] && ok "exactly ONE STOLE-BY-CLAIM$t16_ntag (the claim serialized the cross-impl recovery)" \
+                    || bad "STOLE-BY-CLAIM x$nstole$t16_ntag (want exactly 1)"
   grep -q "STOLE-BY-CLAIM.*ghost=pid=999 host=ghost" "$WORK/recov-all.log" \
-    && ok "the steal line attributes the crashed ghost cross-impl (wire-format line 2 parsed)" \
-    || bad "STOLE-BY-CLAIM does not carry the ghost's line-2 attribution"
+    && ok "the steal line attributes the crashed ghost cross-impl (wire-format line 2 parsed)$t16_ntag" \
+    || bad "STOLE-BY-CLAIM does not carry the ghost's line-2 attribution$t16_ntag"
   grep -q "CLAIM .*tok=tok\." "$WORK/recov-all.log" \
-    && ok "claim create logged with its per-attempt token (CLAIM ... tok=)" \
-    || bad "no CLAIM line with a token in the recovery logs"
-  [ "$nold" = 0 ] && ok "unserialized-steal line shape ('STOLE stale lock') never logged" \
-    || bad "'STOLE stale lock' shape appeared x$nold — an unserialized steal lane is present"
-  [ "$ndisp" = 0 ] && ok "zero STEAL-DISPLACED lines (prevention, not detect-and-repair)" \
-    || bad "STEAL-DISPLACED fired x$ndisp — displacement-repair machinery present?"
-  [ -e "$T16_GRAVESEEN" ] && bad "a move-aside file (.dead.*) existed during recovery — the steal is staged through an intermediate file!" \
-    || ok "no move-aside file (.dead.*) ever existed during recovery (sampler)"
-  [ -e "$LOCK" ] && bad "leftover crash-recovery lock" || ok "no leftover lock"
-  [ -e "$LOCK.next" ] && bad "leftover claim after recovery" || ok "no leftover claim"
+    && ok "claim create logged with its per-attempt token (CLAIM ... tok=)$t16_ntag" \
+    || bad "no CLAIM line with a token in the recovery logs$t16_ntag"
+  [ "$nold" = 0 ] && ok "unserialized-steal line shape ('STOLE stale lock') never logged$t16_ntag" \
+    || bad "'STOLE stale lock' shape appeared x$nold$t16_ntag — an unserialized steal lane is present"
+  [ "$ndisp" = 0 ] && ok "zero STEAL-DISPLACED lines (prevention, not detect-and-repair)$t16_ntag" \
+    || bad "STEAL-DISPLACED fired x$ndisp$t16_ntag — displacement-repair machinery present?"
+  [ -e "$T16_GRAVESEEN" ] && bad "a move-aside file (.dead.*) existed during recovery$t16_ntag — the steal is staged through an intermediate file!" \
+    || ok "no move-aside file (.dead.*) ever existed during recovery (sampler)$t16_ntag"
+  [ -e "$LOCK" ] && bad "leftover crash-recovery lock$t16_ntag" || ok "no leftover lock$t16_ntag"
+  [ -e "$LOCK.next" ] && bad "leftover claim after recovery$t16_ntag" || ok "no leftover claim$t16_ntag"
 else
-  bad "T16: no clean run under a conclusive backdate in $T16_TRIES attempts (see above)"
+  bad "T16: no clean run under a conclusive backdate in $T16_TRIES attempts$t16_ntag (see above)"
 fi
+done
 fi
 
 if section "Test 16b: bash claimant vs ps1 claimant racing ONE ghost — one claim winner, cross-impl wire parity"; then

@@ -35,6 +35,21 @@ PASS=0; FAIL=0; TAPN=0; DONE=0; SECTIONS_RUN=0
 GCL_TAP="${GCL_TAP:-0}"           # CI sets GCL_TAP=1 for machine-readable TAP13 output
 GCL_TEST_ONLY="${GCL_TEST_ONLY:-}"  # if set, run ONLY test blocks whose label REGEX-matches (single-test selector)
 
+# Axis-A waiter-count sweep (Bucket 6). GCL_TEST_SWEEP=1 (nightly/deep CI) widens
+# the fan-out/contention tests over several waiter counts to wring more coverage
+# from the existing tests; unset/0 (per-PR default + plain dev) keeps the floor so
+# default runs are byte-identical to today. T_AXIS_A is the shared waiter-count
+# list the contention tests (unit Test 2b, interop Test 16) iterate N over; each
+# names N in every assertion message so a sweep failure says which N broke. The
+# floor is 4 — the count those two tests hardcode today, so the single-element
+# default reproduces today's behaviour exactly. (Test 20's floor is mode-driven
+# `$T20_N` (5 REDUCED / 10 FULL), not 4, so it composes its own list from $T20_N +
+# the sweep's higher counts rather than from T_AXIS_A — see that test.)
+GCL_TEST_SWEEP="${GCL_TEST_SWEEP:-0}"
+# shellcheck disable=SC2034  # T_AXIS_A is consumed by the sourcing suites (unit
+# Test 2b, interop Test 16), not within this harness file.
+if [ "$GCL_TEST_SWEEP" = 1 ]; then T_AXIS_A="4 12 24"; else T_AXIS_A="4"; fi
+
 # ok/bad are TAP-aware (gated by GCL_TAP so plain dev runs are byte-unchanged) and
 # bump the running assertion number TAPN. The trailing `1..$TAPN` plan line (emitted
 # by each suite just before its verdict) lets a TAP consumer fail on a short count;

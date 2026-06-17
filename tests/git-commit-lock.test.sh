@@ -184,16 +184,49 @@ if section "Test 2b: crash recovery under CONTENTION — claim-serialized: zero 
 # WINNER'S live lock), the attempt is kept only if its outcome is clean and
 # otherwise discarded and retried (bounded), instead of failing assertions
 # the protocol never violated.
-T2B_N=4
+#
+# Waiter count is swept over $T_AXIS_A (Bucket 6): one iteration at N=4 by
+# default (byte-identical to today) and at N=4,12,24 under GCL_TEST_SWEEP=1.
+# Every sweep iteration's assertions carry an " at N=<count>" tag so a sweep
+# failure says which N broke; that tag is SUPPRESSED in the default (non-sweep)
+# run (t2b_ntag empty) so the messages are byte-identical to today — the first
+# assertion already names the count via "$T2B_N waiters". The correctness
+# invariants asserted here (zero 98, exactly one steal, no move-aside, clean
+# final state) stay ok/bad strict (not envelope) at all N — but that requires
+# STALE >> the winner's EFFECTIVE hold, which grows with N under load (the
+# winner is one of N concurrent processes; oversubscription stretches the wall
+# time between its create and release), so STALE is floored to N when sweeping
+# (t2b_stale) — at the default floor it is the same 8 as today. The per-waiter
+# wall-clock budget scales too: MAX_WAIT = 30*N (=> 120 at N=4, today's value)
+# so a wide sweep, where the losing waiters acquire in sequence after the winner
+# releases, has time to drain instead of timing out and looking like a product
+# failure.
 T2B_TRIES=3   # per-round attempts; see the backdate_ghost note
+for T2B_N in $T_AXIS_A; do
+# MAX_WAIT and STALE: today's exact values (120 / 8) in the default (non-sweep)
+# run so the env passed to the library is byte-identical; only the sweep's wider
+# N raise them. MAX_WAIT scales 30*N (=> 120 at N=4 anyway). STALE floors to N so
+# a wide fan-out's load-stretched winner hold (the winner is one of N concurrent
+# processes) can never make its own live lock look stale and trigger a
+# legitimate-but-unwanted second steal.
+if [ "$GCL_TEST_SWEEP" = 1 ]; then
+  t2b_maxwait=$(( 30 * T2B_N ))
+  [ "$T2B_N" -gt 8 ] && t2b_stale="$T2B_N" || t2b_stale=8
+  t2b_ntag=" at N=$T2B_N"
+else
+  t2b_maxwait=120; t2b_stale=8; t2b_ntag=""
+fi
 t2b_fail=0; t2b_stole=0; t2b_old_shape=0; t2b_disp=0; t2b_98=0; t2b_retried=0
 for r in $(seq 1 "$T2B_ROUNDS"); do
   t2b_valid=0
   for try in $(seq 1 "$T2B_TRIES"); do
-    GHOST="tok.ghost.t2b.$r.$try"
+    # Ghost token carries an N segment only when sweeping (distinct per N); the
+    # default keeps today's exact "tok.ghost.t2b.$r.$try" so the lock CONTENT
+    # the library sees is byte-identical.
+    if [ "$GCL_TEST_SWEEP" = 1 ]; then GHOST="tok.ghost.t2b.$T2B_N.$r.$try"; else GHOST="tok.ghost.t2b.$r.$try"; fi
     LOCK="$WORK/recov.$r.lock"; RAN="$WORK/recov.$r.ran"; : > "$RAN"
     GRAVESEEN="$WORK/recov.$r.graveseen"; SAMPSTOP="$WORK/recov.$r.sampstop"
-    rm -f "$GRAVESEEN" "$SAMPSTOP" "$LOCK" "$LOCK.next"
+    rm -f "$GRAVESEEN" "$SAMPSTOP" "$LOCK" "$LOCK.next" "$WORK/recov.$r".*.log
     fabricate_lock "$LOCK" "$GHOST" "pid=999 host=ghost" # fresh mtime: not yet stale
     # Move-aside sampler: ANY .dead.* sighting at ANY moment during the round
     # means the implementation stages the steal through an intermediate file
@@ -207,21 +240,21 @@ for r in $(seq 1 "$T2B_ROUNDS"); do
       done
     ) &
     sampler=$!
-    pids=()
+    pids=(); waiter_logs=()
     for i in $(seq 1 "$T2B_N"); do
       : > "$WORK/recov.$r.$i.log"   # per-waiter logs: concurrent appends to one log drop lines
-      AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$WORK/recov.$r.$i.log" AGENT_LOCK_STALE_SECS=8 \
-        AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=120 \
+      waiter_logs+=("$WORK/recov.$r.$i.log")
+      AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$WORK/recov.$r.$i.log" AGENT_LOCK_STALE_SECS="$t2b_stale" \
+        AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT="$t2b_maxwait" \
         bash "$LIB" run -- bash -c 'echo ran >> "$1"; sleep 0.1' _ "$RAN" 2>/dev/null &
       pids+=($!)
     done
     t2b_sync=1
-    if ! sync_waiting_fresh "$LOCK" 60 "$WORK/recov.$r.1.log" "$WORK/recov.$r.2.log" \
-                            "$WORK/recov.$r.3.log" "$WORK/recov.$r.4.log"; then
+    if ! sync_waiting_fresh "$LOCK" 60 "${waiter_logs[@]}"; then
       t2b_sync=0
       for i in $(seq 1 "$T2B_N"); do
         grep -q "WAITING for lock" "$WORK/recov.$r.$i.log" 2>/dev/null \
-          || echo "  round $r: waiter $i never logged WAITING"
+          || echo "  N=$T2B_N round $r: waiter $i never logged WAITING"
       done
     fi
     backdate_ghost "$LOCK" "$GHOST" 9999; bd=$?   # all waiters now judge the ghost stale together
@@ -230,8 +263,8 @@ for r in $(seq 1 "$T2B_ROUNDS"); do
       wait "${pids[$((i-1))]}"; rc=$?
       case "$rc" in
         0)  ;;
-        98) round_98=$((round_98+1)); echo "  round $r: waiter $i rc=98 — displacement under the claim protocol" ;;
-        *)  round_badrc=$((round_badrc+1)); echo "  round $r: waiter $i rc=$rc (want 0)" ;;
+        98) round_98=$((round_98+1)); echo "  N=$T2B_N round $r: waiter $i rc=98 — displacement under the claim protocol" ;;
+        *)  round_badrc=$((round_badrc+1)); echo "  N=$T2B_N round $r: waiter $i rc=$rc (want 0)" ;;
       esac
     done
     touch "$SAMPSTOP"; wait "$sampler" 2>/dev/null
@@ -254,7 +287,7 @@ for r in $(seq 1 "$T2B_ROUNDS"); do
       { [ -e "$LOCK" ] || [ -e "$LOCK.next" ]; } && round_dirty=1
       if [ "$round_dirty" = 1 ]; then
         t2b_retried=$((t2b_retried+1))
-        echo "  round $r try $try: non-conclusive backdate AND dirty outcome — attempt discarded, retrying"
+        echo "  N=$T2B_N round $r try $try: non-conclusive backdate AND dirty outcome — attempt discarded, retrying"
         rm -f "$LOCK" "$LOCK.next" "$RAN" "$GRAVESEEN" "$SAMPSTOP"
         continue
       fi
@@ -266,38 +299,39 @@ for r in $(seq 1 "$T2B_ROUNDS"); do
     nran="$(grep -c ran "$RAN")"
     [ "$nran" = "$T2B_N" ] || {
       t2b_fail=1
-      echo "  round $r: only $nran/$T2B_N commands ran"
+      echo "  N=$T2B_N round $r: only $nran/$T2B_N commands ran"
     }
     [ -e "$LOCK" ] && {
       t2b_fail=1
-      echo "  round $r: leftover lock"
+      echo "  N=$T2B_N round $r: leftover lock"
     }
     [ -e "$LOCK.next" ] && {
       t2b_fail=1
-      echo "  round $r: leftover claim"
+      echo "  N=$T2B_N round $r: leftover claim"
     }
     [ -e "$GRAVESEEN" ] && {
       t2b_fail=1
-      echo "  round $r: a move-aside file (.dead.*) existed during recovery — the steal is staged through an intermediate file!"
+      echo "  N=$T2B_N round $r: a move-aside file (.dead.*) existed during recovery — the steal is staged through an intermediate file!"
     }
     t2b_stole=$((t2b_stole + $(grep -c "STOLE-BY-CLAIM" "$WORK/recov.$r.all.log")))
     t2b_old_shape=$((t2b_old_shape + $(grep -c "STOLE stale lock" "$WORK/recov.$r.all.log")))
     t2b_disp=$((t2b_disp + $(grep -c "STEAL-DISPLACED" "$WORK/recov.$r.all.log")))
     break
   done
-  [ "$t2b_valid" = 1 ] || { t2b_fail=1; echo "  round $r: no clean round under a conclusive backdate in $T2B_TRIES attempts"; }
+  [ "$t2b_valid" = 1 ] || { t2b_fail=1; echo "  N=$T2B_N round $r: no clean round under a conclusive backdate in $T2B_TRIES attempts"; }
 done
-[ "$t2b_retried" = 0 ] || echo "  note: $t2b_retried discarded attempt(s) — harness backdate race, not a protocol verdict"
+[ "$t2b_retried" = 0 ] || echo "  note: $t2b_retried discarded attempt(s) at N=$T2B_N — harness backdate race, not a protocol verdict"
 [ "$t2b_fail" = 0 ] && ok "$T2B_ROUNDS rounds x $T2B_N waiters on one crashed lock: all ran, clean final state, no move-aside file ever existed" \
-  || bad "crash-recovery contention failure (see above)"
-[ "$t2b_98" = 0 ] && ok "zero spurious 98s — the claim serialized recovery (unserialized: near-certain displacement)" \
-  || bad "$t2b_98 waiter(s) exited 98 — displacement happened under the claim protocol"
-[ "$t2b_stole" = "$T2B_ROUNDS" ] && ok "exactly one STOLE-BY-CLAIM per recovery (x$t2b_stole/$T2B_ROUNDS rounds)" \
-  || bad "STOLE-BY-CLAIM count $t2b_stole != $T2B_ROUNDS rounds (want exactly one steal per recovery)"
-[ "$t2b_old_shape" = 0 ] && ok "unserialized-steal line shape ('STOLE stale lock') never logged" \
-  || bad "'STOLE stale lock' line appeared x$t2b_old_shape — an unserialized steal lane is present"
-[ "$t2b_disp" = 0 ] && ok "zero STEAL-DISPLACED lines (prevention, not detect-and-repair)" \
-  || bad "STEAL-DISPLACED fired x$t2b_disp — displacement-repair machinery present?"
+  || bad "crash-recovery contention failure$t2b_ntag (see above)"
+[ "$t2b_98" = 0 ] && ok "zero spurious 98s$t2b_ntag — the claim serialized recovery (unserialized: near-certain displacement)" \
+  || bad "$t2b_98 waiter(s) exited 98$t2b_ntag — displacement happened under the claim protocol"
+[ "$t2b_stole" = "$T2B_ROUNDS" ] && ok "exactly one STOLE-BY-CLAIM per recovery$t2b_ntag (x$t2b_stole/$T2B_ROUNDS rounds)" \
+  || bad "STOLE-BY-CLAIM count $t2b_stole != $T2B_ROUNDS rounds$t2b_ntag (want exactly one steal per recovery)"
+[ "$t2b_old_shape" = 0 ] && ok "unserialized-steal line shape ('STOLE stale lock') never logged$t2b_ntag" \
+  || bad "'STOLE stale lock' line appeared x$t2b_old_shape$t2b_ntag — an unserialized steal lane is present"
+[ "$t2b_disp" = 0 ] && ok "zero STEAL-DISPLACED lines$t2b_ntag (prevention, not detect-and-repair)" \
+  || bad "STEAL-DISPLACED fired x$t2b_disp$t2b_ntag — displacement-repair machinery present?"
+done
 fi
 
 if section "Test 3: REGRESSION — EMPTY lock file (crash between create and write) is still stolen"; then
@@ -1073,36 +1107,77 @@ if section "Test 20: claim contention — N concurrent stealers, ONE claim winne
 # N stealers race one ancient ghost: exactly one wins the O_EXCL claim and
 # steals (one STOLE-BY-CLAIM); the rest lose the claim create and acquire
 # normally in sequence after the winner releases. No displacement (zero
-# LOST/98), no leftovers. STALE=5 keeps a loaded box from re-stealing the
-# winner's brief hold.
+# LOST/98), no leftovers. STALE keeps a loaded box from re-stealing the
+# winner's brief hold — that bound only holds while STALE >> the winner's
+# effective hold, which (counter-intuitively) grows with N: the WINNER is one
+# of N concurrently-spawned bash processes, so under oversubscription the wall
+# time between its create and its release stretches with the contention. So
+# STALE must scale with N too (see t20_stale below), keeping "exactly one
+# steal" a strict, config-independent correctness invariant at every N.
+#
+# Waiter count is swept (Bucket 6). Unlike Test 2b/16, this test's floor is NOT
+# 4 — it is the MODE-driven $T20_N (5 REDUCED / 10 FULL), the count CI already
+# stresses. So instead of iterating the shared T_AXIS_A ("4 ...") it builds its
+# own list: just $T20_N by default (byte-identical), and $T20_N plus the sweep's
+# higher counts (12, 24) under GCL_TEST_SWEEP=1 — preserving today's per-PR AND
+# full-mode coverage while still widening the sweep. MAX_WAIT scales 30*N (the
+# workers run `true`, so this is ample headroom, never the floor's behaviour).
 LOCK="$WORK/contend.lock"
-fabricate_lock "$LOCK" "tok.ghost.t20" "pid=888 host=ghost"
+T20_FLOOR="$T20_N"
+if [ "$GCL_TEST_SWEEP" = 1 ]; then
+  T20_AXIS="$T20_FLOOR"
+  for _n in 12 24; do [ "$_n" = "$T20_FLOOR" ] || T20_AXIS="$T20_AXIS $_n"; done
+else
+  T20_AXIS="$T20_FLOOR"
+fi
+for T20_N in $T20_AXIS; do
+# N-tag for assertion messages: empty in the default run (byte-identical), set
+# only when sweeping so each N's pass/fail line is attributable.
+if [ "$GCL_TEST_SWEEP" = 1 ]; then t20_ntag=" at N=$T20_N"; else t20_ntag=""; fi
+# MAX_WAIT and STALE: keep today's exact values (120 / 5) in the default
+# (non-sweep) run so the env passed to the library is byte-identical; only the
+# sweep's wider N raise them. MAX_WAIT scales 30*N (workers run `true`, ample
+# headroom). STALE floors to N so a wide fan-out's load-stretched winner hold
+# can NEVER make a live lock look stale -> the "exactly one steal" invariant
+# stays true at N=24 just as at the floor. The fixture ghost token likewise
+# carries an N segment only when sweeping (distinct tokens per N), so the
+# default lock CONTENT the library sees is unchanged too.
+if [ "$GCL_TEST_SWEEP" = 1 ]; then
+  t20_maxwait=$(( 30 * T20_N ))
+  [ "$T20_N" -gt 5 ] && t20_stale="$T20_N" || t20_stale=5
+  t20_ghost="tok.ghost.t20.$T20_N"
+else
+  t20_maxwait=120; t20_stale=5; t20_ghost="tok.ghost.t20"
+fi
+rm -f "$WORK/contend".*.log "$LOCK" "$LOCK.next"
+fabricate_lock "$LOCK" "$t20_ghost" "pid=888 host=ghost"
 backdate "$LOCK" 9999
 pids=(); t20_fail=0
 for i in $(seq 1 "$T20_N"); do
   : > "$WORK/contend.$i.log"
-  AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$WORK/contend.$i.log" AGENT_LOCK_STALE_SECS=5 \
-    AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=120 \
+  AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$WORK/contend.$i.log" AGENT_LOCK_STALE_SECS="$t20_stale" \
+    AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT="$t20_maxwait" \
     bash "$LIB" run -- bash -c 'true' 2>/dev/null &
   pids+=($!)
 done
 for i in $(seq 1 "$T20_N"); do
   wait "${pids[$((i-1))]}"; rc=$?
-  [ "$rc" = 0 ] || { t20_fail=1; echo "  worker $i rc=$rc (want 0)"; }
+  [ "$rc" = 0 ] || { t20_fail=1; echo "  N=$T20_N worker $i rc=$rc (want 0)"; }
 done
 cat "$WORK/contend."*.log > "$WORK/contend.all.log"
 nst="$(grep -c "STOLE-BY-CLAIM" "$WORK/contend.all.log")"
 nacq="$(grep -c "ACQUIRED" "$WORK/contend.all.log")"
 nrel="$(grep -c "RELEASED" "$WORK/contend.all.log")"
 nlost="$(grep -c "lock LOST" "$WORK/contend.all.log")"
-[ "$t20_fail" = 0 ] && ok "$T20_N concurrent stealers all completed with rc 0" || bad "claim-contention worker failures (see above)"
-[ "$nst" = 1 ] && ok "exactly ONE claim winner stole the ghost (STOLE-BY-CLAIM x$nst)" \
-               || bad "STOLE-BY-CLAIM x$nst (want exactly 1 — the claim must serialize stealers)"
+[ "$t20_fail" = 0 ] && ok "$T20_N concurrent stealers all completed with rc 0" || bad "claim-contention worker failures$t20_ntag (see above)"
+[ "$nst" = 1 ] && ok "exactly ONE claim winner stole the ghost$t20_ntag (STOLE-BY-CLAIM x$nst)" \
+               || bad "STOLE-BY-CLAIM x$nst$t20_ntag (want exactly 1 — the claim must serialize stealers)"
 [ "$nacq" = "$T20_N" ] && [ "$nrel" = "$T20_N" ] && ok "balanced ACQUIRED/RELEASED ($nacq/$nrel of $T20_N)" \
-                                                  || bad "ACQUIRED=$nacq RELEASED=$nrel (want $T20_N each)"
-[ "$nlost" = 0 ] && ok "zero LOST warnings under claim contention" || bad "$nlost LOST warnings under claim contention"
-[ -e "$LOCK" ] && bad "leftover lock after contention" || ok "no leftover lock"
-[ -e "$LOCK.next" ] && bad "leftover claim after contention" || ok "no leftover claim"
+                                                  || bad "ACQUIRED=$nacq RELEASED=$nrel$t20_ntag (want $T20_N each)"
+[ "$nlost" = 0 ] && ok "zero LOST warnings under claim contention$t20_ntag" || bad "$nlost LOST warnings under claim contention$t20_ntag"
+[ -e "$LOCK" ] && bad "leftover lock after contention$t20_ntag" || ok "no leftover lock$t20_ntag"
+[ -e "$LOCK.next" ] && bad "leftover claim after contention$t20_ntag" || ok "no leftover claim$t20_ntag"
+done
 fi
 
 if section "Test 21: crashed-claimant and empty-claim orphans age out; steals resume"; then
