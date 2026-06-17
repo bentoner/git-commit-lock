@@ -2497,6 +2497,559 @@ grep -q "WARNING" "$LOG" \
   || ok "displaced holder's exec-0 emitted NO WARNING at all (unwarned silent loss)"
 rm -f "$LOCK"
 
+echo "== Test 41: forward clock jump steals a live lock — detected as 98, never silent (E2) =="
+# Staleness is age = now - mtime (git-commit-lock.sh ~:928, ~:1409), where `now`
+# is _lock_now. A process whose clock has LEAPED FORWARD computes an inflated age
+# for everyone's lock, so it can judge a LIVE, fresh lock ancient and steal it.
+# This is correctness-safe but liveness-degraded: it degrades into the already-
+# handled robbed-holder lane (Test 4b) — the displaced holder DETECTS the theft
+# at release and exits 98 with a loud WARNING; it never silently double-commits.
+#
+# Steering (no real sleep/backdate): holder H acquires and HOLDS a fresh lock on
+# a NORMAL clock. Waiter W has _lock_now shadowed to return the real now PLUS a
+# large offset (+9999s), so H's just-created lock looks ~9999s old to W and W
+# steals it. STALE=100 means the lock is genuinely fresh under a normal clock
+# (without the jump W would block, never steal — the jump is what's causal);
+# CLAIM_STALE=99999 keeps W's own just-created claim (also judged ~9999s old by
+# W's jumped clock) well under the claim-stale window, so W's recheck does not
+# self-abort (contested) and the steal proceeds to rename.
+LOCK="$WORK/fwdjump.lock"; LOG="$WORK/fwdjump.log"; : > "$LOG"; OUT="$WORK/fwdjump-out"; : > "$OUT"
+READY="$WORK/t41.ready"; TDONE="$WORK/t41.thief-done"
+# Holder H (sourced, NORMAL clock): create+hold a fresh lock, signal READY, hold
+# until told the waiter is done, then release and exit with the release rc.
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=100 \
+  AGENT_LOCK_CLAIM_STALE_SECS=99999 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=120 \
+  bash -c '
+    source "$1" || exit 70
+    lock_acquire || exit 72
+    echo h-work >> "$2"
+    touch "$3"
+    until [ -e "$4" ]; do sleep 0.05; done
+    lock_release
+    exit $?
+  ' _ "$LIB" "$OUT" "$READY" "$TDONE" &
+hpid=$!
+wait_for_file "$READY" || bad "T41 holder never signalled ready (lock not held)"
+# Waiter W (sourced, clock JUMPED +9999s): _lock_now returns real now + offset, so
+# every age it computes is inflated and H's fresh lock reads as ancient. W acquires
+# (by stealing) then releases; run in the FOREGROUND so its rc is captured.
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=100 \
+  AGENT_LOCK_CLAIM_STALE_SECS=99999 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=30 \
+  bash -c '
+    source "$1" || exit 70
+    clone_fn _lock_now _now_orig
+    _lock_now() { echo $(( $(_now_orig) + 9999 )); }
+    lock_acquire || exit 72
+    echo w-work >> "$2"
+    lock_release
+    exit $?
+  ' _ "$LIB" "$OUT"
+wpid_rc=$?
+touch "$TDONE"
+wait "$hpid"; h_rc=$?
+# W judged H's live, fresh lock ancient under the jumped clock and stole it.
+grep -q "STOLE-BY-CLAIM" "$LOG" \
+  && ok "forward-jumped waiter stole a LIVE fresh lock (STOLE-BY-CLAIM)" \
+  || bad "no STOLE-BY-CLAIM — jumped waiter did not steal the live lock"
+[ "$wpid_rc" = 0 ] && ok "thief (its own fresh hold) released cleanly (rc 0)" \
+                   || bad "thief rc=$wpid_rc (its own fresh hold should release 0)"
+grep -q w-work "$OUT" && ok "thief did its work" || bad "thief work missing"
+# The proof: the premature steal was DETECTED, not silent — H exits exactly 98.
+[ "$h_rc" = 98 ] && ok "robbed holder detected the premature steal — exits exactly 98" \
+                 || bad "robbed holder rc=$h_rc (forward-jump steal must degrade to 98, never silent)"
+grep -q "WARNING: lock LOST" "$LOG" \
+  && ok "robbed holder logged a loud theft WARNING (no silent double-commit)" \
+  || bad "no theft WARNING logged for the forward-jump steal"
+rm -f "$LOCK" "$LOCK.next"
+
+echo "== Test 42: mtime unreadable — staleness disabled, fail-safe (no steal), warn-once, 97 (E3) =="
+# §E3: if the lock file's mtime cannot be read AT ALL (every probe fails on a
+# PRESENT file), staleness detection is BROKEN. The mtime floor fails closed to
+# "fresh": _lock_verify_stale returns state=fresh, so a crashed/stale holder is
+# NEVER stolen — recovery is disabled and waiters block to MAX_WAIT (97). The
+# tool must say so LOUDLY, exactly once per process. Test 1 only asserts the
+# NEGATIVE (the warning must NOT fire under healthy contention); this drives the
+# positive lane.
+#
+# Steering: shadow _lock_stat_mtime — the INNER single-probe (sh:606, runs
+# stat/date and prints the epoch) — to return EMPTY for the LOCK path while it
+# is PRESENT. We must NOT shadow _lock_path_mtime (sh:629): that is the 3x-retry
+# wrapper that EMITS the warn-once, so shadowing it would remove the very
+# warning we assert. With the inner probe empty on a present file,
+# _lock_path_mtime retries 3x, sees the file present-but-unreadable, fires the
+# warn-once and sets _LOCK_MTIME="" -> _lock_verify_stale -> fresh -> no steal.
+# The shadow returns empty ONLY for the lock path: _lock_stat_mtime is also used
+# for the CLAIM file's mtime (sh:1120/1230), which must keep working, and other
+# paths fall through to the real probe.
+T42_LOCK="$WORK/t42.lock"; T42_LOG="$WORK/t42.log"; T42_ERR="$WORK/t42.err"
+: > "$T42_LOG"; : > "$T42_ERR"
+# A STALE ghost that WOULD normally be stolen (backdated 9999s, well past STALE):
+# the whole point is that it is NOT stolen because its age can't be established.
+fabricate_lock "$T42_LOCK" "tok.ghost.t42.99999" "pid=99999 host=ghost"
+backdate "$T42_LOCK" 9999
+T42_INNER='
+  source "$1" || exit 70
+  clone_fn _lock_stat_mtime _sm_orig
+  # Return EMPTY for the present lock path; defer to the real probe otherwise
+  # (the claim-file mtime at sh:1120/1230 must stay readable).
+  _lock_stat_mtime() {
+    if [ "$1" = "$AGENT_LOCK_PATH" ]; then printf ""; return 0; fi
+    _sm_orig "$@"
+  }
+  lock_acquire; exit $?
+'
+# Tight timing: small MAX_WAIT so the blocked waiter reaches 97 in ~2-3s.
+AGENT_LOCK_PATH="$T42_LOCK" AGENT_LOCK_LOG="$T42_LOG" AGENT_LOCK_STALE_SECS=2 \
+  AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=2 \
+  bash -c "$T42_INNER" _ "$LIB" 2>"$T42_ERR"; t42_rc=$?
+
+# (1) The fail-safe lane ran: the warn-once line appears. It is logged via
+#     _lock_log (lock log) AND echoed to stderr; assert either surface.
+if grep -q "Staleness detection is BROKEN" "$T42_LOG" "$T42_ERR" 2>/dev/null \
+   || grep -q "cannot read the lock file's mtime" "$T42_ERR" 2>/dev/null; then
+  ok "mtime-unreadable: 'Staleness detection is BROKEN' fail-safe warning fired"
+else
+  bad "mtime-unreadable: no broken-staleness warning (fail-safe lane did not run); err=$(cat "$T42_ERR")"
+fi
+# (2) NO steal: the stale ghost is NOT stolen and is left in place.
+if grep -q "STOLE-BY-CLAIM" "$T42_LOG" 2>/dev/null || grep -q "STOLE" "$T42_LOG" 2>/dev/null; then
+  bad "mtime-unreadable: ghost was STOLEN — staleness should have been disabled"
+else
+  ok "mtime-unreadable: no steal (recovery disabled, ghost not stolen)"
+fi
+g42="$(head -n 1 -- "$T42_LOCK" 2>/dev/null | tr -d '\r')"
+[ "$g42" = "tok.ghost.t42.99999" ] \
+  && ok "mtime-unreadable: stale ghost lock left in place (token unchanged)" \
+  || bad "mtime-unreadable: ghost lock disturbed (line1=$g42, want tok.ghost.t42.99999)"
+# (3) The waiter blocks to MAX_WAIT and exits 97 (recovery disabled).
+[ "$t42_rc" = 97 ] \
+  && ok "mtime-unreadable: waiter blocked to MAX_WAIT and exited 97" \
+  || bad "mtime-unreadable: waiter rc=$t42_rc (want 97 — was the stale ghost stolen?)"
+# (4) Warn-once: the broken-staleness warning fires EXACTLY once per process.
+t42_warns="$(grep -c "Staleness detection is BROKEN" "$T42_ERR" 2>/dev/null || echo 0)"
+[ "$t42_warns" -le 1 ] \
+  && ok "mtime-unreadable: broken-staleness warning fired at most once on stderr ($t42_warns)" \
+  || bad "mtime-unreadable: warning repeated ($t42_warns times — warn-once broken)"
+rm -f "$T42_LOCK" "$T42_LOCK.next"
+
+echo "== Test 43: malformed/unreadable lock content at the poll guard — never stolen, warned/skipped =="
+# Two sibling branches of the in-acquire steal CONTENT GUARD (git-commit-lock.sh
+# ~:1419-1444), both gated on an already-stale candidate, neither of which the
+# torn/empty/tok.-prefixed cases (Tests 17/18) reach:
+#   (a) #18 — line 1 is NON-EMPTY but BLANK (whitespace/CR only): the trim at
+#       :1421 reduces it to empty, but the file is NOT empty (`-s` true) and the
+#       read SUCCEEDED, so it lands in the final `else` -> _lock_warn_nonlock
+#       "its content is not lock-shaped" (the `is not a lock file` config
+#       warning). NO steal; waiters reach 97.
+#   (b) #17 — the content read FAILS on a present, non-empty regular file (the
+#       `[ "$rdrc" -ne 0 ]` lane at :1432): logs "steal skipped: stale lock
+#       content unreadable"; NO steal; waiters reach 97. We can't make a real
+#       file unreadable on every platform (a chmod-000 file still reads for its
+#       owner on Windows/Cygwin), so we STEER it: source the lib in-process and
+#       shadow the `read` builtin to fail ONLY for the inline steal-guard read,
+#       identified by its direct caller `lock_acquire` (FUNCNAME[1]) — the
+#       _lock_read_tok / _lock_verify_stale reads delegate to `builtin read`, so
+#       only the :1420 site is perturbed.
+
+# (a) #18 — whitespace-only line 1: non-empty, blank, read OK -> never stolen, warned.
+LOCK="$WORK/t43blank.lock"; LOG="$WORK/t43blank.log"; : > "$LOG"
+printf ' \n' > "$LOCK"; backdate "$LOCK" 9999          # one space + LF: non-empty, blank line 1
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+  AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=2 \
+  bash "$LIB" run -- bash -c 'true' 2> "$WORK/t43a.err"; rc=$?
+[ "$rc" = 97 ] && ok "#18 blank line 1: waiter timed out (97) instead of stealing" \
+               || bad "#18 blank line 1: rc=$rc (want 97)"
+grep -q "is not a lock file" "$WORK/t43a.err" \
+  && ok "#18 config warning fired (line 1 not lock-shaped)" || bad "#18 no config warning for blank line 1"
+grep -q "non-lock object at lock path (its content is not lock-shaped)" "$LOG" \
+  && ok "#18 log records the non-lock-shaped classification (branch ran)" \
+  || bad "#18 missing the non-lock-shaped log line (branch did not run)"
+grep -q "STOLE" "$LOG" && bad "#18 blank-content file was STOLEN" || ok "#18 no steal of the blank-content file"
+[ -f "$LOCK" ] && ok "#18 blank-content file left in place" || bad "#18 blank-content file was removed"
+rm -f "$LOCK"
+
+# (b) #17 — steal-guard content read FAILS on a present, non-empty file.
+# Steering shell: source the lib, shadow the `read` builtin to fail ONLY when
+# invoked directly by lock_acquire (the inline steal read at sh:1420). The ghost
+# is tok.-prefixed and ancient, so absent the shadow it WOULD be stolen — the
+# 97 outcome plus the "steal skipped ... unreadable" line prove the failed-read
+# lane (not some other refusal) is what blocked the steal.
+LOCK="$WORK/t43unread.lock"; LOG="$WORK/t43unread.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t43" "pid=9 host=ghost"; backdate "$LOCK" 9999
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+  AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=2 \
+  bash -c '
+    source "$1" || exit 70
+    # Shadow the read builtin; reach the real one via `builtin read`. Fail only
+    # the steal-guard read (its direct caller is lock_acquire) so the
+    # _lock_read_tok / _lock_verify_stale reads stay intact.
+    read() {
+      if [ "${FUNCNAME[1]:-}" = lock_acquire ]; then return 1; fi
+      builtin read "$@"
+    }
+    lock_acquire || exit 97
+    lock_release || exit 74
+    exit 0
+  ' _ "$LIB" 2> "$WORK/t43b.err"; rc=$?
+[ "$rc" = 97 ] && ok "#17 unreadable steal content: waiter timed out (97) instead of stealing" \
+               || bad "#17 unreadable steal content: rc=$rc (want 97)"
+grep -q "steal skipped: stale lock content unreadable" "$LOG" \
+  && ok "#17 log records the skipped steal (unreadable branch ran)" \
+  || bad "#17 missing the 'steal skipped ... unreadable' log line (branch did not run)"
+grep -q "STOLE" "$LOG" && bad "#17 ghost was STOLEN despite the unreadable content read" \
+                       || ok "#17 no steal while the steal-guard read fails"
+[ -f "$LOCK" ] && ok "#17 stale ghost left in place" || bad "#17 stale ghost was removed"
+rm -f "$LOCK"
+
+echo "== Test 44: socket & device-node at the lock path — never stolen/deleted, refused (97) =="
+# The never-steal wrong-type guard (git-commit-lock.sh ~:1557-1567) classifies
+# NON-regular objects at the lock path so they are NEVER stolen and NEVER
+# deleted: a real config error (a typo'd AGENT_LOCK_PATH, a stray special file)
+# must wedge waiters to 97 with a loud one-time config warning, not get
+# clobbered. Test 17 covers the directory / symlink / FIFO arms of that
+# classifier; this test covers the two remaining arms — the SOCKET (-S) and the
+# DEVICE NODE (-b/-c) — both of which name their detected type in the warning.
+# For each: rc 97, the object survives unchanged (same type), the warning fires
+# naming the type, and nothing is ever stolen.
+
+# (a) a UNIX-DOMAIN SOCKET at the lock path. Fabricated with a backgrounded
+# python3 AF_UNIX bind (the socket inode persists while the process holds it);
+# skipped where a real socket can't be made AND classified -S by the running
+# shell — notably default Git-Bash on Windows, whose bundled python is a native
+# build with no socket.AF_UNIX (probed: bind raises AttributeError, so no inode
+# appears). CI's POSIX legs exercise this arm. The listener is reaped by its
+# EXACT pid at the end (never by name).
+LOCK="$WORK/sock.lock"; LOG="$WORK/sock.log"; : > "$LOG"
+SOCKERR="$WORK/sock.py.err"; sock_pid=""; sock_ok=0
+if command -v python3 >/dev/null 2>&1; then
+  rm -f "$LOCK"
+  python3 -c 'import socket,sys,time
+s=socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1])
+sys.stderr.write("bound\n"); sys.stderr.flush()
+time.sleep(30)' "$LOCK" 2> "$SOCKERR" &
+  sock_pid=$!
+  # Gate on the socket actually existing AND classifying -S (not just the pid
+  # being alive): on a no-AF_UNIX build the process exits immediately with no
+  # inode, so we must positively confirm the object before relying on it.
+  for _ in $(seq 1 100); do
+    [ -S "$LOCK" ] && { sock_ok=1; break; }
+    kill -0 "$sock_pid" 2>/dev/null || break
+    sleep 0.05
+  done
+fi
+if [ "$sock_ok" = 1 ]; then
+  AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+    AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=3 \
+    bash "$LIB" run -- bash -c 'true' 2> "$WORK/t44a.err"; rc=$?
+  [ "$rc" = 97 ] && ok "socket at lock path: waiter timed out (97), command never ran" \
+                 || bad "socket at lock path: rc=$rc (want 97)"
+  [ -S "$LOCK" ] && ok "socket untouched (never stolen/deleted, still a socket)" \
+                 || bad "socket at lock path was removed/replaced!"
+  grep -q "is not a lock file" "$WORK/t44a.err" && ok "loud config warning on stderr (socket)" \
+                                                || bad "no config warning for socket at lock path"
+  grep -q "it is a socket" "$WORK/t44a.err" && ok "warning names the detected type (socket)" \
+                                            || bad "warning does not name the socket type"
+  n="$(grep -c "is not a lock file" "$WORK/t44a.err")"
+  [ "$n" = 1 ] && ok "socket config warning fired exactly once per process (got $n)" \
+               || bad "socket config warning fired $n times (want 1)"
+  grep -q STOLE "$LOG" && bad "socket was STOLEN" || ok "no steal attempted on a socket"
+else
+  echo "note: cannot create a unix-domain socket here (no socket.AF_UNIX / not classified -S) — socket guard not exercised (CI POSIX legs cover it)"
+fi
+# Reap the listener by ITS exact pid only (bounded wait, then hard-kill of the
+# same pid as a last resort) — never by name. Harmless if it already exited.
+if [ -n "$sock_pid" ]; then
+  kill "$sock_pid" 2>/dev/null
+  for _ in $(seq 1 40); do kill -0 "$sock_pid" 2>/dev/null || break; sleep 0.05; done
+  kill -0 "$sock_pid" 2>/dev/null && kill -9 "$sock_pid" 2>/dev/null
+  wait "$sock_pid" 2>/dev/null
+fi
+rm -f "$LOCK"
+
+# (b) a DEVICE NODE at the lock path. mknod needs root, but /dev/null is a
+# character device that always exists, so we point AGENT_LOCK_PATH straight at
+# it: the -c arm of the classifier must refuse it. This is SAFE precisely
+# because the guard refuses — it is never opened-for-write, stolen, or deleted —
+# which the post-run assertion below proves (/dev/null is still a char device).
+# Skipped only if /dev/null somehow isn't a char device on this platform.
+if [ -c /dev/null ]; then
+  LOG="$WORK/dev.log"; : > "$LOG"
+  AGENT_LOCK_PATH="/dev/null" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+    AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=3 \
+    bash "$LIB" run -- bash -c 'true' 2> "$WORK/t44b.err"; rc=$?
+  [ "$rc" = 97 ] && ok "device node (/dev/null) at lock path: waiter timed out (97), command never ran" \
+                 || bad "device node at lock path: rc=$rc (want 97)"
+  [ -c /dev/null ] && ok "/dev/null untouched (never stolen/deleted, still a char device)" \
+                   || bad "/dev/null was damaged — the guard must NEVER touch a device node!"
+  grep -q "is not a lock file" "$WORK/t44b.err" && ok "loud config warning on stderr (device node)" \
+                                                || bad "no config warning for device node at lock path"
+  grep -q "it is a device node" "$WORK/t44b.err" && ok "warning names the detected type (device node)" \
+                                                 || bad "warning does not name the device-node type"
+  n="$(grep -c "is not a lock file" "$WORK/t44b.err")"
+  [ "$n" = 1 ] && ok "device-node config warning fired exactly once per process (got $n)" \
+               || bad "device-node config warning fired $n times (want 1)"
+  grep -q STOLE "$LOG" && bad "device node was STOLEN" || ok "no steal attempted on a device node"
+else
+  echo "note: /dev/null is not a char device here — device-node guard not exercised (CI POSIX legs cover it)"
+fi
+
+
+echo "== Test 45: log self-truncates past ~1 MB (rotation, not unbounded growth) =="
+# _lock_log starts the log over (not rotate) once it grows past ~1MB: the size
+# check at the top of _lock_log truncates the file to empty before the write,
+# so a normal log-producing op on an oversized log leaves a small, well-formed
+# log carrying only the fresh protocol lines. Pre-fill > 1MB, run one clean
+# acquire+release, assert the log SHRANK and the lock still worked.
+LOCK="$WORK/t45.lock"; LOG="$WORK/t45.log"
+# Pre-fill comfortably above the 1048576-byte (1MB) threshold (~1.2MB of 'x').
+head -c 1200000 /dev/zero | tr '\0' 'x' > "$LOG"
+before=$(wc -c < "$LOG")
+[ "$before" -gt 1048576 ] && ok "pre-fill exceeds the 1MB threshold (${before} bytes)" \
+                          || bad "pre-fill not over threshold (${before} bytes)"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" bash "$LIB" run -- bash -c 'true'; rc=$?
+[ "$rc" = 0 ] && ok "lock op succeeded over an oversized log (rc=0)" \
+             || bad "lock op rc=$rc over oversized log (want 0)"
+after=$(wc -c < "$LOG")
+# Truncation fired iff the log is now far below the threshold (it holds only a
+# handful of fresh lines). Use 1MB as the boundary: any non-truncation leaves
+# it at/above the 1.2MB pre-fill.
+[ "$after" -lt 1048576 ] && ok "log shrank below threshold after the op (${before} -> ${after} bytes — rotation fired)" \
+                         || bad "log did NOT shrink (${before} -> ${after} bytes — truncation never fired)"
+# Well-formed: the new log carries the fresh protocol lines, not the old giant
+# 'x' content, and records the truncation.
+grep -q 'log exceeded 1MB; truncated' "$LOG" && ok "log records the self-truncation notice" \
+                                             || bad "no truncation notice in the restarted log"
+grep -q 'ACQUIRED' "$LOG" && grep -q 'RELEASED' "$LOG" \
+  && ok "restarted log carries fresh ACQUIRED + RELEASED protocol lines" \
+  || bad "restarted log missing fresh protocol lines (ACQUIRED/RELEASED)"
+grep -q 'xxxx' "$LOG" && bad "old oversized 'x' content survived into the restarted log" \
+                      || ok "old oversized content is gone (clean restart, not appended)"
+[ -e "$LOCK" ] && bad "lock left held after run" || ok "lock released after the over-threshold run"
+rm -f "$LOCK" "$LOG"
+
+echo "== Test 46: EXIT while waiting (no hold) — no-hold trap arc, no spurious release =="
+# A10 (steering-coverage.md): _lock_on_exit's no-hold arc-end (:1009,1017-1018).
+# A sourced waiter, blocked in the wait loop against a LIVE held lock, exits 0
+# while still parked — the EXIT trap is STILL '_lock_on_exit' (the timeout's
+# trap-restore has NOT run, because we never time out), so EXIT fires the
+# handler on the NO-HOLD path: claim-trap cleanup (no token => no-op),
+# leaked-resolve, restore traps. NO release semantics may run (we never held).
+#
+# Why interposition and not "lock_acquire times out 97 then exit": the 97
+# timeout path itself runs _lock_restore_traps BEFORE returning, so by the time
+# the caller exits the EXIT trap is already gone and _lock_on_exit never fires
+# (verified: post-97 `trap -p EXIT` is empty). To exercise the EXIT-while-
+# WAITING arc the process must leave the loop via `exit` with the trap still
+# armed — so W shadows `sleep` (called once per poll inside the wait loop) to
+# park on a marker, then `exit 0` from inside that first poll-sleep. At that
+# point _LOCK_HELD=0 and no claim is in flight (the live lock is never stale, so
+# no steal/claim was attempted), which is exactly the no-hold arc.
+T46_INNER='
+  source "$1" || exit 70
+  F46=0
+  sleep() {
+    if [ "$F46" = 0 ]; then
+      F46=1
+      command touch "$T46R"                 # signal: parked in the wait loop
+      until [ -e "$T46G" ]; do command sleep 0.05; done
+      # Record the live EXIT trap so the assertions can prove _lock_on_exit
+      # (not a bare/restored trap) is what fires on the exit below.
+      trap -p EXIT > "$T46T"
+      exit 0                                  # EXIT while waiting, no hold held
+    fi
+    command sleep "$@"
+  }
+  lock_acquire
+  echo "REACHED-UNEXPECTED rc=$?" >&2        # the shadowed sleep must exit first
+'
+LOCK="$WORK/exitwait.lock"; LOG="$WORK/exitwait.log"; : > "$LOG"
+HLOG="$WORK/exitwait.h.log"; : > "$HLOG"
+T46R="$WORK/t46.ready"; T46G="$WORK/t46.go"; T46T="$WORK/t46.trap"
+rm -f "$T46R" "$T46G" "$T46T" "$LOCK" "$LOCK.next"
+# H: holder — sourced, takes a FRESH live lock and parks until released. STALE is
+# huge so the lock is never judged stealable; W therefore stays a pure waiter.
+HR="$WORK/t46.hready"; HG="$WORK/t46.hgo"; rm -f "$HR" "$HG"
+HR="$HR" HG="$HG" \
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$HLOG" AGENT_LOCK_STALE_SECS=600 \
+  AGENT_LOCK_CLAIM_STALE_SECS=600 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=60 \
+  bash -c '
+    source "$1" || exit 70
+    lock_acquire || exit 72
+    touch "$HR"
+    until [ -e "$HG" ]; do sleep 0.05; done
+    lock_release
+  ' _ "$LIB" 2>/dev/null &
+h46=$!
+wait_for_file "$HR" 30 || bad "T46 holder never acquired the lock"
+htok=""; IFS= read -r htok < "$LOCK" || true       # the live holder's token
+# W: the waiter that will exit while parked in the wait loop (no hold).
+T46R="$T46R" T46G="$T46G" T46T="$T46T" \
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=600 \
+  AGENT_LOCK_CLAIM_STALE_SECS=600 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=60 \
+  bash -c "$T46_INNER" _ "$LIB" 2>/dev/null &
+w46=$!
+# Gate on W proving it reached the wait-loop poll (its WAITING line is logged,
+# and its shadowed sleep touched the ready marker) before releasing it to exit.
+wait_for_grep "WAITING for lock" "$LOG" 30 || bad "T46 waiter never logged WAITING"
+wait_for_file "$T46R" 30 || bad "T46 waiter never reached its wait-loop poll"
+touch "$T46G"
+wait "$w46"; rc=$?
+# Core assertion: W exited cleanly via the EXIT no-hold arc, with NO release
+# semantics — it never held the lock, so a RELEASED or a 98/'lock LOST' would
+# mean the handler wrongly ran the holding branch.
+[ "$rc" = 0 ] && ok "waiter exited 0 via the EXIT-while-waiting no-hold arc" \
+              || bad "T46 waiter rc=$rc (want 0; EXIT trap mishandled the no-hold arc?)"
+grep -q RELEASED "$LOG" && bad "spurious RELEASED on the no-hold EXIT arc (release ran without a hold)" \
+                        || ok "no RELEASED on the no-hold EXIT arc (no release semantics)"
+grep -q "lock LOST" "$LOG" && bad "98-classification ran on the no-hold EXIT arc" \
+                           || ok "no 98 classification on the no-hold EXIT arc"
+# The trap that fired was our handler, not a bare/restored one — this is the
+# discriminator that the EXIT-WHILE-WAITING arc ran (vs a post-97 exit, where
+# the trap is already empty). Mirrors Test 12d's trap-restoration idiom.
+grep -q "_lock_on_exit" "$T46T" && ok "EXIT trap still armed as _lock_on_exit at exit (no-hold arc, not post-97)" \
+                                || bad "EXIT trap was not _lock_on_exit at exit (got: $(cat "$T46T" 2>/dev/null))"
+# The waiter left no claim behind (it never claimed — the live lock is not stale).
+[ -e "$LOCK.next" ] && bad "waiter left a claim file behind on the no-hold EXIT arc" \
+                    || ok "no leftover claim from the no-hold EXIT waiter"
+# H's lock is untouched — still the holder's original token, still held.
+l1=""; IFS= read -r l1 < "$LOCK" 2>/dev/null || true
+[ -n "$htok" ] && [ "$l1" = "$htok" ] && ok "holder's lock untouched by the dying waiter (token intact)" \
+                                      || bad "holder's lock changed by the dying waiter (was=$htok now=$l1)"
+# Release H and confirm it shut down cleanly (no fallout from W's exit).
+touch "$HG"; wait "$h46" 2>/dev/null
+grep -q "lock LOST" "$HLOG" && bad "holder saw a stolen lease (98) — the waiter's exit disturbed the hold" \
+                            || ok "holder released its still-held lock cleanly (no 98)"
+rm -f "$LOCK" "$LOCK.next" "$T46R" "$T46G" "$T46T" "$HR" "$HG"
+
+echo "== Test 47: no-mv-T rename-over fallback (BSD/macOS lane) forced via _LOCK_MVT=0 — steal still installs =="
+# _lock_rename_over (git-commit-lock.sh ~:961-979) probes once for GNU `mv -T`
+# and caches the verdict in _LOCK_MVT (""=unprobed, 1=supported, 0=not). On
+# Linux/MINGW the probe ALWAYS picks `mv -T`, so the no-`-T` fallback lane
+# (~:976-977: a last-instant `[ -d "$dst" ]` guard + a bare `mv`) is NEVER
+# executed in CI except on a real BSD/macOS runner. Pre-seeding _LOCK_MVT=0 in
+# the sourced steal shell BEFORE any acquire makes the `[ -z "$_LOCK_MVT" ]`
+# probe short-circuit (the var is already non-empty), forcing the fallback on
+# the common leg. Two scenarios:
+#   (a) a normal steal of a stale ghost under _LOCK_MVT=0 installs the lock via
+#       the unlink-free bare-`mv` fallback (STOLE-BY-CLAIM, the steal acquires);
+#   (b) a DIRECTORY squatting the lock path under _LOCK_MVT=0 is refused by the
+#       fallback's `[ -d ]` last-instant guard (no clobber) — the fallback-path
+#       analogue of Test 37's `mv -T` natural refusal.
+# Determinism proof that the fallback truly ran (not GNU `mv -T`): scenario (a)
+# shadows `mv` to record, per invocation touching ".next", whether `-T` was
+# passed; under _LOCK_MVT=0 the steal's claim->lock rename MUST be a bare `mv`
+# (no `-T`). A control run WITHOUT the override is asserted to still steal, so a
+# pass cannot come from the override having silently broken the steal entirely.
+
+# ---- (a) forced-fallback steal of a stale ghost: STOLE-BY-CLAIM via bare mv ----
+LOCK="$WORK/mvt0.lock"; LOG="$WORK/mvt0.log"; : > "$LOG"
+MVTRACE="$WORK/mvt0.mvtrace"; : > "$MVTRACE"
+fabricate_lock "$LOCK" "tok.ghost.t47" "pid=9 host=ghost"; backdate "$LOCK" 9999
+# Sourced steal shell: pre-seed _LOCK_MVT=0, shadow `mv` to log the flags it was
+# called with on the ".next" (claim->lock) rename, then call the real `mv`.
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=2 \
+  AGENT_LOCK_CLAIM_STALE_SECS=600 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=10 \
+  bash -c '
+    source "$1" || exit 70
+    _LOCK_MVT=0                                  # force the no-mv-T fallback lane
+    export MVTRACE_PATH="$2"                     # pass the trace path into mv() via env
+    mv() {
+      case "$*" in
+        *".next"*) printf "%s\n" "$*" >> "$MVTRACE_PATH" ;;  # record claim->lock rename flags
+      esac
+      command mv "$@"
+    }
+    lock_acquire || exit 72
+    lock_release || exit 74
+    exit 0
+  ' _ "$LIB" "$MVTRACE" 2>/dev/null; rc=$?
+[ "$rc" = 0 ] && ok "T47(a): forced-fallback steal acquired+released rc 0 (_LOCK_MVT=0)" \
+              || bad "T47(a): forced-fallback steal rc=$rc (want 0)"
+grep -q "STOLE-BY-CLAIM" "$LOG" \
+  && ok "T47(a): stale ghost stolen via the no-mv-T fallback (STOLE-BY-CLAIM logged)" \
+  || bad "T47(a): no STOLE-BY-CLAIM under _LOCK_MVT=0 — fallback did not install the lock"
+grep -q "ACQUIRED" "$LOG" && grep -q "RELEASED" "$LOG" \
+  && ok "T47(a): fallback steal produced a clean ACQUIRED/RELEASED pair" \
+  || bad "T47(a): missing ACQUIRED/RELEASED after the fallback steal"
+# The mv trace proves the fallback lane (bare mv, no -T) actually carried the
+# claim->lock rename — the whole point of forcing _LOCK_MVT=0.
+[ -s "$MVTRACE" ] \
+  && ok "T47(a): claim->lock rename went through the shadowed mv (trace non-empty)" \
+  || bad "T47(a): no .next rename recorded — the steal did not rename-over as expected"
+if grep -q -- '-T' "$MVTRACE"; then
+  bad "T47(a): claim->lock rename used 'mv -T' — the GNU fast path ran, fallback NOT forced"
+else
+  ok "T47(a): claim->lock rename used a BARE mv (no -T) — the BSD/macOS fallback lane was taken"
+fi
+{ [ -e "$LOCK" ] || [ -e "$LOCK.next" ]; } \
+  && bad "T47(a): leftover lock/claim after the fallback steal+release" \
+  || ok "T47(a): clean final state (no lock, no claim) after fallback steal+release"
+
+# ---- (a-control) same steal WITHOUT the override still succeeds ----
+# Guards against a false pass where _LOCK_MVT=0 silently broke the steal: the
+# unmodified library must steal the identical ghost too (here via mv -T).
+LOCKC="$WORK/mvt0c.lock"; LOGC="$WORK/mvt0c.log"; : > "$LOGC"
+fabricate_lock "$LOCKC" "tok.ghost.t47c" "pid=9 host=ghost"; backdate "$LOCKC" 9999
+AGENT_LOCK_PATH="$LOCKC" AGENT_LOCK_LOG="$LOGC" AGENT_LOCK_STALE_SECS=2 \
+  AGENT_LOCK_CLAIM_STALE_SECS=600 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=10 \
+  bash -c 'source "$1" || exit 70; lock_acquire || exit 72; lock_release || exit 74; exit 0' \
+  _ "$LIB" 2>/dev/null; rcc=$?
+[ "$rcc" = 0 ] && grep -q "STOLE-BY-CLAIM" "$LOGC" \
+  && ok "T47(a-control): unmodified steal of the same ghost also succeeds (override didn't trivially break it)" \
+  || bad "T47(a-control): control steal rc=$rcc / no STOLE-BY-CLAIM (the (a) pass may be vacuous)"
+
+# ---- (b) directory at the lock path under _LOCK_MVT=0: [ -d ] guard refuses ----
+# The fallback's last-instant `[ -d "$dst" ]` guard (sh:976) must refuse to
+# rename a file over a directory — Test 37's no-clobber outcome, reached via the
+# fallback rather than `mv -T`'s natural directory refusal. Test 37 shadows `mv`
+# so the directory appears just before the real `mv -T` refuses it; that timing
+# does NOT exercise the fallback's `[ -d ]` because the swap lands AFTER the
+# library has already passed line 976. To hit the fallback guard itself we wrap
+# `_lock_rename_over`: the wrapper installs the directory and pins _LOCK_MVT=0,
+# THEN calls the unmodified original — whose own `[ -d "$dst" ]` check (line 976)
+# now sees the directory and returns 1, with NO library `mv`/`mv -T` ever run.
+# The verifies (step 3.3) ran before the wrapper, so they saw a stale FILE; the
+# directory exists only from the wrapper's first line onward. This is the
+# fallback-lane analogue of Test 37's wrong-type refusal.
+LOCKB="$WORK/mvt0dir.lock"; LOGB="$WORK/mvt0dir.log"; : > "$LOGB"
+fabricate_lock "$LOCKB" "tok.ghost.t47b" "pid=9 host=ghost"; backdate "$LOCKB" 9999
+AGENT_LOCK_PATH="$LOCKB" AGENT_LOCK_LOG="$LOGB" AGENT_LOCK_STALE_SECS=1 \
+  AGENT_LOCK_CLAIM_STALE_SECS=600 AGENT_LOCK_POLL_SECS=0.2 AGENT_LOCK_MAX_WAIT=3 \
+  bash -c '
+    source "$1" || exit 70
+    clone_fn _lock_rename_over _ro_orig
+    _lock_rename_over() {
+      # Land a DIRECTORY at the lock path, then force the fallback lane and run
+      # the REAL rename-over: its own `[ -d ]` guard (sh:976) must refuse (rc 1).
+      command rm -f -- "$AGENT_LOCK_PATH" 2>/dev/null
+      command mkdir -- "$AGENT_LOCK_PATH" 2>/dev/null
+      _LOCK_MVT=0
+      _ro_orig
+    }
+    lock_acquire
+    exit $?
+  ' _ "$LIB" 2>/dev/null; rcb=$?
+[ "$rcb" = 97 ] && ok "T47(b): fallback [ -d ] guard refused; waiter honoured MAX_WAIT (97), no false hold" \
+               || bad "T47(b): rc=$rcb (want 97 — a clobber/false hold would differ)"
+grep -q "CLAIM-ABORT (rename-refused)" "$LOGB" \
+  && ok "T47(b): CLAIM-ABORT (rename-refused) logged — fallback guard hit the wrong-type lane" \
+  || bad "T47(b): no CLAIM-ABORT (rename-refused) — fallback guard branch not exercised"
+grep -q "non-file at the lock path" "$LOGB" \
+  && ok "T47(b): refusal classified as non-file at the lock path" \
+  || bad "T47(b): missing 'non-file at the lock path' classification"
+grep -q "STOLE-BY-CLAIM" "$LOGB" \
+  && bad "T47(b): spurious STOLE-BY-CLAIM — the directory-occupied path was falsely stolen" \
+  || ok "T47(b): no STOLE-BY-CLAIM (the [ -d ] guard prevented a false steal)"
+[ -d "$LOCKB" ] \
+  && ok "T47(b): directory left in place at the lock path (never clobbered by the fallback mv)" \
+  || bad "T47(b): lock path no longer the squatting directory — the guard failed to protect it"
+[ -e "$LOCKB.next" ] \
+  && bad "T47(b): claim leftover (\$LOCK.next) after the fallback rename-refused abort" \
+  || ok "T47(b): claim file cleaned up — no leftover \$LOCK.next"
+rm -rf "$LOCK" "$LOCK.next" "$LOCKC" "$LOCKC.next" "$LOCKB" "$LOCKB.next"
+
+
 # NOTES (deliberately untested here):
 # * lock_release's LEFTOVER lane (the unlink blocked persistently) needs a
 #   foreign no-delete-share handle on the lock file — Windows-only, and the
