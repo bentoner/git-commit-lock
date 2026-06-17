@@ -1,6 +1,7 @@
 # Subplan: split the Windows unit CI leg into parallel shards
 
-Status: **PROPOSAL (Phase 2) — rounds 1-2 review folded; final spot-confirm pending.** A small
+Status: **CONVERGED (Phase 2) — 3 review rounds (Claude ×3 + Codex ×3); final Codex clean,
+"sound-to-implement". Ready for Ben's go on implementation.** A small
 follow-on to the Bucket-6 CI work, building on the `section()`/selector machinery (commit
 `4ee5899`) and the shared `tests/_harness.sh` (`b8e2951`). No implementation until the review
 converges and Ben gives the go.
@@ -70,8 +71,11 @@ Round-1 verdicts: Reviewer A *needs-changes (1,2)*; Codex *not-sound-yet (1,2,3)
 Plus a **kcov-interaction** note (Ben asked): the coverage job runs the full suite unsharded;
 the sharding code is inert when `GCL_TEST_SHARD` is unset — no interaction.
 
-**Convergence:** the mechanism is verified sound by 4 reviewers across 2 rounds; round-2 fixes
-are validation-method/accuracy corrections. A final Codex spot-confirm follows before the go.
+**Convergence (REACHED):** round 3 — a final independent Codex spot-confirm — returned **no
+findings, "sound-to-implement"** (verified the run-line regex, the honest guard framing, the
+gated `selector_report` snippet's bash-correctness under `set -uo pipefail`, the shard-only
+`RAN:` marker, and the kcov note). The mechanism is verified sound across 3 rounds (Claude ×3 +
+Codex ×3). **Ready for implementation on Ben's go.**
 
 ---
 
