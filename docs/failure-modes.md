@@ -733,6 +733,8 @@ asserting a Tier-1 bound on a Tier-2 quantity.
 
 Ordered by how much they need an explicit owner decision.
 
+agree except where indicated
+
 1. **Define and document the load/timing envelope (§K) — highest value.**
    *Recommendation:* state in `docs/git-commit-lock.md` that correctness
    (exclusion, no silent loss, eventual recovery) is load-independent, while all
@@ -760,14 +762,16 @@ Ordered by how much they need an explicit owner decision.
    possible but cross-platform-awkward and incomplete — treat as low-priority
    polish, not a requirement.
 
-4. **ps1-on-POSIX FIFO/device residual (§D3) and ps1 `-File` exit backstop gap
+Don't do the polish, just document.
+
+1. **ps1-on-POSIX FIFO/device residual (§D3) and ps1 `-File` exit backstop gap
    (§H3) — accept as documented.** Both are real but confined to an unsupported
    config (ps1-on-POSIX) or a forgetful-caller edge that the stale window
    recovers. *Recommendation:* no code change; confirm they stay documented.
    Reconsider only if PowerShell-on-POSIX ever becomes supported (it isn't,
    `README.md:91-95`).
 
-5. **Untested-but-robust-by-code lanes (resource exhaustion F1/F3/F4, log-write
+2. **Untested-but-robust-by-code lanes (resource exhaustion F1/F3/F4, log-write
    failure F2/J1).** These degrade safely (wait/97, or silent best-effort log
    loss) but have **no fault-injection tests** — they are reasoned-correct, not
    verified. *Recommendation:* accept without adding ENOSPC/EMFILE injection
@@ -776,7 +780,9 @@ Ordered by how much they need an explicit owner decision.
    → clean 97** (cheap to write deterministically; F4), since that's the most
    likely real-world misconfiguration of the set.
 
-6. **Mixed-version tree (§I2) and case-insensitive FS (§D5) — out of scope,
+i'd add test coverage for the various scenarios. It just makes the project easier to maintain and for future users to use if the these sorts of edge cases are actually tested rather than reasoned correct but untested.
+
+1. **Mixed-version tree (§I2) and case-insensitive FS (§D5) — out of scope,
    confirm.** The first degrades to detection (98), never silent, and is covered
    by the "upgrade both together" note. The second is a non-issue. *Recommendation:*
    leave both out of scope; optionally one sentence each in the design doc.
