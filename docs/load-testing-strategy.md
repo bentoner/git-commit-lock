@@ -27,8 +27,9 @@ product/test code. Where it cites a fact about GitHub Actions limits, treat the 
    genuinely dangerous windows are reachable *deterministically* only by the in-process
    function-interposition the suite already uses. Invest there first; external load is a
    secondary, probabilistic complement for the few windows it can actually move.
-3. **Three-tier CI:** a **Required** per-PR gate with **no artificial load** (so a red gate
-   always means a real correctness bug); a **Nightly** non-blocking tier that adds calibrated
+3. **Three-tier CI:** a **Required** per-PR gate with **no artificial load** (so a red gate is
+   never a stress-manufactured wall-clock flake — it's actionable); a **Nightly** non-blocking
+   tier that adds calibrated
    load × kind and the parametrization sweeps, with wall-clock assertions relaxed to warnings;
    and an on-demand **Deep sweep** (the current stress design) for the 50-clean hunt.
 4. **Fix the injection: calibrate, target, record.** Express load as an *oversubscription
@@ -122,12 +123,19 @@ create/write/delete loops): it is a *reasonable background-jitter generator* and
 
 **Recommendations:**
 - **Express load as an oversubscription ratio `R = stressors / nproc`** (e.g. R ∈ {0, 1, 2}),
-  not an absolute hog count, so a level is runner-independent.
+  not an absolute hog count, so a level is runner-independent. Note `R` is **per kind**: the
+  current wrapper's `GCL_STRESS_LOAD=N` spawns N hogs per selected kind, so `both` doubles total
+  hogs — define and cap `R_total`, and record cpu- and disk-stressor counts separately.
 - **Prefer calibrated mechanisms:** `stress-ng --cpu $((R*nproc)) --cpu-load … --metrics`
-  (defined, measurable) over bare spinners; on **Linux**, prefer **cgroup throttling**
-  (`systemd-run --user --scope -p CPUQuota=…` / `io.max`) which gives *deterministic,
-  reproducible* latency — the right tool for **envelope validation** (a 10% CPU quota means the
-  same everywhere; "8 hogs" does not).
+  (defined, measurable) over bare spinners. On **Linux**, calibrated **CPU** throttling is the
+  cleanest *envelope-validation* tool — `sudo systemd-run --scope -p CPUQuota=10%` gives a
+  runner-independent quota (a 10% quota means the same everywhere; "8 hogs" does not). **Treat
+  this as a probe-required Linux-only option, not a turnkey fact:** it needs cgroup v2 +
+  controller delegation + a usable systemd manager on the GitHub `ubuntu-24.04` runner, so gate
+  it behind a CI capability probe with the `stress-ng`/ratio path as the fallback. **IO** cgroup
+  throttling is *experimental* here — it is not a simple `systemd-run -p io.max`; systemd
+  exposes it as `IOReadBandwidthMax=`/`IOWriteBandwidthMax=` with device/path caveats — so don't
+  rely on it until proven on the runner.
 - **Record a per-run `load-manifest`** artifact next to the suite logs: `{kind, R, nproc,
   achieved-slowdown, tool versions, runner os/arch, git sha}`, uploaded on *success too* (you
   need the negatives to interpret the positives). Optionally probe achieved slowdown with a
@@ -139,17 +147,23 @@ create/write/delete loops): it is a *reasonable background-jitter generator* and
 
 ## 4. Embrace platform asymmetry (don't build a uniform injection layer)
 
-The platforms diverge too much for a "uniform" load layer (cgroups & FUSE are Linux-only;
-macOS SIP blocks `DYLD_INSERT_LIBRARIES` on system binaries; Windows has neither). Don't fight
-it — structure around it and **record which regime ran per leg**:
+The platforms diverge too much for a "uniform" *calibrated/targeted* load layer (cgroup
+throttling and FUSE fault-injection filesystems are Linux-only for this CI plan; `strace`
+inject is Linux-only; `DYLD_INSERT_LIBRARIES` injection is unreliable on macOS for
+SIP-protected Apple/system binaries like `mv`/`git` — possible only for non-protected helper
+binaries). Don't fight it — structure around it and **record which regime ran per leg**:
 
 - **Deterministic steering** — *everywhere* (portable bash; pwsh equivalent). The real
   race-coverage tool.
-- **Calibrated latency** (cgroup `cpu.max`/`io.max`; optionally `strace -e inject` to slow one
-  syscall in one process; a FUSE fsync-delay shim only if window W7 is prioritized) — **Linux
-  leg only**.
-- **CPU oversubscription** (`stress-ng` or the bash-spinner fallback) — the **macOS/Windows**
-  fallback, uncalibrated; document the asymmetry.
+- **Calibrated / targeted latency** (cgroup CPU quota; optionally `strace -e inject` to slow one
+  syscall in one process; a FUSE fsync-delay shim — charybdefs-style — only if window W7 is
+  prioritized) — **Linux leg only** (probe-gated, per §3).
+- **Uncalibrated oversubscription — the macOS/Windows fallback.** Both **CPU** (`stress-ng` or
+  the bash-spinner fallback) **and the simple disk-churn hog** (the current
+  `dd`/create-write-fsync-delete wrapper) run cross-platform; they are *low-fidelity and
+  uncalibrated* but real metadata-op pressure, which is why the Tier-N macOS/Windows `disk`
+  cells (§5) use them. Document the asymmetry: calibrated latency only on Linux; everywhere else
+  it's blunt oversubscription.
 
 Low-yield, **avoid:** memory/swap pressure (trivial allocation surface; risks OOM-killing the
 harness), raw disk-bandwidth saturation (doesn't touch metadata-op latency), de-prioritizing
@@ -173,7 +187,9 @@ test split (D-c).
 
 This is exactly today's matrix **minus the stress env**. Running it at **`none` load** means it
 only ever asserts Tier-1 correctness — it *cannot* flake on a Tier-2 wall-clock bound, so **a
-red required check always means a real bug.** Target < ~8 min. (Also: flip the concurrency group
+red required check is never stress-manufactured envelope noise.** It's always actionable — a
+real bug, or at worst runner-image/action-download/infra drift (which is also worth knowing) —
+never a "load was too high" false alarm. Target < ~8 min. (Also: flip the concurrency group
 back to `${{ github.workflow }}-${{ github.ref }}` + `cancel-in-progress: true` — the current
 per-run-unique group is a *deep-sweep* setting, which is exactly why the stress branch is marked
 "do NOT merge to main.")
@@ -239,20 +255,34 @@ matrix × sweep), never multiply everything on every PR.
 
 ## 7. GitHub Actions realities (the real constraints — confirm against current docs)
 
-- **Minutes are free on public repos, but concurrency is the real ceiling.** Free/public
-  accounts cap concurrent jobs on the order of ~20 (with a much smaller macOS sub-limit). A
-  matrix past that **queues** (serialises into waves), it doesn't fail. Design any single
-  triggered workflow to ≤ ~15–20 jobs to run in one wave; the deep sweep intentionally exceeds
-  this and accepts waves.
-- **Runner scarcity ≠ billing:** even free, **macOS runners are scarce/slow (~10× cost-weight),
-  windows ~2×, ubuntu 1×.** Be stingy with macOS cells, liberal with ubuntu.
-- **`strategy.matrix`:** `fail-fast: false` (keep — an OS-specific failure is the signal);
-  `max-parallel` on nightly/deep so a big sweep doesn't starve the required gate of runners;
-  256-job hard cap per workflow (irrelevant at our scale).
+- **Minutes are free on public repos; concurrency is the real ceiling.** Free-plan accounts cap
+  concurrent jobs at **20 total, with a 5-job macOS sub-limit** (confirm against GitHub's
+  current limits page). A matrix past that **queues** (serialises into waves), it doesn't fail.
+  Design any single triggered workflow to ≤ ~15–20 jobs to run in one wave; the deep sweep
+  intentionally exceeds this and accepts waves.
+- **Cost-weight is separate from queue scarcity (don't conflate).** On a public repo standard
+  runners are *free* — the per-minute rates don't consume credits or set queue priority. They do
+  signal relative runner *cost/scarcity*: roughly Linux 1×, **Windows ~1.7×** ($0.010 vs
+  $0.006/min), **macOS ~10×** ($0.062/min). The real constraint on macOS is the **5-job
+  sub-limit** above, plus it being the slowest pool. → keep macOS cells **sparse**, ubuntu
+  liberal.
+- **`strategy.matrix`:** `fail-fast: false` (keep — an OS-specific failure is the signal).
+  **`max-parallel` only limits parallelism *within a single matrix run*** — it does **not**
+  reserve capacity across separate workflow runs or the deep sweep's many `workflow_dispatch`
+  invocations. To stop a sweep starving the required gate, **bound the deep/nightly tiers with a
+  workflow-level `concurrency` group (and cap the dispatcher width)**, not `max-parallel` alone.
+  256-job hard cap per workflow run (irrelevant at our scale).
 - **Triggers:** required on `pull_request` + `push: main`; nightly on `schedule` (cron,
   off-peak minute) + `workflow_dispatch`; deep on `workflow_dispatch` only — heavy load never
-  sits in a PR's critical path. Keep `paths-ignore` (`**.md`, `.plans/**`) on required.
-  (Note: `schedule` triggers are auto-disabled after ~60 days of repo inactivity.)
+  sits in a PR's critical path. (Note: `schedule` triggers are auto-disabled after ~60 days of
+  repo inactivity.)
+- **`paths-ignore` gotcha on a *required* check.** A workflow skipped by path filtering leaves
+  its checks **Pending**, which *blocks merge* if those checks are required. So **don't** put
+  `paths-ignore` on the workflow whose jobs are the required checks and expect doc-only PRs to
+  merge. Instead either (a) keep the required workflow always-running with a tiny always-green
+  job and path-filter only the expensive test jobs, or (b) make a separate cheap job the
+  required check. (Doc-only-skip is still worth doing — just not on the required-check workflow
+  naively.)
 - **Artifacts:** keep the existing `upload-artifact` (with `include-hidden-files` for the
   `.git/`-buried lock logs); name uniquely per (os, leg, kind, level) so parallel cells don't
   collide.
@@ -306,6 +336,11 @@ Synthesized from three parallel first-principles research passes (load fidelity 
 mechanisms; CI matrix on free public runners; existing-test parametrization), each grounded in
 `git-commit-lock.sh`/`.ps1`, the three suites, `tests/with-load.sh`, `.github/workflows/tests.yml`,
 and `docs/failure-modes.md`, and cross-checked against the code (one agent's claim that
-`tests/with-load.sh` was absent was verified false — it exists and is tracked). Pending: a
-foreign-model (Codex) review pass over the GitHub-Actions limit claims and the load-mechanism
-portability claims before this is treated as settled.
+`tests/with-load.sh` was absent was verified false — it exists and is tracked). A foreign-model
+(Codex, web-grounded) review has been applied: it confirmed the §2 window→load reachability
+table against the code and the core GitHub-Actions facts (20-total / 5-macOS free-plan
+concurrency, 256-job matrix cap, 60-day schedule auto-disable, `cancel-in-progress`, `stress-ng`
+availability), and its corrections are folded in — the cgroup mechanism is now marked
+**probe-required** (CPU quota only; IO throttling experimental), the `max-parallel` and
+`paths-ignore`-on-required caveats added, billing-weight separated from queue-scarcity, and the
+FUSE/SIP claims hedged.
