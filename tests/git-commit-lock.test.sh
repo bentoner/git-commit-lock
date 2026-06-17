@@ -2208,6 +2208,295 @@ grep -q "resolved tok=tok.leak.t36.2" "$LOG" && ok "conclusive resolution logged
                                              || bad "no resolution log line for the conclusive drop"
 rm -f "$LOCK" "$LOCK.next"
 
+echo "== Test 37: rename-refused — a directory appearing at the lock path mid-steal aborts the steal, no false hold =="
+# The only acquire/steal VERDICT branch with no test: a NON-regular object (a
+# directory) appears AT the lock path between the claimant's final re-verify
+# (step 3.3, sees a stale FILE) and its rename-over, so the rename is refused
+# with the lock path occupied by a non-file. The claimant must classify this
+# as rename-refused (non-file at the lock path), delete its claim, take NO
+# hold, and re-poll to MAX_WAIT. Steered deterministically by shadowing mv:
+# the claim->lock rename (the `.next` move) is intercepted to swap the stale
+# lock FILE for a DIRECTORY at the lock path, then the real `mv -T` runs and
+# fails NATURALLY (mv refuses to overwrite a directory with a non-directory) —
+# exactly the wrong-type rename lane. The verifies don't call mv, so the lock
+# reads as a stale file through step 3.3; only the rename sees the directory.
+# Mutation check: an implementation that mis-classifies the refused rename
+# (e.g. treats it as blocked, or proceeds to STOLE-BY-CLAIM) fails the
+# no-false-hold / rename-refused assertions below.
+LOCK="$WORK/renref.lock"; LOG="$WORK/renref.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t37" "pid=9 host=ghost"; backdate "$LOCK" 9999
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+  AGENT_LOCK_CLAIM_STALE_SECS=600 AGENT_LOCK_POLL_SECS=0.2 AGENT_LOCK_MAX_WAIT=3 \
+  bash -c '
+    source "$1" || exit 70
+    # Shadow mv: on the claim->lock rename (the only mv touching ".next"),
+    # replace the stale lock file with a directory, then run the real mv -T,
+    # which refuses to overwrite a directory with a non-directory. The mv -T
+    # capability probe inside _lock_rename_over operates on its own temp paths
+    # (never ".next"), so it is unaffected.
+    mv() {
+      case "$*" in
+        *".next"*)
+          command rm -f -- "$AGENT_LOCK_PATH" 2>/dev/null
+          command mkdir -- "$AGENT_LOCK_PATH" 2>/dev/null
+          ;;
+      esac
+      command mv "$@"
+    }
+    lock_acquire
+    exit $?
+  ' _ "$LIB" 2>/dev/null; rc=$?
+[ "$rc" = 97 ] && ok "rename-refused waiter honoured MAX_WAIT (97), never falsely held" \
+               || bad "rename-refused rc=$rc (want 97 — a false hold would exit 0)"
+grep -q "CLAIM-ABORT (rename-refused)" "$LOG" \
+  && ok "CLAIM-ABORT (rename-refused) logged — the wrong-type rename branch was hit" \
+  || bad "no CLAIM-ABORT (rename-refused) — branch not exercised"
+grep -q "non-file at the lock path" "$LOG" \
+  && ok "rename refusal classified as non-file at the lock path" \
+  || bad "missing 'non-file at the lock path' classification wording"
+grep -q "STOLE-BY-CLAIM" "$LOG" \
+  && bad "spurious STOLE-BY-CLAIM — the steal was claimed despite the refused rename" \
+  || ok "no STOLE-BY-CLAIM (no false steal of the directory-occupied path)"
+grep -q "DISCOVERY-HOLD" "$LOG" \
+  && bad "spurious discovery-HOLD — the victim wrongly believed it acquired" \
+  || ok "no spurious discovery-HOLD — ownership-discovery read found no hold"
+grep -q "acquire verification FAILED" "$LOG" \
+  && bad "read-back path entered — the rename was treated as having succeeded" \
+  || ok "rename treated as refused, not as a completed-then-unverified steal"
+[ -e "$LOCK.next" ] \
+  && bad "claim leftover (\$LOCK.next) after the rename-refused abort" \
+  || ok "claim file cleaned up — no leftover \$LOCK.next"
+[ -d "$LOCK" ] \
+  && ok "directory left in place at the lock path (never overwritten)" \
+  || bad "lock path is no longer the squatting directory"
+rm -rf "$LOCK" "$LOCK.next"
+
+echo "== Test 38: step-3.3 pre-rename re-verify abort — claim cleaned, discovery, no false hold =="
+# The step-2 re-verify (sh:1075) and the step-3.3 re-verify immediately before
+# the rename (sh:1149) are near-identical abort lanes; Test 23/27 exercise the
+# step-2 lane only, leaving 3.3 untested. Steered with a CALL-COUNTER on
+# _lock_verify_stale: call 1 (step-2) passes through to the REAL verdict
+# (stale — the ghost is backdated 9999s), so the steal proceeds PAST step-2;
+# call 2 (step-3.3) freshens the lock first, so the real verify reports "fresh"
+# and the abort fires SPECIFICALLY at step-3.3. The proof is the log suffix
+# "(lock re-verify before rename: fresh)" — step-2's suffix is "after claim",
+# so the string can only be the 3.3 lane. STALE_SECS=30 keeps the freshened
+# ghost fresh long enough that the post-abort re-poll does NOT re-steal before
+# the test removes the lock — so the waiter then acquires via the CREATE race
+# (no second STOLE-BY-CLAIM), the same shape as Test 23.
+LOCK="$WORK/pr33.lock"; LOG="$WORK/pr33.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t38" "pid=9 host=slow"; backdate "$LOCK" 9999
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=30 \
+  AGENT_LOCK_CLAIM_STALE_SECS=60 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=30 \
+  bash -c '
+    source "$1" || exit 70
+    clone_fn _lock_verify_stale _vs_orig
+    N=0
+    _lock_verify_stale() {
+      N=$((N+1))
+      # call 1 = step-2: pass through to the real verdict (stale). call 2 =
+      # step-3.3: freshen the ghost lock so the real verify now sees "fresh",
+      # tripping the pre-rename abort at the 3.3 position.
+      if [ "$N" = 2 ]; then command touch -- "$AGENT_LOCK_PATH"; fi
+      _vs_orig "$@"
+    }
+    lock_acquire || exit 72
+    lock_release || exit 74
+    exit 0
+  ' _ "$LIB" 2>/dev/null &
+w38=$!
+# Proof the 3.3 lane ran AND the steal got PAST step-2: the "before rename"
+# suffix is unique to the step-3.3 position (step-2 logs "after claim").
+wait_for_grep "lock re-verify before rename: fresh" "$LOG" 20 \
+  && ok "step-3.3 pre-rename re-verify aborted (fresh) — got past step-2 to the 3.3 lane" \
+  || bad "no step-3.3 'before rename' abort — the 3.3 lane did not run"
+grep -q "CLAIM-ABORT (fresh) tok=.* (lock re-verify before rename: fresh)" "$LOG" \
+  && ok "CLAIM-ABORT (fresh) logged at the 3.3 position (reason map: fresh)" \
+  || bad "no CLAIM-ABORT (fresh) with the 'before rename' suffix"
+grep -q "lock re-verify after claim" "$LOG" \
+  && bad "the abort fired at step-2 (after claim) — the call-counter let call 1 trip, not the 3.3 lane" \
+  || ok "no step-2 (after claim) abort — call 1 passed; only the 3.3 lane aborted"
+grep -q "STOLE-BY-CLAIM" "$LOG" \
+  && bad "a rename installed the claim — the 3.3 fresh abort did not prevent the steal" \
+  || ok "no STOLE-BY-CLAIM — no rename onto the lock from the aborted attempt"
+grep -q "DISCOVERY-HOLD" "$LOG" \
+  && bad "spurious DISCOVERY-HOLD — the victim wrongly held after the 3.3 abort" \
+  || ok "no false hold — the discovery read ran and the victim did not wrongly hold"
+[ -e "$LOCK.next" ] && bad "claim leftover immediately after the 3.3 fresh abort" \
+                    || ok "claim deleted on the 3.3 fresh abort"
+rm -f "$LOCK"                       # the slow holder releases normally
+wait "$w38"; rc=$?
+[ "$rc" = 0 ] && ok "waiter re-polled past the 3.3 abort, then acquired/released (rc 0)" \
+              || bad "waiter rc=$rc after the slow holder released (want 0)"
+[ -e "$LOCK.next" ] && bad "claim leftover after the waiter finished" || ok "no claim leftover at exit"
+rm -f "$LOCK" "$LOCK.next"
+
+
+echo "== Test 39: foreign claim at recheck — left intact, discovery, no false 98 =="
+# After winning its claim and passing step-2 re-verify, the claimant rechecks
+# its OWN claim file before installing. The `gone` recheck leg is covered (Test
+# 25 recheck-gone / Test 32); the `foreign` leg is NOT: a waiter judged our
+# claim abandoned, cleared it, and a RIVAL re-claimed in its place, so the
+# recheck reads back a FOREIGN token at the claim path. The claimant must then
+# LEAVE the rival's claim alone, run the ownership-discovery read (the lock is
+# still the ghost, not ours -> no hold), and back off to re-poll — never a 98
+# (a mere claim recheck carries NO stolen-lease semantics) and never a deletion
+# of the rival's claim.
+#
+# Steering (Test 24/25 idiom): clone _lock_claim_state and, on the FIRST recheck
+# only (fire-once via a flag FILE so a subshell can't lose the state), overwrite
+# <lock>.next with a fresh-mtime foreign "tok.rival.*" token before delegating
+# to the original — exactly what a waiter-cleared + rival-reclaimed claim path
+# looks like. The original then classifies it `foreign`. CLAIM_STALE is large
+# and MAX_WAIT small so the freshly-planted rival claim is never aged out: it
+# survives, the create on the next poll loses to it, and the waiter times out
+# 97. Mutation check: an implementation that 98'd on a foreign recheck, or that
+# deleted/overwrote the rival's claim, or that false-HELD, fails the asserts.
+LOCK="$WORK/foreign-recheck.lock"; LOG="$WORK/foreign-recheck.log"; : > "$LOG"
+fabricate_lock "$LOCK" "tok.ghost.t39" "pid=9 host=ghost"; backdate "$LOCK" 9999
+SF="$LOCK.steered"; RIVAL="tok.rival.t39.deadbeef"; rm -f "$SF"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+  AGENT_LOCK_CLAIM_STALE_SECS=600 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=3 \
+  SF="$SF" RIVAL="$RIVAL" \
+  bash -c '
+    source "$1" || exit 70
+    clone_fn _lock_claim_state _cs_orig
+    _lock_claim_state() {
+      # Fire ONCE, at the post-win recheck of OUR claim: a waiter cleared ours
+      # and a rival re-claimed. Plant the rival token (fresh mtime => not stale)
+      # then classify via the real function.
+      if [ ! -e "$SF" ] && [ "$1" = "$_LOCK_CLAIM_TOKEN" ] \
+         && [ "$_LOCK_CLAIM_PATH" -ef "$AGENT_LOCK_PATH.next" ] 2>/dev/null; then
+        : > "$SF"
+        printf "%s\n%s\n" "$RIVAL" "pid=4242 host=rival" > "$_LOCK_CLAIM_PATH"
+      fi
+      _cs_orig "$@"
+    }
+    lock_acquire
+    exit $?
+  ' _ "$LIB" 2>/dev/null; rc=$?
+
+# The foreign-recheck branch ran (its log line is the proof the leg executed).
+grep -q "claim recheck: foreign token '$RIVAL' at the claim" "$LOG" \
+  && ok "foreign-recheck branch ran (rival token left at the claim, discovery read)" \
+  || bad "no foreign-recheck log line — branch not executed"
+# A mere claim recheck must NEVER report a stolen-lease 98.
+[ "$rc" = 98 ] && bad "false 98 on a foreign CLAIM recheck (no lease was ever held)" \
+              || ok "no false 98 on the foreign claim recheck (rc=$rc)"
+# No hold was ever taken: discovery saw the ghost, not our token.
+grep -q "DISCOVERY-HOLD" "$LOG" && bad "false discovery-HOLD on the foreign recheck" \
+                               || ok "no false hold (ownership-discovery read found the ghost, not ours)"
+grep -q "STOLE-BY-CLAIM" "$LOG" && bad "claimant stole despite a foreign claim at recheck" \
+                                || ok "no STOLE-BY-CLAIM — claimant backed off the foreign claim"
+# The rival's claim file SURVIVES, unmodified (left intact, never deleted).
+[ -e "$LOCK.next" ] && ok "rival's foreign claim file still present (not deleted)" \
+                    || bad "rival's foreign claim was deleted — must be left alone"
+rl1=""; IFS= read -r rl1 < "$LOCK.next" 2>/dev/null || true
+[ "$rl1" = "$RIVAL" ] && ok "rival's claim token intact (untouched: $rl1)" \
+                      || bad "rival's claim token modified (line1=$rl1, want $RIVAL)"
+grep -q "CLAIM-STALE-CLEARED" "$LOG" && bad "claimant aged-out/cleared the rival's fresh claim" \
+                                     || ok "rival's fresh claim never cleared as stale"
+# Clean outcome: the lock was never acquired; the waiter timed out (97).
+[ "$rc" = 97 ] && ok "waiter re-polled past the foreign claim and timed out cleanly (97)" \
+              || bad "rc=$rc (want 97 — clean re-poll/timeout behind the surviving rival claim)"
+# The ghost lock is untouched (never stolen).
+gl1=""; IFS= read -r gl1 < "$LOCK" 2>/dev/null || true
+[ "$gl1" = "tok.ghost.t39" ] && ok "ghost lock untouched by the foreign-recheck backoff" \
+                             || bad "ghost lock modified (line1=$gl1)"
+rm -f "$LOCK" "$LOCK.next" "$SF"
+
+echo "== Test 40: exec-bypass boundary — exec in the lock-holding shell skips release (OOS-5); exec in a child does not =="
+# `lock_run` runs the wrapped command vector with `"$@"` IN THE WRAPPER SHELL
+# (git-commit-lock.sh), so a command that is itself an `exec` REPLACES the
+# lock-holding wrapper process: the trailing `lock_release` AND the EXIT trap
+# are both skipped, and the lock is left held with no RELEASED logged. This is
+# the one interleaving that can SILENTLY lose an update (guarantees.md OOS-5) —
+# this test pins the exact boundary so a future change to the release/trap
+# wiring can't quietly widen or close it without a red.
+
+# (a1) BYPASS: `run -- exec true` — the wrapped command IS an exec, so it
+# replaces the wrapper. Release + EXIT trap are skipped: lock LEFT, no RELEASED
+# (ACQUIRED proves the hold was taken, so "no RELEASED" means the trap really
+# was bypassed, not that nothing ran).
+LOCK="$WORK/t40.bypass.lock"; LOG="$WORK/t40.bypass.log"; : > "$LOG"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" bash "$LIB" run -- exec true; rc=$?
+[ "$rc" = 0 ] && ok "run -- exec true exits 0 (the exec'd command's code)" \
+              || bad "run -- exec true rc=$rc (want 0)"
+grep -q ACQUIRED "$LOG" && ok "run -- exec true did take the lock (ACQUIRED logged)" \
+                        || bad "run -- exec true: no ACQUIRED — the hold never happened, test is vacuous"
+[ -e "$LOCK" ] && ok "run -- exec true LEFT the lock file (release bypassed by exec)" \
+               || bad "run -- exec true: lock released — exec did NOT bypass (boundary changed)"
+grep -q RELEASED "$LOG" && bad "run -- exec true logged RELEASED — the EXIT trap was NOT skipped (boundary changed)" \
+                        || ok "run -- exec true logged NO RELEASED (EXIT trap skipped — OOS-5 boundary)"
+rm -f "$LOCK"
+
+# (a2) CONTROL — NO bypass: `run -- bash -c 'exec true'` — the exec replaces the
+# CHILD, not the wrapper, so the wrapper releases normally: lock GONE, RELEASED
+# logged. The opposite outcome to (a1) is the whole point; assert both so the
+# test documents the exact boundary.
+LOCK="$WORK/t40.child.lock"; LOG="$WORK/t40.child.log"; : > "$LOG"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" bash "$LIB" run -- bash -c 'exec true'; rc=$?
+[ "$rc" = 0 ] && ok "run -- bash -c 'exec true' exits 0" \
+              || bad "run -- bash -c 'exec true' rc=$rc (want 0)"
+[ -e "$LOCK" ] && bad "run -- bash -c 'exec true' LEFT the lock — exec in a child must NOT bypass" \
+               || ok "run -- bash -c 'exec true' released the lock (exec in a child does not bypass)"
+grep -q RELEASED "$LOG" && ok "run -- bash -c 'exec true' logged RELEASED (the control: release ran)" \
+                        || bad "run -- bash -c 'exec true' logged NO RELEASED — the control case did not release"
+rm -f "$LOCK"
+
+# (a3) REALISTIC sourced bypass: `lock_acquire; exec true` in a sourcing shell
+# (a subshell so it can't take the suite down) — the holder execs away before
+# release, leaving the lock held. This is the shape a real caller hits if it
+# execs while holding instead of calling lock_release.
+LOCK="$WORK/t40.sourced.lock"; LOG="$WORK/t40.sourced.log"; : > "$LOG"
+( AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" bash -c '
+    source "$1" || exit 70
+    lock_acquire || exit 72
+    exec true
+  ' _ "$LIB" ); rc=$?
+[ "$rc" = 0 ] && ok "sourced lock_acquire; exec true exits 0" \
+              || bad "sourced lock_acquire; exec true rc=$rc (want 0)"
+[ -e "$LOCK" ] && ok "sourced lock_acquire; exec true LEFT the lock held (release skipped)" \
+               || bad "sourced lock_acquire; exec true released the lock — exec did not bypass"
+grep -q RELEASED "$LOG" && bad "sourced exec-while-holding logged RELEASED — the trap was not skipped" \
+                        || ok "sourced exec-while-holding logged NO RELEASED (release + trap skipped)"
+rm -f "$LOCK"
+
+# (b) SILENT-LOSS boundary: a DISPLACED holder that execs a 0-exit is UNWARNED.
+# Build a holder H that (sourced) acquires, backdates its OWN lock ancient so a
+# contender steals it (H is now displaced — a rival token sits at the path),
+# then execs a 0-exit. Because the exec skips BOTH release and the EXIT trap,
+# the displacement-detection in lock_release NEVER runs: H exits 0 with no
+# WARNING and no 98. This is exactly the documented silent boundary (OOS-5): a
+# non-unwinding exit while displaced cannot report that the hold was not
+# exclusive. (backdate/epoch_to_stamp are export -f'd by the preamble, so the
+# steering shell inherits them.)
+LOCK="$WORK/t40.silent.lock"; LOG="$WORK/t40.silent.log"; : > "$LOG"
+AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
+  AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=10 bash -c '
+    source "$1" || exit 70
+    lock_acquire || exit 72             # H holds the lock
+    backdate "$2" 9999                  # H'"'"'s own lock now ancient -> instantly stealable
+    # A contender steals it (separate process) — H is displaced once a rival
+    # token lands at the path.
+    AGENT_LOCK_PATH="$2" AGENT_LOCK_LOG="$3" AGENT_LOCK_STALE_SECS=1 \
+      AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=10 \
+      bash "$1" run -- true
+    exec true                           # H execs 0 — neither release nor trap runs
+  ' _ "$LIB" "$LOCK" "$LOG"; rc=$?
+[ "$rc" = 0 ] && ok "displaced holder's exec-0 exits 0 (no unwinding ran)" \
+              || bad "displaced holder's exec-0 rc=$rc (want 0)"
+grep -q "STOLE-BY-CLAIM" "$LOG" \
+  && ok "the contender genuinely displaced H (STOLE-BY-CLAIM logged) — H WAS displaced" \
+  || bad "no STOLE-BY-CLAIM — H was not actually displaced, the (b) premise is gone"
+grep -q "lock LOST" "$LOG" \
+  && bad "H logged a 'lock LOST' displacement WARNING — the exec did NOT skip release/trap" \
+  || ok "displaced holder's exec-0 emitted NO 'lock LOST' WARNING (silent boundary — OOS-5)"
+grep -q "WARNING" "$LOG" \
+  && bad "an unexpected WARNING was logged by the displaced exec-0 holder" \
+  || ok "displaced holder's exec-0 emitted NO WARNING at all (unwarned silent loss)"
+rm -f "$LOCK"
+
 # NOTES (deliberately untested here):
 # * lock_release's LEFTOVER lane (the unlink blocked persistently) needs a
 #   foreign no-delete-share handle on the lock file — Windows-only, and the
