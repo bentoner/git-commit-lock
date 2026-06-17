@@ -1,5 +1,10 @@
 # Subplan: balance the Windows-unit shards with a fixed (measured) split
 
+**SUPERSEDED 2026-06-18** by `.plans/2026-06-18-ci-stress-canary-split-plan.md`. The "Test 1 vs
+rest" insight here was right, but the cleaner realization is to make Test 1 its own *file* (no
+sharding at all) — so the `GCL_TEST_SHARD` machinery was unwound (`89de803` + `143e280`) and the
+canary is extracted instead. Original status retained below for record.
+
 Status: **ENDORSED by Ben (2026-06-18) — split = "Test 1" vs "not Test 1"; implementing.**
 The change is a tiny assignment swap on the already-3-round-reviewed shard mechanism, so the
 local proof + CI run are the gates (no separate review rounds). Follow-on to

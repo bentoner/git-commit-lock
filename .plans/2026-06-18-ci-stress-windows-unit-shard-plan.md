@@ -1,5 +1,9 @@
 # Subplan: split the Windows unit CI leg into parallel shards
 
+**SUPERSEDED 2026-06-18** by `.plans/2026-06-18-ci-stress-canary-split-plan.md`. The sharding
+was unwound via explicit revert (`89de803` + `143e280`); we extract the canary (Test 1) to its
+own file instead — same CI win, zero sharding machinery. Original status retained below for record.
+
 Status: **CONVERGED (Phase 2) — 3 review rounds (Claude ×3 + Codex ×3); final Codex clean,
 "sound-to-implement". Ready for Ben's go on implementation.** A small
 follow-on to the Bucket-6 CI work, building on the `section()`/selector machinery (commit
