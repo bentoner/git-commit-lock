@@ -27,20 +27,23 @@ permissions:
 
 jobs:
   test:
-    name: ${{ matrix.os }}${{ matrix.leg != 'all' && format(' ({0})', matrix.leg) || '' }}
+    name: ${{ matrix.os }}${{ matrix.leg != 'all' && format(' ({0})', matrix.leg) || '' }}${{ matrix.shard && format(', shard {0}', matrix.shard) || '' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false               # an OS-specific failure is the signal we want; let the others finish
       matrix:
         # Windows splits into two parallel jobs — the bash-only unit suite is the
         # wall-clock bottleneck there (~309s vs interop 100s + integration 28s;
-        # process-spawn overhead, not the PowerShell engines). Suites must NOT run
+        # process-spawn overhead, not the PowerShell engines). The unit suite is
+        # further split into two round-robin shards (GCL_TEST_SHARD=i/2) on two
+        # runners to ~halve that leg's wall-clock. Suites must NOT run
         # concurrently inside one runner: they're timing-sensitive on 2-core
         # runners. POSIX legs are fast enough to stay single-job.
         include:
           - { os: ubuntu-24.04, leg: all, job_timeout: 35 }
           - { os: macos-15, leg: all, job_timeout: 35 }
-          - { os: windows-2025, leg: unit, job_timeout: 20 }
+          - { os: windows-2025, leg: unit, shard: 1, job_timeout: 20 }
+          - { os: windows-2025, leg: unit, shard: 2, job_timeout: 20 }
           - { os: windows-2025, leg: interop-integration, job_timeout: 22 }
     timeout-minutes: ${{ matrix.job_timeout }}   # backstop only: sum of the leg's step budgets + upload headroom
     defaults:
@@ -75,6 +78,12 @@ jobs:
         timeout-minutes: ${{ matrix.os == 'windows-2025' && 15 || 10 }}   # a step timeout FAILS the step (not the job), so the upload step reliably runs; sized from run 27325978197 + one internal MAX_WAIT hang
         env:
           GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/unit
+          # Only the windows-unit cells carry matrix.shard → 1/2 or 2/2; every other
+          # cell (ubuntu/macos leg:all, windows interop-integration) gets '' (unset
+          # per the harness's ${GCL_TEST_SHARD:-}), so they run the FULL unit suite.
+          # /2 is hardcoded here (harness is n-generic); GHA treats 0 as falsy so
+          # shard indices stay 1-based.
+          GCL_TEST_SHARD: ${{ matrix.shard && format('{0}/2', matrix.shard) || '' }}
         run: |
           mkdir -p test-output
           bash tests/git-commit-lock.test.sh 2>&1 | tee test-output/unit-suite.log
@@ -101,7 +110,7 @@ jobs:
         if: ${{ failure() || cancelled() }}   # failure() covers step timeouts (they fail the step); cancelled() is best-effort cover for manual cancels / the job-level backstop
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1, SHA-pinned
         with:
-          name: test-logs-${{ matrix.os }}-${{ matrix.leg }}   # leg suffix keeps the two windows jobs' artifact names unique (v4+ uploads reject duplicates)
+          name: test-logs-${{ matrix.os }}-${{ matrix.leg }}${{ matrix.shard && format('-{0}', matrix.shard) || '' }}   # leg (+ shard) suffix keeps every windows job's artifact name unique (v4+ uploads reject duplicates); other cells unchanged
           path: test-output/
           include-hidden-files: true   # the integration suite's key diagnostics (lock log, repo state) live under the scratch repo's .git/ — hidden paths are excluded by default since upload-artifact v4.4; contents are suite-generated, no secrets
           if-no-files-found: warn
