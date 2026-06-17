@@ -49,14 +49,16 @@ both matter for the scope decision:
   Tier-1 guarantee **within the envelope (commits faster than STALE)**, not an
   unconditional one.
 - **Detection requires the wrapper to actually reach release.** The 98 path fires
-  on normal return and on trapped signals. It does **not** fire if the held
-  process is *hard-killed* (SIGKILL) or if the wrapped command terminates the
-  process abruptly — notably PowerShell `[Environment]::Exit()`, which bypasses
-  both `Lock-Release` and the `PowerShell.Exiting` backstop
-  (`git-commit-lock.ps1:221-245`). Such an abrupt exit can report success without
-  the 98 (see **§H4**). The *next* holder still recovers via staleness, but the
-  abruptly-exiting one is not warned. Hence the precise statement: **no silent
-  lost update, provided the wrapper unwinds cooperatively.**
+  on normal return and on trapped signals. It does **not** fire if the held process
+  is terminated or *replaced* without unwinding — an external SIGKILL, a bash
+  `exec` in the wrapped command (which replaces the holding shell, so neither
+  `lock_release` nor the EXIT trap runs), or PowerShell `[Environment]::Exit()`
+  (bypasses `Lock-Release`, the `finally`, and the `PowerShell.Exiting` backstop,
+  `git-commit-lock.ps1:221-245`). A *plain* `exit` is safe — it unwinds. A
+  non-unwinding exit returning 0 *while displaced* can report success without the
+  98 (see **§H4**). The *next* holder still recovers via staleness, but the
+  abruptly-exiting one is not warned. Hence the precise statement: **no silent lost
+  update, provided the wrapper unwinds cooperatively.**
 
 Liveness (eventual recovery) and bounded stalls are best-effort within an
 operating envelope (Tier 2), not absolute — and "recovery" means lock-shaped
@@ -136,7 +138,7 @@ robust-by-code-but-unverified · S static/grep check · (plat) platform-gated.
 | H1 | SIGINT/SIGTERM mid-hold | Release + re-raise (143); traps restored | 1 | ✓ U:577-600/1989-2011 | **In scope.** Keep (bash). ps1 = §H. |
 | H2 | EXIT-while-holding | Release + chain caller's EXIT trap | 1 | ✓ U:633-648 | **In scope.** Keep. |
 | H3 | ps1 process death under `-File` | `PowerShell.Exiting` does NOT fire; relies on stale window | 2 | ○ (limit documented) | **Accept;** `run` path is covered. See §H. |
-| H4 | Hard kill / `[Environment]::Exit()` while held | Bypasses release → a displaced holder is unwarned (no 98) | 2 | ~ (I:308-334 indirect) | **Document** the no-silent-loss boundary. See §H4. |
+| H4 | Non-unwinding exit while held (SIGKILL / bash `exec` / `[Environment]::Exit()`) | Skips release → a displaced holder is unwarned (no 98); plain `exit` is safe | 2 | ~ (I:308-334 indirect) | **Document** the no-silent-loss boundary. See §H4. |
 | I1 | bash⇄pwsh wire/format compatibility | Shared format; token grammar tightened to match | 1 | ✓ I:* throughout | **In scope.** Keep. |
 | I2 | Mixed-VERSION tree (old unserialized steal) | Prevention degrades to detection (98); `.dead.*` litter | 3 | ✗ | **Out of scope:** "upgrade both together." Residual 4. |
 | J1 | Logging subsystem failure | All log writes `|| true`; 1 MB self-truncate | 2 | ○ | **Accept;** logging never blocks the lock. |
@@ -555,29 +557,37 @@ backstop gap as documented** — the stale window recovers it, and the supported
 option is handle-based ops (`git-commit-lock.ps1:146-151`), a larger change not
 worth it for a forgetful-caller edge.
 
-**H4 — Hard process termination / `[Environment]::Exit()` while holding (the
-no-silent-loss boundary).** §1's safety guarantee — a displaced holder reports 98
-rather than a false success — relies on the wrapper *reaching its release path*.
-Two ways that doesn't happen while a lease is held: (a) the held process is
-SIGKILL'd (untrappable; no handler runs in either port); (b) the wrapped command
-itself ends the process abruptly, the sharpest case being PowerShell
-`[Environment]::Exit(n)`, which bypasses `Lock-Release`, the `finally`, *and* the
-`PowerShell.Exiting` backstop (`git-commit-lock.ps1:221-245`). If such a process
-was *already displaced* (its lease stolen past STALE) and exits **0**, its caller
-sees success with no 98 — the one interleaving that defeats "no silent lost
-update." Two bounds keep it narrow: a SIGKILL yields a non-zero wait status, so a
-caller that checks exit codes does *not* see success; and the `run` contract pairs
-acquire/release in `try/finally`, so only a command that *itself* hard-exits the
-process (or an external SIGKILL) skips release — a normal-returning or
-signal-trapped command always reaches it. The *next* holder still recovers via
-staleness; only the abruptly-exiting one is unwarned. *Tier 2 — the residual edge
-of the fail-open lease.* Exercised indirectly: interop Test 5 *uses*
-`[Environment]::Exit()` to fabricate a no-release orphan, confirming the bypass
-(`I:308-334`). **Recommend: document this as the explicit boundary of the
+**H4 — Process termination/replacement *without wrapper unwind* (the no-silent-loss
+boundary).** §1's safety guarantee — a displaced holder reports 98 rather than a
+false success — relies on the wrapper *reaching its release path*. The bypass class
+is any termination or replacement of the holding process that skips that unwind;
+crucially it is **not** triggered by a normal `exit`. The instances:
+- **External SIGKILL** — untrappable; no handler runs in either port.
+- **bash `exec` in the wrapped command** — `run` executes `"$@"` *in the wrapper
+  shell itself* (`git-commit-lock.sh:1733`), so an `exec` replaces that shell's
+  process image and *neither* the trailing `lock_release` *nor* the `EXIT` trap
+  (`git-commit-lock.sh:1002-1013`, armed at `:1308`) runs.
+- **PowerShell `[Environment]::Exit(n)`** — a CLR hard-exit that bypasses
+  `Lock-Release`, the `finally`, *and* the `PowerShell.Exiting` backstop
+  (`git-commit-lock.ps1:221-245`).
+
+The useful contrast: a **plain `exit` is safe** — bash `exit` fires the EXIT trap
+(which releases), and a plain `exit` inside the pwsh `run` body unwinds its
+`finally` (`git-commit-lock.ps1:1928-1979`). Only *non-unwinding* termination or
+replacement escapes. If such a process was *already displaced* (its lease stolen
+past STALE) and exits **0**, its caller sees success with no 98 — the one
+interleaving that defeats "no silent lost update." What keeps it narrow: an external
+SIGKILL yields a non-zero wait status (`128+9`), so a caller checking exit codes does
+*not* see success; the leak needs a command that *deliberately* replaces or
+hard-exits the process **and** returns 0 **while displaced**. The *next* holder
+still recovers via staleness; only the abruptly-exiting one is unwarned. *Tier 2 —
+the residual edge of the fail-open lease.* Exercised indirectly: interop Test 5
+*uses* `[Environment]::Exit()` to fabricate a no-release orphan, confirming the
+bypass (`I:308-334`). **Recommend: document this as the explicit boundary of the
 no-silent-loss guarantee**, alongside the "commits must be fast" golden rule — a
-command that hard-exits mid-critical-section *after being displaced* is exactly
-the fail-open case the STALE budget exists to make rare. No code change closes it
-without the handle-based ops the design rejected (§H3).
+command that replaces/hard-exits the process mid-critical-section *after being
+displaced* is exactly the fail-open case the STALE budget exists to make rare. No
+code change closes it without the handle-based ops the design rejected (§H3).
 
 ### I. Cross-implementation
 
