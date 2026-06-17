@@ -121,16 +121,16 @@ robust-by-code-but-unverified · S static/grep check · (plat) platform-gated.
 | C4 | Leaked claim (unverifiable unlink) | Leaked-token memory keeps ownership discoverable | 1 | ✓ U:1549-1758, U:2013-2164 | **In scope.** Keep. |
 | D1 | Atomic rename-over (steal install) | `mv -T` / `File.Move(...,true)` / 5.1 unlink+move | 1 (local FS) | ✓ U:212-346, I:16d S:1141 | **In scope on local FS.** Boundary = D-axis. |
 | D2 | O_EXCL atomic create | `set -C` redirect / `FileMode.CreateNew` | 1 (local FS) | ✓ throughout | **In scope on local FS.** |
-| D3 | Wrong-type at path (dir/symlink/FIFO/dev/socket) | Never stolen/deleted; loud warn; waiters → 97 | 1 (bash + ps1-on-Win) / 2 (ps1-on-POSIX) | ✓ U:818-892/1156-1262, ~(plat) | **In scope.** ps1-on-POSIX residual = accept. |
+| D3 | Wrong-type at path (dir/symlink/FIFO/dev/socket) | Never stolen/deleted; loud warn; waiters → 97 | 1 (bash + ps1-on-Win) / 2 (ps1-on-POSIX) | ✓ U:818-892/1156-1262/Test 37 (rename-refused mid-steal), ~(plat) | **In scope.** ps1-on-POSIX residual = accept. |
 | D4 | Non-lock CONTENT at path (user file) | Never stolen (content guard); warn | 1 | ✓ U:1034-1076 | **In scope.** Two accepted residuals (§D4). |
 | D5 | Case-insensitive FS path collision | Not handled explicitly | 3 | ✗ | **Likely non-issue;** see §D5. Decide. |
 | E1 | Network/shared FS (NFS/SMB/9p/Dropbox) | Outside design guarantees (stated) | 3 | ✗ | **Out of scope** (stated). See §E — decide whether to *enforce*. |
 | E2 | Multi-host clock skew / NTP jump | Implicitly single-clock; **not** addressed in docs | 3 (and a doc gap) | ✗ | **Out of scope** but UNDER-documented. See §E2. |
-| E3 | mtime probe unreadable (staleness clock broken) | Warns loudly once; treats as not-stale → safe, recovery disabled → 97 | 2 | ○ | **Accept** — fails safe + announced. See §E3. |
-| F1 | Disk full (ENOSPC) during create/write | Create fails → wait; torn write ages out | 2/3 | ○ → test planned | **Add test** (§4.5) + document. See §F1. |
-| F2 | ENOSPC during LOG write | Swallowed (`|| true`); silent log loss | 2 | ○ → test planned | **Add test** (§4.5); logging best-effort, lock unaffected. |
-| F3 | Inode / FD exhaustion | Create fails → wait → 97 | 2 | ○ → test planned | **Add test** (§4.5, FD via `ulimit`), document. |
-| F4 | Read-only / unwritable lock dir or parent | `mkdir -p` best-effort; create fails → wait → 97 | 2 | ○ → test planned | **Add test** (§4.5, highest-value). See §F4. |
+| E3 | mtime probe unreadable (staleness clock broken) | Warns loudly once; treats as not-stale → safe, recovery disabled → 97 | 2 | ✓ U:Test 42 | **Accept** — fails safe + announced. See §E3. |
+| F1 | Disk full (ENOSPC) during create/write | Create fails → wait; torn write ages out | 2/3 | ✓ U:Test 50 (Linux+sudo tmpfs; (plat) skip elsewhere) | **Tested** (§4.5) + document. See §F1. |
+| F2 | ENOSPC during LOG write | Swallowed (`|| true`); silent log loss | 2 | ✓ U:Test 49 (portable failing-log path) | **Tested** (§4.5); logging best-effort, lock unaffected. |
+| F3 | Inode / FD exhaustion | Create fails → wait → 97 | 2 | ○ (document-only) | **Document-only**: no deterministic portable injection. See §F3. |
+| F4 | Read-only / unwritable lock dir or parent | `mkdir -p` best-effort; create fails → wait → 97 | 2 | ✓ U:Test 48 (POSIX `chmod 0555`; (plat) skip on Windows) | **Tested** (§4.5, highest-value). See §F4. |
 | G1 | Lock path = a directory / `$HOME` typo | Never stolen/deleted; loud warn; → 97 | 1 | ✓ U:818-840 | **In scope.** Keep. |
 | G2 | Garbage numeric config | Falls back to default + stderr note | 1 | ✓ U:695-703, I:554-608 | **In scope.** Keep. |
 | G3 | `run` outside a git repo, no `AGENT_LOCK_PATH` | Refuses (96) | 1 | ✓ U:705-712 | **In scope.** Keep. |
@@ -141,7 +141,7 @@ robust-by-code-but-unverified · S static/grep check · (plat) platform-gated.
 | H4 | Non-unwinding exit while held (SIGKILL / bash `exec` / `[Environment]::Exit()`) | Skips release → a displaced holder is unwarned (no 98); plain `exit` is safe | 2 | ~ (I:308-334 indirect) | **Document** the no-silent-loss boundary. See §H4. |
 | I1 | bash⇄pwsh wire/format compatibility | Shared format; token grammar tightened to match | 1 | ✓ I:* throughout | **In scope.** Keep. |
 | I2 | Mixed-VERSION tree (old unserialized steal) | Prevention degrades to detection (98); `.dead.*` litter | 3 | ✗ | **Out of scope:** "upgrade both together." Residual 4. |
-| J1 | Logging subsystem failure | All log writes `|| true`; 1 MB self-truncate | 2 | ○ → test planned | **Add test** (§4.5, via F2); logging never blocks the lock. |
+| J1 | Logging subsystem failure | All log writes `|| true`; 1 MB self-truncate | 2 | ✓ U:Test 49 (via F2) | **Tested** (§4.5, via F2); logging never blocks the lock. |
 | K1 | Extreme load / CPU oversubscription / slow FS | Correctness holds; wall-clock bounds stretch | 2 | ~ (CI stress) | **Define the envelope.** See §K — the key analytical section. |
 | K2 | Internal time budgets (poll, MAX_WAIT, read ladder) | Fixed schedules; tunable | 2 | ✓/~ | **In scope** as Tier-2 envelope. See §K. |
 
@@ -452,12 +452,14 @@ stale** — the floor guard `[ "$mt" -gt 946684800 ]` fails closed to "fresh"
 lock whose age it cannot establish, so no premature steal and no corruption — but
 **recovery of a genuinely crashed holder is disabled**, and waiters block to
 MAX_WAIT (97). *Tier 2 (safety held, recovery lost — and loudly announced).*
-Untested (no stat-failure injection). **Recommend: accept and document** — it is a
+Tested: unit Test 42 shadows the inner mtime probe to return empty on a present,
+stale ghost and asserts the fail-safe lane — the "Staleness detection is BROKEN"
+warn-once fires, the ghost is NOT stolen (left in place), and the waiter blocks to
+MAX_WAIT → 97. **Recommend: accept and document** — it is a
 host/FS-health failure the tool already detects and announces, and it fails *safe*
-(no false steal). Fault injection is low-ROI; the loud warning is the right
-behavior. This is also the clean reason recovery is a *Tier-1-within-envelope*
-property, not unconditional (see the tier split under §1): it presumes a readable
-clock.
+(no false steal); the loud warning is the right behavior. This is also the clean
+reason recovery is a *Tier-1-within-envelope* property, not unconditional (see the
+tier split under §1): it presumes a readable clock.
 
 ### F. Resource exhaustion
 
@@ -468,36 +470,47 @@ comment at `:1341-1343`). A created-but-write-failed file is an empty orphan tha
 ages into the steal lane. A torn write *shorter than `tok.`* (e.g. `to`) is the
 accepted residual at `:299-304`: non-empty, non-prefixed → never stolen, loud,
 fixed by one manual `rm`. *Tier 2 (degrades to wait/97) / Tier 3 (the torn-write
-manual-fix residual).* Reasoned from code, **not tested** (no ENOSPC fault
-injection). **Recommend: document + add a fault-injection test (per §4.5).** ENOSPC
-is a host-health failure; the tool degrades safely (no corruption, no false hold)
-and the one sharp edge (sub-`tok.` torn write needing manual `rm`) is already
-documented. Per Ben's §4.5 decision, add an ENOSPC test where it can be injected
-deterministically and portably (e.g. a small dedicated tmpfs/quota); if portable
-injection proves impractical, say so in the plan rather than shipping a flaky test.
+manual-fix residual).* **Tested** (per §4.5): unit Test 50 mounts a small 64k
+tmpfs, fills it to ENOSPC, and asserts the waiter times out at 97 with the wrapped
+command never running — no corruption, no false hold. ENOSPC injection needs a full
+FS (root via a tmpfs; `ulimit -f` raises SIGXFSZ — the wrong lane), so the test runs
+on **Linux with passwordless sudo** (the Linux CI leg) and skips-with-note elsewhere.
+ENOSPC is a host-health failure; the tool degrades safely (no corruption, no false
+hold) and the one sharp edge (sub-`tok.` torn write needing manual `rm`) is already
+documented.
 
 **F2 — ENOSPC during a LOG write.** All log writes end in `|| true`
 (`git-commit-lock.sh:561`); a failed log write is silently lost. *Tier 2.*
-**Recommend: accept + add a test (per §4.5)** — logging is best-effort by explicit
-design (it must never block or fail the lock); the only downside is reduced
-post-mortem signal under disk pressure. Add a test that an unwritable/failing log
-path leaves the lock fully working (the write is swallowed) — this also covers J1.
+**Tested** (per §4.5): unit Test 49 points `AGENT_LOCK_LOG` at a path *under a
+regular file*, so every open/append fails ENOTDIR, and asserts the lock still
+acquires + releases cleanly (rc 0), the wrapped command runs, the lock is cleaned
+up, and no log file appears — i.e. the failing log write is swallowed and the lock
+is unaffected. This is a portable injection (no chmod/perms), and it **also covers
+J1**. Logging is best-effort by explicit design (it must never block or fail the
+lock); the only downside is reduced post-mortem signal under disk pressure.
 
 **F3 — Inode / FD exhaustion.** Same shape as F1: a create that can't get an
 inode fails → wait → eventually 97. The tool holds at most a couple of FDs
-briefly. *Tier 2.* Untested. **Recommend: document + add a test (per §4.5)** as
-host-health — an FD-exhaustion test via `ulimit -n` is the deterministic, portable
-one; add inode exhaustion only if it can be injected cleanly.
+briefly. *Tier 2.* **Document-only — no deterministic portable injection.** A
+`ulimit -n` FD cap can't be driven deterministically here: the create needs only
+~1 FD, so an FD-exhaustion test would have to pin the process at *exactly* the
+limit across a poll loop without starving the harness itself — not portable or
+stable. Inode exhaustion needs a full FS the way F1 does (and F1/Test 50 already
+exercises the create-fails-→-wait-→-97 lane that F3 shares). So F3 is recorded as
+a reasoned-but-untested boundary rather than given a flaky test; the safe-degrade
+behaviour is the same as F1, which is tested.
 
 **F4 — Read-only / unwritable lock dir or parent.** `lock_acquire` does a
 best-effort `mkdir -p "$(dirname …)"` (`git-commit-lock.sh:1278`); if the dir is
 unwritable the create fails every poll and the waiter times out at 97. No
 corruption, no false hold. A *release* unlink blocked by an unwritable parent
-routes to the LEFTOVER lane (`:1699-1711`). *Tier 2.* Untested directly.
-**Recommend: add a test (per §4.5 — the highest-value one).** An unwritable lock
-dir → clean 97 is cheap and deterministic to write. A correct, if blunt, outcome
-(97); an *earlier, clearer* error would be nicer but is optional polish, low
-priority.
+routes to the LEFTOVER lane (`:1699-1711`). *Tier 2.* **Tested** (per §4.5 — the
+highest-value one): unit Test 48 `chmod 0555`s the lock-dir parent and asserts the
+waiter times out at 97, the wrapped command never runs, no lock file is created,
+and the WAITING/TIMEOUT lines are logged — no corruption, no false hold. POSIX-only
+(`chmod 0555` is a no-op for writes on Git-Bash/NTFS, so it skips-with-note on
+Windows; the Linux/macOS CI legs exercise it). A correct, if blunt, outcome (97); an
+*earlier, clearer* error would be nicer but is optional polish, low priority.
 
 **F5 — Memory exhaustion.** The scripts allocate trivially (a few shell vars; the
 leaked-token list is "almost always empty"). Not a meaningful failure surface.
@@ -632,11 +645,12 @@ than rotating (`git-commit-lock.sh:554-562`). A broken log never blocks or fails
 the lock. Under a redirected git dir, log *content* (the owner line) is
 attacker-influenceable — one-line text spoofing, no execution; the tool itself
 writes only its token, owner line, and protocol events, never secrets
-(`docs/git-commit-lock.md:543-551`). *Tier 2.* **Recommend: accept + covered by the
-F2 log-failure test (per §4.5)** — logging is best-effort by design, which is the
-right call for a lock that must keep working when the disk is full or the log path
-is bad. The follow-on (unchanged): don't build automation that *trusts* log text
-from an untrusted repo (already documented).
+(`docs/git-commit-lock.md:543-551`). *Tier 2.* **Tested — covered by the F2
+log-failure test (per §4.5): unit Test 49** proves a failing log path leaves the
+lock fully working. Logging is best-effort by design, which is the right call for a
+lock that must keep working when the disk is full or the log path is bad. The
+follow-on (unchanged): don't build automation that *trusts* log text from an
+untrusted repo (already documented).
 
 ### K. Behavior under extreme load / scheduling pressure, and internal time budgets
 
@@ -787,7 +801,7 @@ edge cases make the tool more maintainable and give future users confidence), ra
 
 5. **Untested-but-robust-by-code lanes (resource exhaustion F1/F3/F4, log-write
    failure F2/J1).** These degrade safely (wait/97, or silent best-effort log
-   loss) but have **no fault-injection tests** — they are reasoned-correct, not
+   loss) but had **no fault-injection tests** — they were reasoned-correct, not
    verified. *Decision (Ben — overrides the prior "accept untested"):* **add test
    coverage** for these lanes. Rationale: actually-tested edge cases make the
    project easier to maintain and give future users confidence, versus
@@ -799,6 +813,16 @@ edge cases make the tool more maintainable and give future users confidence), ra
    portably (e.g. a small dedicated tmpfs or quota for ENOSPC, `ulimit -n` for
    FDs). Flag in the plan any lane that proves genuinely impractical to fault-inject
    portably, rather than forcing a flaky test.
+
+   *Status (done):* coverage added — **F4** unit Test 48 (POSIX `chmod 0555`,
+   skip-with-note on Windows), **F2/J1** unit Test 49 (portable failing-log path via
+   ENOTDIR), **F1** unit Test 50 (Linux + passwordless-sudo 64k tmpfs filled to
+   ENOSPC; skip-with-note elsewhere). **F3** (inode/FD exhaustion) proved impractical
+   to fault-inject deterministically and portably — the create needs only ~1 FD, so a
+   `ulimit -n` cap can't be driven deterministically across a poll loop without
+   starving the harness, and inode exhaustion needs a full FS the way F1 does (F1/Test
+   50 already exercises the shared create-fails-→-wait-→-97 lane). Per the "flag any
+   impractical lane" instruction above, F3 stays **document-only**, not a flaky test.
 
 6. **Mixed-version tree (§I2) and case-insensitive FS (§D5) — out of scope,
    confirm.** The first degrades to detection (98), never silent, and is covered
