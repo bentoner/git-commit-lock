@@ -114,6 +114,16 @@ echo "fan-out mode: $GCL_MODE (bash swarm ${BROUNDS}x${BN}, mixed swarm ${MSH}+$
 # bounded max wait so a wedge fails the suite instead of hanging it.
 LK_ENV=(AGENT_LOCK_STALE_SECS=300 AGENT_LOCK_POLL_SECS=0.2 AGENT_LOCK_MAX_WAIT=240)
 
+# Note-and-ignore the per-test selector the unit/interop suites honour: this
+# suite is ONE indivisible scenario (Tests 1-3 share a single repo + the ALL_IDS
+# accumulator, and Test 3 audits Tests 1+2's output), so a per-block selector
+# can't apply. If GCL_TEST_ONLY is set, say so loudly on stderr and run the
+# whole scenario as normal.
+GCL_TEST_ONLY="${GCL_TEST_ONLY:-}"
+if [ -n "$GCL_TEST_ONLY" ]; then
+    echo "NOTE: integration suite ignores GCL_TEST_ONLY=\"$GCL_TEST_ONLY\" — Tests 1-3 are one indivisible scenario (shared repo + ALL_IDS audit); running the whole suite." >&2
+fi
+
 # --- scratch repo ------------------------------------------------------------
 REPO="$WORK/repo"; OUTD="$WORK/out"; NOHOOKS="$WORK/nohooks"
 mkdir -p "$REPO" "$OUTD" "$NOHOOKS"

@@ -67,8 +67,13 @@ WORK="$(pwsh -NoProfile -Command '[IO.Path]::Combine([IO.Path]::GetTempPath(), "
 WORK="${WORK//\\//}"
 mkdir -p "$WORK"
 
-PASS=0; FAIL=0; TAPN=0; DONE=0
+PASS=0; FAIL=0; TAPN=0; DONE=0; SECTIONS_RUN=0
 GCL_TAP="${GCL_TAP:-0}"           # CI sets GCL_TAP=1 for machine-readable TAP13 output
+# Single-test selector: GCL_TEST_ONLY=<regex> runs only the test blocks whose
+# `== Test N: <desc> ==` label matches the regex (BASH regex, =~). Unset/empty
+# runs every block (default). A typo'd regex that matches nothing bails out
+# loudly at the verdict (the zero-match guard) rather than passing vacuously.
+GCL_TEST_ONLY="${GCL_TEST_ONLY:-}"
 # ok/bad are TAP-aware (gated by GCL_TAP so plain dev runs are byte-unchanged) and
 # bump the running assertion number TAPN. The trailing `1..$TAPN` plan line (emitted
 # just before the verdict) lets a TAP consumer fail on a short count; together with the
@@ -78,6 +83,19 @@ ok()  { PASS=$((PASS+1)); TAPN=$((TAPN+1)); echo "PASS: $*"
         [ "$GCL_TAP" = 1 ] && echo "ok $TAPN - $*"; return 0; }
 bad() { FAIL=$((FAIL+1)); TAPN=$((TAPN+1)); echo "FAIL: $*"
         [ "$GCL_TAP" = 1 ] && echo "not ok $TAPN - $*"; return 0; }
+
+# Per-test gate: echoes the block header (so a normal run is byte-unchanged) and
+# returns success iff GCL_TEST_ONLY is unset/empty OR its regex matches the label.
+# Each top-level `== Test N: <desc> ==` block is wrapped `if section "..."; then ... fi`.
+# Bumps SECTIONS_RUN on a match so the verdict's zero-match guard can catch a
+# selector regex that matched nothing.
+section() {
+  echo "== $1 =="
+  if [ -z "${GCL_TEST_ONLY:-}" ] || [[ "$1" =~ $GCL_TEST_ONLY ]]; then
+    SECTIONS_RUN=$((SECTIONS_RUN + 1)); return 0
+  fi
+  return 1
+}
 
 # Failure post-mortems need the logs: keep $WORK when anything failed, and
 # honour GCL_TEST_PRESERVE_DIR (the CI preserve-logs knob) by copying
@@ -243,7 +261,7 @@ ps_worker() {  # $1=lock $2=log $3=holder $4=violations $5=id
     pwsh -NoProfile -File "$PS1WIN" run "$body"
 }
 
-echo "== Test 1: mixed pwsh+bash workers, mutual exclusion across implementations ($GCL_MODE width) =="
+if section "Test 1: mixed pwsh+bash workers, mutual exclusion across implementations ($GCL_MODE width)"; then
 NSH=$T1_NSH; NPS=$T1_NPS; TOT=$((NSH+NPS))
 LOCK="$WORK/excl.lock"
 HOLDER="$WORK/holder"; : > "$HOLDER"; VIOL="$WORK/violations"; : > "$VIOL"
@@ -278,8 +296,9 @@ else
   [ "$st" != 0 ] && { echo "  STALE/STEAL log lines:"; grep -E "STALE|STOLE" "$WORK/excl-all.log" | sed 's/^/    /'; }
   bad "cross-impl exclusion/balance: violations=$nv steals=$st acquired=$a (floor $((TOT/2))) released=$rl leftover=$([ -e "$LOCK" ] && echo yes || echo no)"
 fi
+fi
 
-echo "== Test 2: a bash holder blocks a pwsh waiter (no concurrent hold, no wrongful steal) =="
+if section "Test 2: a bash holder blocks a pwsh waiter (no concurrent hold, no wrongful steal)"; then
 LOCK="$WORK/b2.lock"; LOG="$WORK/b2.log"; : > "$LOG"; ORDER="$WORK/b2.order"; : > "$ORDER"
 READY="$WORK/b2.ready"; rm -f "$READY"
 AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=300 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=60 \
@@ -295,8 +314,9 @@ wait "$holder"
 got="$(tr '\n' ',' < "$ORDER")"
 [ "$got" = "sh-start,sh-end,ps-ran," ] && ok "bash-holds / pwsh-waits ordering correct" || bad "ordering wrong: $got"
 grep -q STOLE "$LOG" && bad "pwsh wrongly STOLE a live bash lock" || ok "pwsh did not steal the live bash lock"
+fi
 
-echo "== Test 3: a pwsh holder blocks a bash waiter =="
+if section "Test 3: a pwsh holder blocks a bash waiter"; then
 LOCK="$WORK/b3.lock"; LOG="$WORK/b3.log"; : > "$LOG"; ORDER="$WORK/b3.order"; : > "$ORDER"
 READY="$WORK/b3.ready"; rm -f "$READY"
 AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=300 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=60 \
@@ -309,8 +329,9 @@ wait "$holder"
 got="$(tr '\n' ',' < "$ORDER")"
 [ "$got" = "ps-start,ps-end,sh-ran," ] && ok "pwsh-holds / bash-waits ordering correct" || bad "ordering wrong: $got"
 grep -q STOLE "$LOG" && bad "bash wrongly STOLE a live pwsh lock" || ok "bash did not steal the live pwsh lock"
+fi
 
-echo "== Test 4: pwsh steals a STALE lock fabricated as bash's (old file mtime) =="
+if section "Test 4: pwsh steals a STALE lock fabricated as bash's (old file mtime)"; then
 # AGENT_LOCK_MAX_WAIT caps the run so a steal regression fails in ~20s, not 420s.
 LOCK="$WORK/b4.lock"; LOG="$WORK/b4.log"; : > "$LOG"; MARK="$WORK/b4.mark"; printf '%s' before > "$MARK"
 fabricate_lock "$LOCK" "tok.sh.ghost.1" "pid=99999 host=ghost"
@@ -323,8 +344,9 @@ grep -q STOLE "$LOG" && ok "log records the cross-impl steal" || bad "no STOLE e
 grep -q "holder=pid=99999 host=ghost" "$LOG" \
   && ok "STALE log line carries the holder parsed from line 2 (cross-impl wire format)" \
   || bad "holder from line 2 missing in pwsh's STALE log line"
+fi
 
-echo "== Test 5: bash steals a STALE lock GENUINELY created by pwsh (holder killed mid-hold) =="
+if section "Test 5: bash steals a STALE lock GENUINELY created by pwsh (holder killed mid-hold)"; then
 # The stale lock really is pwsh's: a pwsh process dot-sources the lock, acquires (writing
 # its tok.ps.* token to line 1 and flushing+closing the file), signals ready, then
 # SELF-EXITS via [Environment]::Exit(0) — the port's documented hard-exit that bypasses
@@ -356,8 +378,9 @@ else
   kill -9 "$hpid" 2>/dev/null; wait "$hpid" 2>/dev/null
   bad "T5 pwsh holder never acquired/signalled ready"
 fi
+fi
 
-echo "== Test 6: deterministic lost-update counter, mixed bash+pwsh increments ($GCL_MODE width) =="
+if section "Test 6: deterministic lost-update counter, mixed bash+pwsh increments ($GCL_MODE width)"; then
 # The deterministic complement to Test 1's exclusion probe (which has a blind
 # window and tolerates launch flakiness): every worker MUST launch (strict rc
 # checks) and the final counter MUST equal the total increments — any lost
@@ -403,8 +426,9 @@ cat "$WORK"/cnt-*.log > "$WORK/cnt-all.log" 2>/dev/null || : > "$WORK/cnt-all.lo
 a="$(grep -c ACQUIRED "$WORK/cnt-all.log")"; rl="$(grep -c RELEASED "$WORK/cnt-all.log")"
 [ "$a" = "$CTOT" ] && [ "$rl" = "$CTOT" ] && ok "lock logs balanced ($a acquired / $rl released)" || bad "lock logs unbalanced: acquired=$a released=$rl want=$CTOT"
 [ -e "$LOCK" ] && bad "leftover counter lock" || ok "no leftover lock"
+fi
 
-echo "== Test 7: pwsh run propagates the command's exit code (two contending runs in parallel) =="
+if section "Test 7: pwsh run propagates the command's exit code (two contending runs in parallel)"; then
 LOCK="$WORK/rc.lock"; LOG="$WORK/rc.log"; : > "$LOG"
 AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_MAX_WAIT=60 \
   pwsh -NoProfile -File "$PS1WIN" run "exit 0" & p0=$!
@@ -415,8 +439,9 @@ wait "$p7"; rc7=$?
 [ "$rc0" = 0 ] && ok "pwsh exit 0 propagated" || bad "pwsh exit 0 not propagated (rc=$rc0)"
 [ "$rc7" = 7 ] && ok "pwsh exit 7 propagated" || bad "pwsh exit code not propagated ($rc7)"
 [ -e "$LOCK" ] && bad "lock left held after pwsh run" || ok "lock released after pwsh run (success and failure)"
+fi
 
-echo "== Test 7b: ps1 run verdicts for PowerShell-NATIVE failure (a failing cmdlet must not exit 0) =="
+if section "Test 7b: ps1 run verdicts for PowerShell-NATIVE failure (a failing cmdlet must not exit 0)"; then
 # A cmdlet's non-terminating error never sets LASTEXITCODE, so a runner
 # consulting only LASTEXITCODE would return 0 for a failed command. The
 # runner must consult the staged script's FINAL '$?' when no nonzero native
@@ -454,8 +479,9 @@ AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_MAX_WAIT=20 \
 [ "$rc" = 0 ] && ok "mid-command cmdlet failure + succeeding final statement -> 0 (the documented final-statement limitation)" \
               || bad "limitation pin: rc=$rc (want 0 — has the final-statement contract changed?)"
 [ -e "$LOCK" ] && bad "lock left held after the failing-cmdlet verdict runs" || ok "no leftover lock after the failing-cmdlet verdict runs"
+fi
 
-echo "== Test 7c: ps1 CLI help/usage convention — explicit help -> stdout + exit 0; usage errors -> stderr + 96 =="
+if section "Test 7c: ps1 CLI help/usage convention — explicit help -> stdout + exit 0; usage errors -> stderr + 96"; then
 # (bash's side of the same convention is pinned in the unit suite, Test 7.)
 for h in --help -h; do
   pwsh -NoProfile -File "$PS1WIN" "$h" > "$WORK/t7c.out" 2> "$WORK/t7c.err"; rc=$?
@@ -475,8 +501,9 @@ pwsh -NoProfile -File "$PS1WIN" > "$WORK/t7c-noargs.out" 2> "$WORK/t7c-noargs.er
   || bad "ps1 no-args rc=$rc (want 96) stderr-usage=$(grep -c '^usage:' "$WORK/t7c-noargs.err")"
 pwsh -NoProfile -File "$PS1WIN" frobnicate >/dev/null 2>&1; rc=$?
 [ "$rc" = 96 ] && ok "ps1 unknown subcommand -> 96" || bad "ps1 unknown subcommand rc=$rc (want 96)"
+fi
 
-echo "== Test 8: a ROBBED holder exits 98 — pwsh victim/bash thief, then bash victim/pwsh thief =="
+if section "Test 8: a ROBBED holder exits 98 — pwsh victim/bash thief, then bash victim/pwsh thief"; then
 # Fail-open ceiling, cross-impl: the victim holds past its 1s stale window
 # UNTIL THE THIEF IS DONE (marker, not a fixed sleep — a fixed hold once let a
 # slow-starting thief arrive after the victim had already released), the other
@@ -509,15 +536,17 @@ touch "$TDONE"
 wait "$vic"; vic_rc=$?
 [ "$vic_rc" = 98 ] && ok "robbed bash holder exited 98" || bad "robbed bash holder exited $vic_rc (want 98)"
 [ "$thief_rc" = 0 ] && ok "pwsh thief exited 0" || bad "pwsh thief exited $thief_rc"
+fi
 
-echo "== Test 9: a slow but UNCONTENDED pwsh holder keeps its lock (slowness != failure) =="
+if section "Test 9: a slow but UNCONTENDED pwsh holder keeps its lock (slowness != failure)"; then
 LOCK="$WORK/slow.lock"; LOG="$WORK/slow.log"; : > "$LOG"
 AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=30 \
   pwsh -NoProfile -File "$PS1WIN" run "Start-Sleep 2"; rc=$?
 [ "$rc" = 0 ] && ok "uncontended slow pwsh holder exited 0" || bad "uncontended slow pwsh holder exited $rc"
 grep -q "WARNING" "$LOG" && bad "spurious theft WARNING with no contender" || ok "no spurious WARNING when uncontended"
+fi
 
-echo "== Test 10: default lock location is <gitdir>/commit.lock for BOTH impls (regression: item 1) =="
+if section "Test 10: default lock location is <gitdir>/commit.lock for BOTH impls (regression: item 1)"; then
 # The BLOCKER this guards against: the .ps1 silently fell back to a CWD lock at
 # default config, so the two impls never contended. Run BOTH impls from a
 # SUBDIRECTORY of a scratch repo with AGENT_LOCK_PATH/LOG unset; each command
@@ -539,8 +568,9 @@ nps="$(grep -c "ACQUIRED.*tok=tok\.ps\." "$DLOG" 2>/dev/null)"
   && ok "shared <gitdir> log shows 1 bash + 1 pwsh acquisition" \
   || bad "default-log evidence wrong: ACQUIRED=$na (want 2), pwsh tokens=$nps (want 1) in $DLOG"
 [ -e "$GITDIR2/commit.lock" ] && bad "leftover default lock" || ok "no leftover default lock"
+fi
 
-echo "== Test 11: release-time classification agrees across impls — truncated => unverifiable (1); deleted => theft (98) =="
+if section "Test 11: release-time classification agrees across impls — truncated => unverifiable (1); deleted => theft (98)"; then
 # (i) TRUNCATED at release: the file still exists but reads EMPTY after the
 # retry ladder. NOT provable theft (it is the probe-F create->write window of
 # a successor after a boundary steal, or external truncation), so BOTH impls
@@ -569,8 +599,9 @@ AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_MAX_WAIT=20 \
   pwsh -NoProfile -File "$PS1WIN" run "Remove-Item -LiteralPath '$LOCK' -Force" 2>/dev/null; rc_ps=$?
 [ "$rc_sh" = 98 ] && ok "bash: lock GONE at release -> exit 98 (theft)" || bad "bash gone-at-release rc=$rc_sh (want 98)"
 [ "$rc_ps" = 98 ] && ok "pwsh: lock GONE at release -> exit 98 (theft)" || bad "pwsh gone-at-release rc=$rc_ps (want 98)"
+fi
 
-echo "== Test 12: fractional STALE/MAX_WAIT rejected identically by both impls (note + default) =="
+if section "Test 12: fractional STALE/MAX_WAIT rejected identically by both impls (note + default)"; then
 # These two knobs are integers in both impls; a fractional value silently
 # rounded by one side but rejected by the other would give the two impls
 # DIFFERENT steal thresholds for the same env. Both must note + use defaults.
@@ -625,10 +656,11 @@ n_ps="$(grep -c 'ignoring invalid' "$WORK/poll-ps.err")"
 [ "$rc_sh" = 0 ] && [ "$n_sh" = 0 ] && [ "$rc_ps" = 0 ] && [ "$n_ps" = 0 ] \
   && ok "POLL_SECS='' (empty): silent default in BOTH impls (no note)" \
   || bad "POLL_SECS='' parity: sh rc=$rc_sh notes=$n_sh; pwsh rc=$rc_ps notes=$n_ps (want rc 0 + 0 notes each)"
+fi
 
 if [ "$GCL_WINDOWS" = 1 ]; then
 
-echo "== Test 13: blocked release (no-delete-share handle) — deterministic LEFTOVER, run keeps the command's code, then recovery =="
+if section "Test 13: blocked release (no-delete-share handle) — deterministic LEFTOVER, run keeps the command's code, then recovery"; then
 # Probe D1 made this lane deterministically testable (TODO #30): a pwsh
 # FileShare.Read handle on the lock file blocks the release unlink (and any
 # steal rename) until it closes. (a) sourced bash: lock_release returns 1 and
@@ -732,8 +764,9 @@ AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=2 AGENT_LOCK
 [ "$rc" = 0 ] && ok "leftover reclaimed once the handle closed + stale window elapsed (TODO #30 lane)" \
               || bad "leftover recovery rc=$rc (want 0)"
 grep -q STOLE "$LOG" && ok "recovery steal logged" || bad "no STOLE entry during leftover recovery"
+fi
 
-echo "== Test 14: blocked steal — a no-delete-share handle on a STALE lock defers the steal until it closes =="
+if section "Test 14: blocked steal — a no-delete-share handle on a STALE lock defers the steal until it closes"; then
 # Same handle class against a stale lock: the stealer's rename keeps failing
 # while the handle is open (probe D1), so it re-polls — and acquires promptly
 # once the handle closes. Run with the ps1 stealer: this exercises its
@@ -761,8 +794,9 @@ else
   touch "$BGO"; wait "$blk14" 2>/dev/null
   bad "T14 blocker never signalled its handle open"
 fi
+fi
 
-echo "== Test 14b: blocked steal NEVER bypasses MAX_WAIT — squatted stale lock => 97 with bounded logging (regression: busy-spin) =="
+if section "Test 14b: blocked steal NEVER bypasses MAX_WAIT — squatted stale lock => 97 with bounded logging (regression: busy-spin)"; then
   # Discriminator: when the steal rename keeps
 # failing with the lock file still present (a no-delete-share handle squatting
   # it), a failed-steal lane that `continue`s past the timeout check AND the
@@ -834,13 +868,14 @@ else
   bad "T14b squatter never signalled its handle open"
 fi
 rm -f "$LOCK"
+fi
 
 else
   echo "== Tests 13/14/14b SKIPPED (POSIX): open handles never block unlink/rename here =="
   echo "note: the LEFTOVER and blocked-steal lanes are Windows-only by construction (.NET's Unix FileShare gates no namespace operation); the Windows CI leg covers them"
 fi
 
-echo "== Test 15: ps1-side never-steal guards — dir, dangling symlink, non-lock content (parity with the bash guards) =="
+if section "Test 15: ps1-side never-steal guards — dir, dangling symlink, non-lock content (parity with the bash guards)"; then
 # The ps1 guards use different APIs than bash (PSIsContainer, reparse
 # attributes, the catch-all CreateNew exception), so bash coverage proves
 # nothing about them. The wrong-type warning needs the SAME concrete type on
@@ -899,8 +934,9 @@ grep -q "is not a lock file" "$WORK/psuser.err" && ok "ps1: config warning names
                                                 || bad "ps1: no config warning for non-lock content"
 grep -q STOLE "$LOG" && bad "ps1 STOLE the user file" || ok "ps1: no steal of the user file"
 rm -f "$LOCK"
+fi
 
-echo "== Test 16: crash recovery under CONTENTION, mixed impls — claim-serialized: zero displacement, zero 98s =="
+if section "Test 16: crash recovery under CONTENTION, mixed impls — claim-serialized: zero displacement, zero 98s"; then
 # Cross-impl variant of the unit suite's Test 2b (which carries the full
 # rationale): 2 bash + 2 pwsh waiters race ONE crashed lock. Under the claim
 # protocol the straggler-robs-recovery-winner race is PREVENTED (the claim
@@ -1032,8 +1068,9 @@ if [ "$t16_valid" = 1 ]; then
 else
   bad "T16: no clean run under a conclusive backdate in $T16_TRIES attempts (see above)"
 fi
+fi
 
-echo "== Test 16b: bash claimant vs ps1 claimant racing ONE ghost — one claim winner, cross-impl wire parity =="
+if section "Test 16b: bash claimant vs ps1 claimant racing ONE ghost — one claim winner, cross-impl wire parity"; then
 # The 1+1 distilled version of Test 16: one bash and one pwsh waiter race the
 # same ancient ghost. Exactly one wins the O_EXCL claim and steals
 # (STOLE-BY-CLAIM x1); the loser either loses the claim create (a young
@@ -1105,8 +1142,9 @@ if [ "$t16b_valid" = 1 ]; then
 else
   bad "T16b: no clean run under a conclusive backdate in $T16B_TRIES attempts (see above)"
 fi
+fi
 
-echo "== Test 16c: cross-impl claim staleness — each side clears the OTHER side's aged claim; young foreign claims are respected =="
+if section "Test 16c: cross-impl claim staleness — each side clears the OTHER side's aged claim; young foreign claims are respected"; then
 # (a) bash clears an aged ps1-tokened claim, then completes the steal.
 LOCK="$WORK/cstale.lock"; LOG="$WORK/cstale.log"; : > "$LOG"
 fabricate_lock "$LOCK" "tok.ghost.cstale" "pid=9 host=ghost"; backdate "$LOCK" 9999
@@ -1156,8 +1194,9 @@ AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=1 \
   && ok "ps1 respected a young bash claim (97, claim intact, no clear/steal)" \
   || bad "ps1 young-bash-claim handling: rc=$rc intact=$([ -f "$LOCK.next" ] && echo yes || echo no)"
 rm -f "$LOCK" "$LOCK.next"
+fi
 
-echo "== Test 16d: static checks — no File.Replace in the ps1 port =="
+if section "Test 16d: static checks — no File.Replace in the ps1 port"; then
 # File.Replace is deliberately never used: it throws on a
 # read-only destination and has partial-failure states when called without a
 # backup file. The 5.1 lane must stay unlink + fail-if-exists Move.
@@ -1166,8 +1205,9 @@ if grep -qE 'File\]?::Replace' "$ROOT/git-commit-lock.ps1"; then
 else
   ok "git-commit-lock.ps1 contains no File.Replace call"
 fi
+fi
 
-echo "== Test 16e: ps1 arc-end pass keeps INCONCLUSIVE entries; trap-time discovery-HOLD releases per normal release semantics =="
+if section "Test 16e: ps1 arc-end pass keeps INCONCLUSIVE entries; trap-time discovery-HOLD releases per normal release semantics"; then
 # Driven directly via a dot-sourcing pwsh driver — the ps1 side's
 # unit-equivalent steering mechanism (the lib skips its CLI when
 # dot-sourced). Part 1: the arc-end resolution pass's entry-drop is gated
@@ -1261,8 +1301,9 @@ PSEOF
 else
   echo "note: the blocked trap-time release leg is Windows-only by construction (POSIX open handles never block unlink); the happy-path leg above pins the honest-log contract"
 fi
+fi
 
-echo "== Test 16f: ps1 claim-gone-at-touch — the SetLastWriteTimeUtc FileNotFound gone signal fires; no resurrection =="
+if section "Test 16f: ps1 claim-gone-at-touch — the SetLastWriteTimeUtc FileNotFound gone signal fires; no resurrection"; then
 # The unit suite's discovery-position matrix (T25) covers bash's
 # touch-gone lane; this is the ps1 counterpart: the claim passes the
 # step-3.1 recheck, vanishes before the step-3.2 touch (steered via the
@@ -1321,9 +1362,10 @@ PSEOF
 else
   echo "== Test 16f SKIPPED: claim-gone-at-touch steering uses Windows pwsh (POSIX legs cover the protocol via the bash matrix; the ps1 gone-catch is probed Q1) =="
 fi
+fi
 
 if command -v powershell >/dev/null 2>&1; then
-echo "== Test 17: Windows PowerShell 5.1 smoke lane — the ps1 must run, not just parse, on the in-box engine =="
+if section "Test 17: Windows PowerShell 5.1 smoke lane — the ps1 must run, not just parse, on the in-box engine"; then
 # Everything above runs the port under pwsh (7+). 5.1 ships in every Windows
 # 10/11 box and stays supported, so its claim is tested, not asserted: the
   # run lane's exit-code contract (0 / exit 7 / the failing-cmdlet -> 1) and
@@ -1393,12 +1435,23 @@ AGENT_LOCK_PATH="$LOCK51" AGENT_LOCK_LOG="$LOG51" AGENT_LOCK_STALE_SECS=2 \
 grep -q "CLAIM .*tok=tok\.ps\." "$LOG51" && ok "5.1: claim create logged with its per-attempt token" || bad "5.1: no CLAIM line with a tok.ps.* token"
 [ -e "$LOCK51" ] && bad "5.1: leftover lock after the steal ladder" || ok "5.1: no leftover lock"
 [ -e "$LOCK51.next" ] && bad "5.1: leftover claim after the steal ladder" || ok "5.1: no leftover claim"
+fi
 else
   echo "== Test 17 SKIPPED: Windows PowerShell 5.1 (powershell) not on PATH — POSIX leg; the Windows CI leg covers it =="
   echo "note: the 5.1 unlink+Move steal-ladder leg is part of this lane and is covered by the Windows CI leg"
 fi
 
 echo
+# Zero-match guard: a set-but-non-matching GCL_TEST_ONLY ran no test block, so
+# the (vacuously green) verdict below would lie. Bail loudly instead — a typo'd
+# selector regex must FAIL, not pass with zero assertions.
+if [ -n "${GCL_TEST_ONLY:-}" ] && [ "$SECTIONS_RUN" = 0 ]; then
+  echo "Bail out! GCL_TEST_ONLY=\"$GCL_TEST_ONLY\" matched no test" >&2
+  exit 1
+fi
+# When a selector is active, report how many blocks it matched (the default run
+# stays byte-unchanged because this is gated on GCL_TEST_ONLY being non-empty).
+[ -n "${GCL_TEST_ONLY:-}" ] && echo "selector GCL_TEST_ONLY=\"$GCL_TEST_ONLY\" ran $SECTIONS_RUN test block(s)"
 DONE=1
 echo "==== INTEROP RESULT: $PASS passed, $FAIL failed (fan-out: $GCL_MODE) ===="
 [ "$GCL_TAP" = 1 ] && echo "1..$TAPN"
