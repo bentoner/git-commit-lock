@@ -3050,6 +3050,85 @@ grep -q "STOLE-BY-CLAIM" "$LOGB" \
 rm -rf "$LOCK" "$LOCK.next" "$LOCKC" "$LOCKC.next" "$LOCKB" "$LOCKB.next"
 
 
+echo "== Test 48: unwritable lock dir -> clean 97, command never runs, no false hold (F4) =="
+# F4 (failure-modes.md §4.5): a read-only / unwritable lock-dir parent makes the
+# O_EXCL create fail every poll, so the waiter times out at 97 — no corruption, no
+# false hold, and the wrapped command never runs. POSIX-only: chmod 0555 is a no-op
+# for writes on Git-Bash/NTFS (the create would wrongly succeed), so skip-with-note
+# on Windows; the Linux/macOS CI legs exercise it.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    echo "note: Test 48 skipped on Windows — chmod 0555 does not deny writes on NTFS; the POSIX CI legs cover it" ;;
+  *)
+    T48DIR="$WORK/t48.nowrite"; T48LOG="$WORK/t48.log"; mkdir -p "$T48DIR"; : > "$T48LOG"
+    T48MARK="$WORK/t48.ran"; rm -f "$T48MARK"
+    chmod 0555 "$T48DIR"
+    AGENT_LOCK_PATH="$T48DIR/commit.lock" AGENT_LOCK_LOG="$T48LOG" \
+      AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=2 \
+      bash "$LIB" run -- bash -c "touch '$T48MARK'" 2> "$WORK/t48.err"; rc=$?
+    [ "$rc" = 97 ] && ok "F4 unwritable lock dir: waiter timed out (97)" \
+                   || bad "F4 unwritable lock dir: rc=$rc (want 97)"
+    [ ! -e "$T48MARK" ] && ok "F4: the wrapped command never ran" \
+                        || bad "F4: the wrapped command ran despite no lock"
+    [ ! -e "$T48DIR/commit.lock" ] && ok "F4: no lock file created in the unwritable dir" \
+                                   || bad "F4: a lock file appeared in an unwritable dir"
+    grep -q "WAITING for lock" "$T48LOG" && ok "F4: logged WAITING (the create kept failing)" \
+                                         || bad "F4: no WAITING log"
+    grep -q "TIMEOUT after" "$T48LOG" && ok "F4: logged the TIMEOUT" || bad "F4: no TIMEOUT log"
+    chmod 0755 "$T48DIR" 2>/dev/null; rm -rf "$T48DIR"   # restore so cleanup() can rm -rf $WORK
+    ;;
+esac
+
+echo "== Test 49: failing log path -> lock still works, the log write is swallowed (F2/J1) =="
+# F2/J1 (failure-modes.md §4.5): logging is best-effort (every write ends || true).
+# Point AGENT_LOCK_LOG under a REGULAR FILE so every append/open fails ENOTDIR — the
+# lock must still acquire+release cleanly (rc 0) with the log write swallowed.
+# Portable (no chmod/perms). NOTE: bash's redirection-OPEN failure leaks to stderr
+# (the ||true is on the write, not the open), so do NOT assert clean stderr; and do
+# NOT grep the log (nothing is ever written to it).
+T49P="$WORK/t49.notadir"; : > "$T49P"          # a regular FILE; using it as a dir -> ENOTDIR
+T49LOG="$T49P/x.log"                            # every open/append under it fails ENOTDIR
+T49MARK="$WORK/t49.ran"; rm -f "$T49MARK"
+AGENT_LOCK_PATH="$WORK/t49.lock" AGENT_LOCK_LOG="$T49LOG" \
+  bash "$LIB" run -- bash -c "touch '$T49MARK'" 2>/dev/null; rc=$?
+[ "$rc" = 0 ] && ok "F2/J1 failing log: lock acquired+released, command ran (rc 0)" \
+             || bad "F2/J1 failing log: rc=$rc (want 0 — a bad log must not fail the lock)"
+[ -e "$T49MARK" ] && ok "F2/J1: the wrapped command ran" \
+                  || bad "F2/J1: the wrapped command did not run"
+[ ! -e "$WORK/t49.lock" ] && ok "F2/J1: lock released/cleaned up despite the failing log" \
+                          || bad "F2/J1: lock left behind"
+[ ! -e "$T49LOG" ] && ok "F2/J1: the log write was swallowed (no log file under the non-dir)" \
+                   || bad "F2/J1: a log file was created under a non-dir"
+rm -f "$T49P" "$WORK/t49.lock"
+
+echo "== Test 50: ENOSPC on lock create/write -> wait then 97, no false hold (F1) =="
+# F1 (failure-modes.md §4.5): a full filesystem makes the create's write fail
+# (ENOSPC); the created-but-write-failed file is an empty orphan and the waiter
+# times out at 97 — no corruption, no false hold. Real ENOSPC needs a full FS, which
+# needs root (a small tmpfs); `ulimit -f` is NOT usable (it raises SIGXFSZ and kills
+# the wrapper, the wrong lane). So: Linux + passwordless sudo only; skip-with-note
+# otherwise. The Linux CI leg (ubuntu runners have passwordless sudo) exercises it.
+if [ "$(uname -s)" = Linux ] && sudo -n true 2>/dev/null; then
+  T50MNT="$WORK/t50.full"; T50LOG="$WORK/t50.log"; mkdir -p "$T50MNT"; : > "$T50LOG"
+  T50MARK="$WORK/t50.ran"; rm -f "$T50MARK"
+  if sudo mount -t tmpfs -o size=64k tmpfs "$T50MNT" 2>/dev/null; then
+    dd if=/dev/zero of="$T50MNT/fill" bs=1k count=256 2>/dev/null || true   # fill to ENOSPC
+    AGENT_LOCK_PATH="$T50MNT/commit.lock" AGENT_LOCK_LOG="$T50LOG" \
+      AGENT_LOCK_STALE_SECS=1 AGENT_LOCK_POLL_SECS=0.1 AGENT_LOCK_MAX_WAIT=2 \
+      bash "$LIB" run -- bash -c "touch '$T50MARK'" 2> "$WORK/t50.err"; rc=$?
+    [ "$rc" = 97 ] && ok "F1 ENOSPC: waiter timed out (97)" \
+                   || bad "F1 ENOSPC: rc=$rc (want 97)"
+    [ ! -e "$T50MARK" ] && ok "F1: the wrapped command never ran under ENOSPC" \
+                        || bad "F1: the wrapped command ran despite ENOSPC"
+    sudo umount "$T50MNT" 2>/dev/null
+  else
+    echo "note: Test 50 skipped — could not mount a tmpfs (sudo mount failed); covered where mountable"
+  fi
+  rmdir "$T50MNT" 2>/dev/null || true
+else
+  echo "note: Test 50 skipped — ENOSPC injection needs Linux + passwordless sudo (a small tmpfs); the Linux CI leg covers it"
+fi
+
 # NOTES (deliberately untested here):
 # * lock_release's LEFTOVER lane (the unlink blocked persistently) needs a
 #   foreign no-delete-share handle on the lock file — Windows-only, and the
