@@ -67,9 +67,17 @@ WORK="$(pwsh -NoProfile -Command '[IO.Path]::Combine([IO.Path]::GetTempPath(), "
 WORK="${WORK//\\//}"
 mkdir -p "$WORK"
 
-PASS=0; FAIL=0
-ok()  { echo "PASS: $*"; PASS=$((PASS+1)); }
-bad() { echo "FAIL: $*"; FAIL=$((FAIL+1)); }
+PASS=0; FAIL=0; TAPN=0; DONE=0
+GCL_TAP="${GCL_TAP:-0}"           # CI sets GCL_TAP=1 for machine-readable TAP13 output
+# ok/bad are TAP-aware (gated by GCL_TAP so plain dev runs are byte-unchanged) and
+# bump the running assertion number TAPN. The trailing `1..$TAPN` plan line (emitted
+# just before the verdict) lets a TAP consumer fail on a short count; together with the
+# DONE sentinel below this closes the silent-undercount gap. `return 0` preserves the
+# "ok/bad cannot fail" property the `<assert> && ok ... || bad ...` idiom relies on.
+ok()  { PASS=$((PASS+1)); TAPN=$((TAPN+1)); echo "PASS: $*"
+        [ "$GCL_TAP" = 1 ] && echo "ok $TAPN - $*"; return 0; }
+bad() { FAIL=$((FAIL+1)); TAPN=$((TAPN+1)); echo "FAIL: $*"
+        [ "$GCL_TAP" = 1 ] && echo "not ok $TAPN - $*"; return 0; }
 
 # Failure post-mortems need the logs: keep $WORK when anything failed, and
 # honour GCL_TEST_PRESERVE_DIR (the CI preserve-logs knob) by copying
@@ -86,7 +94,18 @@ cleanup() {
   fi
   rm -rf "$WORK" 2>/dev/null || true
 }
-trap cleanup EXIT
+# Sentinel: the suite reaching its end sets DONE=1. If the EXIT trap fires with
+# DONE!=1, the suite died early (a stray exit/crash) and the assertion count is
+# unreliable — fail loudly even if the pre-trap code was 0. A bare trap `return`
+# is IGNORED (the script keeps its pre-trap code), so the guard must `exit 1`.
+finish() {
+  cleanup
+  if [ "${DONE:-0}" != 1 ]; then
+    echo "Bail out! suite terminated early before the plan line; ran ${TAPN:-0} assertion(s), count unreliable" >&2
+    exit 1
+  fi
+}
+trap finish EXIT
 
 # Poll for a marker file: ready-markers replace fixed head-start sleeps so a
 # slow pwsh cold-start (1-3s+ under load) can't fake an ordering failure.
@@ -1380,5 +1399,7 @@ else
 fi
 
 echo
+DONE=1
 echo "==== INTEROP RESULT: $PASS passed, $FAIL failed (fan-out: $GCL_MODE) ===="
+[ "$GCL_TAP" = 1 ] && echo "1..$TAPN"
 [ "$FAIL" = 0 ]
