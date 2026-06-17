@@ -11,3 +11,6 @@ Thumbs.db
 /.agent/review-queue.lock.*
 /.agent/last-opened
 /.agent/.tmp.*
+
+# Test/CI artifact output (manifests, suite logs); created at runtime, never committed.
+test-output/
