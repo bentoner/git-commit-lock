@@ -570,10 +570,15 @@ false success — relies on the wrapper *reaching its release path*. The bypass 
 is any termination or replacement of the holding process that skips that unwind;
 crucially it is **not** triggered by a normal `exit`. The instances:
 - **External SIGKILL** — untrappable; no handler runs in either port.
-- **bash `exec` in the wrapped command** — `run` executes `"$@"` *in the wrapper
-  shell itself* (`git-commit-lock.sh:1733`), so an `exec` replaces that shell's
-  process image and *neither* the trailing `lock_release` *nor* the `EXIT` trap
-  (`git-commit-lock.sh:1002-1013`, armed at `:1308`) runs.
+- **bash `exec` that replaces the lock-holding shell** — `run` executes `"$@"`
+  *in the wrapper shell itself* (`git-commit-lock.sh:1733`), so the bypass needs the
+  exec to run in *that* shell: the wrapped command *is* an exec (`run -- exec …`),
+  or a **sourced** caller does `lock_acquire; exec …` in its own shell. Then the
+  exec replaces that shell's process image and *neither* the trailing `lock_release`
+  *nor* the `EXIT` trap (`git-commit-lock.sh:1002-1013`, armed at `:1308`) runs. An
+  exec **nested in a child** — the ordinary `run -- bash -c 'exec …'` — does **not**
+  bypass (the child is replaced; the wrapper waits and releases normally). *Verified
+  empirically 2026-06-17.*
 - **PowerShell `[Environment]::Exit(n)`** — a CLR hard-exit that bypasses
   `Lock-Release`, the `finally`, *and* the `PowerShell.Exiting` backstop
   (`git-commit-lock.ps1:221-245`).
