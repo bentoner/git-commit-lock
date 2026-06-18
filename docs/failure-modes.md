@@ -107,7 +107,7 @@ robust-by-code-but-unverified · S static/grep check · (plat) platform-gated.
 
 | # | Failure mode | Current behavior | Tier | Tested | Recommendation |
 |---|---|---|---|---|---|
-| A1 | Clean high contention (N workers, no crashes) | Serialized; no lost update | 1 | ✓ U:166-195, I:227-261/341-386, integ | **In scope.** Keep. |
+| A1 | Clean high contention (N workers, no crashes) | Serialized; no lost update | 1 | ✓ C:81-111 (canary), I:227-261/341-386, integ | **In scope.** Keep. |
 | A2 | Thundering herd recovering one dead lock | Claim serializes; exactly one steal, zero displacement | 1 | ✓ U:212-346, I:884-1015 | **In scope.** Keep. |
 | A3 | Many concurrent stealers on one ghost | One O_EXCL claim winner | 1 | ✓ U:1095-1128, I:1017-1088 | **In scope.** Keep. |
 | B1 | Holder dies (crash/SIGKILL/power) mid-hold | Lease ages out; stolen after STALE | 1 (recovery) / 2 (latency) | ✓ U:197-210/348-361 | **In scope** (recovery). Latency = Tier 2. |
@@ -146,6 +146,7 @@ robust-by-code-but-unverified · S static/grep check · (plat) platform-gated.
 | K2 | Internal time budgets (poll, MAX_WAIT, read ladder) | Fixed schedules; tunable | 2 | ✓/~ | **In scope** as Tier-2 envelope. See §K. |
 
 U = `tests/git-commit-lock.test.sh`, I = `tests/git-commit-lock.interop.test.sh`,
+C = `tests/git-commit-lock.canary.test.sh` (the concurrency canary),
 integ = `tests/git-commit-lock.integration.test.sh`.
 
 ---
@@ -161,10 +162,12 @@ exactly one creator wins, the rest poll and take turns
 token (read-back verification, `git-commit-lock.sh:1352-1361`) before claiming
 the hold — so even a create that "won" but whose file was concurrently
 clobbered does not produce a false hold.
-*Tier 1.* Tested heavily: unit Test 1 (8 rounds × 25 workers at FULL,
-`U:166-195`), interop Test 1/Test 6 mixed bash+pwsh (`I:227-261`, the strict
-deterministic counter `I:341-386`), and the integration suite's real-commit
-swarm. **Recommend: in scope, keep.** This is the tool's whole reason to exist.
+*Tier 1.* Tested heavily: the concurrency canary — mutual exclusion under many
+concurrent workers, 8 rounds × 25 at FULL (`tests/git-commit-lock.canary.test.sh`
+Test 1, `C:81-111`) — interop Test 1/Test 6 mixed bash+pwsh (`I:227-261`, the
+strict deterministic counter `I:341-386`), and the integration suite's real-commit
+swarm. (Crash-recovery / claim-contention witnesses stay in the unit suite: A2's
+Test 2b, A3's Test 20.) **Recommend: in scope, keep.** This is the tool's whole reason to exist.
 
 **A2 — Thundering herd recovering one dead lock.** After a holder dies, *every*
 waiter judges the same lock stale off the same mtime in the same poll window —
@@ -394,8 +397,9 @@ keep out of scope — but consider making it harder to *fall into* accidentally.
 The current failure mode on a bad FS is *silent* (the tool runs, exclusion may
 just not hold). Options, in increasing cost: (i) leave as-is, documented — the
 default lock lives in `.git`, which is almost always local, so accidental
-network use is rare; (ii) a one-line caveat in `README.md` (currently only in the
-deeper design doc); (iii) an optional best-effort startup probe of the lock dir's
+network use is rare; (ii) a one-line caveat in `README.md` (since done —
+`README.md:60-64`; previously only in the deeper design doc); (iii) an optional
+best-effort startup probe of the lock dir's
 FS type with a stderr warning on a known-network type (cheap on Linux via
 `stat -f`, awkward cross-platform, and inherently incomplete). **My
 recommendation: (ii) now** (surface the boundary in the README, where an operator
@@ -634,8 +638,8 @@ mixed tree degrades prevention to detection (98) and can leave `.dead.*` litter
 current versions don't clean (residual 4, `git-commit-lock.sh:261-265`). *Tier
 3.* Untested (would require shipping an old version into the suite). **Recommend:
 out of scope; keep the "upgrade both implementations together" deployment note**
-— currently in the design doc only (`docs/git-commit-lock.md:251-255`), **not** in
-`README.md`; surface it there too, where operators actually look. Acceptable
+— in the design doc (`docs/git-commit-lock.md:251-255`) and now also surfaced in
+`README.md:101-106`, where operators actually look. Acceptable
 because the degraded mode is still *detected* (98), never silent.
 
 ### J. Logging subsystem failure

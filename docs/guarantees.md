@@ -124,7 +124,9 @@ bug.
   `tok.` is a non-lock-shaped residual, never stolen, that needs manual removal
   (`failure-modes.md` §F1 — an accepted residual). *Witness:* the read-back-failure lanes —
   create-path Test 32, steal-path Test 32b (`U:1760-1855`); resource lanes —
-  coverage planned (Bucket 2 / `failure-modes.md` §4.5). *Basis:* §1, §A1, §F.
+  unwritable lock dir Test 48 (F4), ENOSPC Test 50 (F1, Linux+sudo; skip-with-note
+  elsewhere) (`failure-modes.md` §4.5); FD/inode exhaustion (F3) is document-only
+  (no portable injection). *Basis:* §1, §A1, §F.
 
 - **G-S3 — Strict mutual exclusion within the staleness window, with no
   displacement during crash recovery.** Within `AGENT_LOCK_STALE_SECS` no steal
@@ -139,8 +141,10 @@ bug.
   *Condition:* holds complete within the window (E4); a stable clock (E1) — a local
   clock jump preserves *no silent loss* (G-S1) but can break *strict exclusion* by
   making a live lock look stale (a premature, but detected, steal); and matching
-  version (E5). *Witness:* unit Tests 1/2b/20, interop Tests 1/6/16/16b, integration suite
-  (`U:166-195,212-346,1095-1128`; `I:227-261,341-386,884-1088`). *Basis:*
+  version (E5). *Witness:* the concurrency canary (mutual exclusion under many
+  concurrent workers, 8 rounds × 25 at FULL, `C:81-111`), unit Tests 2b/20
+  (claim-recovery and many-stealers), interop Tests 1/6/16/16b, integration suite
+  (`U:212-346,1095-1128`; `I:227-261,341-386,884-1088`). *Basis:*
   §A1/§A2/§A3.
 
 - **G-S4 — Never destroys a non-lock-shaped object.** A directory, symlink, FIFO,
@@ -268,13 +272,17 @@ split, `failure-modes.md` §4.1 / D-c).
   warn loudly once per process and treat the lock as **not** stale (the mtime floor
   fails closed to "fresh"): no premature steal, no corruption — but recovery of a
   genuinely crashed holder is *disabled* and waiters block to `MAX_WAIT` (97).
-  Safety is preserved; recovery is lost and announced. *Coverage planned* (Bucket
-  2 / §4.5). *Basis:* §E3.
+  Safety is preserved; recovery is lost and announced. *Witness:* unit Test 42
+  (shadows the mtime probe to return empty on a present stale ghost; the
+  "Staleness detection is BROKEN" warn-once fires, the ghost is left in place,
+  the waiter blocks to 97). *Basis:* §E3.
 
 - **BE-4 — Logging is best-effort and never blocks the lock.** Every log write
   ends `|| true`; a failed or unwritable log write is swallowed and the lock works
-  unaffected (the log self-truncates past ~1 MB). *Coverage planned* (Bucket 2 /
-  §4.5, the F2/J1 test). *Basis:* §F2/§J1.
+  unaffected (the log self-truncates past ~1 MB). *Witness:* unit Test 49 (points
+  `AGENT_LOCK_LOG` under a regular file so every append fails ENOTDIR; the lock
+  still acquires + releases cleanly with the log write swallowed — also covers
+  J1). *Basis:* §F2/§J1.
 
 - **BE-5 — The PowerShell 5.1 steal is claim-guarded, not atomic.** Windows
   PowerShell 5.1 lacks the 3-arg `File.Move` overload, so its steal is
@@ -304,7 +312,7 @@ of §2 are **not** claimed here.
   the no-displacement prevention (G-S3) degrades to detection (98), and old-style
   stealers can leave `.dead.*` litter. Never silent, but the prevention property is
   not guaranteed. Deployment rule: **upgrade both implementations together**
-  (`git-commit-lock.md:251-256`; to be surfaced in the README too — Bucket 3).
+  (`git-commit-lock.md:251-256`; also surfaced in `README.md:101-106`).
   *Basis:* §I2.
 
 - **OOS-4 — PowerShell port on POSIX.** Supported on Windows only; on POSIX it runs
@@ -330,9 +338,9 @@ of §2 are **not** claimed here.
   or hard-exits the lock-holding shell **and** returns 0 **while displaced**. The
   *next* holder still recovers via staleness; only the abruptly-exiting one is
   unwarned. No code change closes this without the handle-based ops the design
-  rejected. *Witness (boundary exercised indirectly):* interop Test 5 (`I:308-334`,
-  ps1 `[Environment]::Exit()`); the bash `exec` lane is a coverage gap
-  (`steering-coverage.md` A4). *Basis:* §H4.
+  rejected. *Witness:* the §H4 non-unwinding-exit boundary is pinned by interop
+  Test 5 (`I:308-334`, ps1 `[Environment]::Exit()`) and unit Test 40 (bash `exec`
+  in the lock-holding shell, OOS-5). *Basis:* §H4.
 
 - **OOS-6 — Adversarial / hostile local processes.** The lock is advisory. Against
   a process actively trying to break it (deleting/overwriting the lock file, or a
@@ -384,16 +392,18 @@ The design considered and rejected each of these; they are not roadmap items
 
 Each guarantee → its witnessing test(s) and the failure-modes section. `U` =
 `tests/git-commit-lock.test.sh`, `I` = `tests/git-commit-lock.interop.test.sh`,
-`integ` = `tests/git-commit-lock.integration.test.sh`. "Coverage planned" marks a
-guarantee that is currently reasoned-correct-but-untested and slated for a
-fault-injection test under Bucket 2 (`failure-modes.md` §4.5, Ben's override to
-add coverage); the *guarantee* is made now, the *test* lands in Phase 3.
+`C` = `tests/git-commit-lock.canary.test.sh` (the concurrency canary), `integ` =
+`tests/git-commit-lock.integration.test.sh`. The former resource-exhaustion and
+diagnostic-clock coverage gaps are now closed by the fault-injection tests
+(`failure-modes.md` §4.5): F4 (Test 48), F2/J1 (Test 49), F1 (Test 50), and the
+unreadable-mtime fail-safe (Test 42). The one remaining document-only lane is F3
+(FD/inode exhaustion), which has no portable deterministic injection.
 
 | Guarantee | Witness | failure-modes § |
 |---|---|---|
 | G-S1 no silent lost update | U Test 4b + Test 16 (unverifiable lane); I Test 8 (both dirs) | §1, §B5 |
-| G-S2 no corruption / no false hold | U Tests 32/32b (read-back failure); **resource lanes: coverage planned** (F1/F3/F4) | §1, §A1, §F |
-| G-S3 strict exclusion in window + no displacement | U Tests 1/2b/20; I Tests 1/6/16/16b; integ | §A1/§A2/§A3 |
+| G-S2 no corruption / no false hold | U Tests 32/32b (read-back failure); **resource lanes: Test 48 (F4), Test 50 (F1); F3 document-only** | §1, §A1, §F |
+| G-S3 strict exclusion in window + no displacement | C Test 1 (8×25 canary); U Tests 2b/20; I Tests 1/6/16/16b; integ | §A1/§A2/§A3 |
 | G-S4 never destroys non-lock-shaped | U Tests 17/17d/18/22 | §D3/§D4/§G1 |
 | G-S5 truthful exit codes | U Tests 7/8/4b/5/16; I run-verdict tests | §1, §H4 |
 | G-R1 lock-shaped orphans reclaimed | U Tests 2/3/21 | §B1/§C1/§C2/§C3 |
@@ -401,8 +411,9 @@ add coverage); the *guarantee* is made now, the *test* lands in Phase 3.
 | G-R3 no busy-spin; bounded wait | I Test 14b | §K(4) |
 | G-R4 no unowned lock left behind | U Tests 31/35/36 | §C4 |
 | G-I1 bash⇄pwsh same lock | I suite throughout | §I1 |
-| BE-3 unreadable mtime fails safe | **coverage planned** (E3) | §E3 |
-| BE-4 logging best-effort | **coverage planned** (F2/J1) | §F2/§J1 |
+| BE-3 unreadable mtime fails safe | U Test 42 | §E3 |
+| BE-4 logging best-effort | U Test 49 (F2/J1) | §F2/§J1 |
 
-The "coverage planned" rows are exactly the lanes Phase 1c (the steering-coverage
-audit) and Bucket 2 (the new fault-injection tests) exist to close.
+The resource-exhaustion and diagnostic-clock lanes (Tests 42/48/49/50) are the
+fault-injection coverage added per `failure-modes.md` §4 item 5; F3 (FD/inode
+exhaustion) stays document-only for want of a portable deterministic injection.

@@ -1,346 +1,236 @@
-# Load & matrix testing strategy — recommendation
+# git-commit-lock: CI & load-testing strategy
 
-**Status: RECOMMENDATION for Ben's decision — not an implementation.** Produced by a
-considered, first-principles process (three parallel research agents — load fidelity, CI
-matrix, test parametrization — synthesized and cross-checked against the code), deliberately
-**not anchored** on the current `tests/with-load.sh` approach (which was thrown together from a
-few lines of discussion). It answers: are we injecting load the right way / of the right
-kinds; how to use the free public GitHub runners for a load×config matrix; and how to get more
-from the existing tests routinely — while staying **considered, not maximalist**.
-
-Grounded in `docs/failure-modes.md` (esp. §K and the correctness-vs-liveness split) and the
-product/test code. Where it cites a fact about GitHub Actions limits, treat the number as
-"current as of writing, confirm against GitHub docs before relying on it."
+This is the rationale for *why the CI is shaped the way it is* — the principles
+behind the three workflows (`tests.yml`, `nightly.yml`, `deep-sweep.yml`), the load
+wrapper (`tests/with-load.sh`), and the two test-level levers (the Axis-A sweep and
+the envelope tier). It describes the system as it stands; for the correctness
+guarantees the suites assert against, see `docs/guarantees.md` and
+`docs/failure-modes.md`.
 
 ---
 
-## 0. Headline recommendations (skim)
+## 1. The principle: correctness is load-independent
 
-1. **Reframe load's job.** Correctness here is *load-independent* (O_EXCL + atomic rename +
-   per-attempt tokens never consult the clock for a correctness decision). So load can't break
-   exclusion or cause a silent lost update. Load has exactly two jobs: **(J1)** perturb
-   scheduling so the protocol's multi-syscall sequences get preempted at adversarial points
-   (race-surfacing), and **(J2)** broaden configs to exercise different code paths. Load
-   *magnitude* past ~2× CPU oversubscription mostly manufactures *harness wall-clock flakes*,
-   not bugs.
-2. **The biggest race-coverage lever is NOT external load — it's deterministic steering.** The
-   genuinely dangerous windows are reachable *deterministically* only by the in-process
-   function-interposition the suite already uses. Invest there first; external load is a
-   secondary, probabilistic complement for the few windows it can actually move.
-3. **Three-tier CI:** a **Required** per-PR gate with **no artificial load** (so a red gate is
-   never a stress-manufactured wall-clock flake — it's actionable); a **Nightly** non-blocking
-   tier that adds calibrated
-   load × kind and the parametrization sweeps, with wall-clock assertions relaxed to warnings;
-   and an on-demand **Deep sweep** (the current stress design) for the 50-clean hunt.
-4. **Fix the injection: calibrate, target, record.** Express load as an *oversubscription
-   ratio* relative to core count (not an absolute hog count); prefer calibrated mechanisms
-   (`stress-ng`, Linux cgroup `cpu.max`/`io.max`) over free-running spinners; write a per-run
-   load-manifest artifact so a flake is reproducible.
-5. **Embrace platform asymmetry** instead of a uniform injection layer: steering everywhere
-   (portable); calibrated latency on the Linux leg only; plain CPU oversubscription as the
-   macOS/Windows fallback — and record per-leg which regime actually ran.
-6. **Get more from existing tests** via a *bounded* parametrization of a named handful (waiter
-   count, fail-open ratio, poll cadence) — with strict correctness assertions kept
-   config-independent and wall-clock assertions moved to the envelope tier.
+This is not a throughput-bound system whose correctness degrades under load. Safety
+and exclusion rest on structural primitives — `O_EXCL` create, atomic `rename(2)`,
+per-attempt token discovery — that never consult the clock for a *correctness*
+decision (`guarantees.md` §E, BE-1; `failure-modes.md` §K). No amount of CPU or IO
+pressure makes a rename non-atomic or lets two `O_EXCL` creates both win on a local
+filesystem.
 
----
+So load does not *change what is correct* — it only *surfaces races*. Its sole job
+is to widen the timing windows in the protocol's multi-syscall sequences (which are
+not individually atomic) so that the inter-process interleavings the code claims to
+handle are actually exercised. The right question to ask of a load regime is "does
+this raise the probability that process A is suspended between syscall N and N+1
+while process B advances?" — not "does it consume the box?". Past roughly 2× CPU
+oversubscription, more load finds no new correctness bugs; it only stretches
+wall-clock latency and starts tripping the suite's best-effort timing assertions.
 
-## 1. What load testing is FOR here (the reframe that drives everything)
+Two consequences shape the whole design:
 
-This is **not** a throughput-bound system whose correctness degrades under load. Per
-`failure-modes.md` §1/§K, safety/exclusion rest on structural primitives (atomic
-create/rename, per-attempt-token discovery) that never reference the clock for a *correctness*
-decision. No amount of CPU/IO pressure makes `rename(2)` non-atomic or lets two O_EXCL creates
-both win on a local FS.
+- **The per-PR gate runs no load** (strict, fast). A red required check is then
+  always actionable — a real correctness bug or genuine infra drift, never a
+  stress-manufactured wall-clock flake.
+- **Load lives in non-blocking tiers** (nightly, deep-sweep), where the
+  load-sensitive timing assertions are relaxed to warnings so an oversubscribed
+  runner cannot turn a latency stretch into a red.
 
-So load's honest purpose is narrow: **make the protocol's multi-syscall sequences (which are
-not individually atomic) get preempted at adversarial points, so the inter-process
-interleavings the code claims to handle are actually exercised** — plus widen the few
-genuinely timing-derived decisions (mtime staleness, the FILETIME-zero floor, empty-read
-retries). The right metric for a load regime is *"does it raise the probability that process A
-is suspended between syscall N and N+1 while process B advances?"* — **not** *"does it consume
-the box?"*
+## 2. Deterministic steering is the primary race-coverage lever
 
-**Direct consequence (the most important single point):** beyond ~2× CPU oversubscription,
-more load does not find new correctness bugs — it only stretches wall-clock latency and starts
-blowing the suite's *Tier-2* wall-clock assertions (Test 21's ≤20s recovery, Test 22a's
-warning timing, Test 29's poll-count), which `failure-modes.md` §K already identifies as
-Tier-1-bound-on-a-Tier-2-quantity. The fix for those is to **scope the bound**, not pile on
-load. This is why the strategy below puts load in non-blocking tiers and keeps the gate clean.
+The protocol's genuinely dangerous windows — create → read-back verify; the claim
+recheck → touch → re-verify → rename residual; rename-over → read-back on a steal;
+the release boundary — are ones where a *wrong interleaving could actually corrupt
+state*. External load can only reach those windows *probabilistically*: it raises
+the background chance of hitting an interleaving nobody scripted.
 
----
+The suite reaches them *deterministically* instead, by in-process function
+interposition. `clone_fn` (`tests/_harness.sh`) clones a library internal (or
+shadows a command like `mv`/`rm`/`touch` with a shell function) so a steering test
+can land "the rival's rename" at an exact protocol position, then call the original
+through the clone (the Test 23–36 steered scenarios in
+`tests/git-commit-lock.test.sh`). This hits the exact protocol window every run,
+attributably — which is why it, not external load, is the primary race-coverage
+investment.
 
-## 2. The biggest lever is deterministic steering, not load
+External load is the secondary, broad-net lever. It earns its place mainly on the
+one window it can genuinely move: the mtime-staleness / fail-open boundary, where
+CPU/IO pressure stretches a contended holder past the STALE threshold and exercises
+the detected-98 lane. A corollary for triage: because external load *cannot* break
+correctness, a load run that produces a *correctness* failure is surfacing either a
+real logic bug in a steering-reachable window (high value) or a test-harness setup
+race (a harness fix, not a code fix).
 
-The protocol's scary windows — and whether *external load* can even reach them:
+## 3. The three tiers
 
-| Window | Code | Reachable by external load? |
-|---|---|---|
-| create → read-back verify | `git-commit-lock.sh:1336-1357` | Only probabilistically (1 command-sub wide); deterministically via steering |
-| **claim recheck → touch → re-verify → rename** (residual 1/2 — THE delicate path) | `:1092-1168` | Probabilistically via CPU preemption; deterministically only via steering |
-| rename-over → read-back (steal install) | `:1168-1179` | Same — steering for determinism |
-| **mtime staleness / fail-open boundary (B5)** | `:1408-1410`, `:928` | **Yes** — CPU/IO load stretches cadence and can push a contended holder past STALE → exercises the 98-detect lane. The most realistic "load surfaces a real lane" case. |
-| two-poll wrong-type confirmation (ghosts) | `:1518-1567` | **Yes, but mostly the bad way** — oversubscription *starves* the poll headroom → manufactures the Test 22a-style flake rather than finding a bug |
-| FILETIME-zero floor (Windows) | `:925`, `:1408` | **No** — a *create-churn* artifact, not load-driven |
-| empty-read retry ladder (AV/create→write) | `:668-684` | Realistic trigger is Windows AV/filter-drivers, not synthetic load |
+### Tier R — required, per-PR (`tests.yml`)
 
-**Takeaway:** the windows where a *wrong interleaving could actually corrupt state*
-(create→readback, claim→rename, rename→readback, release boundary) are reached *deterministically*
-only by the in-process function-interposition steering the suite already does (`clone_fn`,
-`tests/git-commit-lock.test.sh:127-136`). External load merely raises the background
-probability of hitting an interleaving nobody scripted. **So the primary race-coverage
-investment is MORE STEERED SCENARIOS** (portable, deterministic, attributable) — e.g. steered
-cases that park the claimant between recheck and rename, and between touch and rename, firing a
-clearer + rival. External load is a *secondary, probabilistic* complement, valuable mainly for
-the staleness/fail-open boundary (B5) it can genuinely move.
+The blocking gate. It runs every suite (unit, interop, integration, and the
+full-width concurrency canary as its own parallel cell) at full fan-out
+(`GCL_TEST_FULL=1`) with **no load** and the **strict** envelope tier (the default —
+the workflow sets no `GCL_ENVELOPE_TIER`, so every timing assertion is hard). The
+matrix is:
 
-A corollary for triage: because external load *cannot* break correctness, a load run that
-produces a *correctness* failure is surfacing either (a) a real logic bug in a steering-only
-window (high value) or (b) a *test-harness* setup race (`sync_waiting_fresh`/`backdate_ghost`
-losing its race under load) — a harness fix, not a code fix. Prefer deterministic mechanisms so
-an observed failure is *attributable*.
-
----
-
-## 3. Fix the load injection: calibrate, target, record
-
-**Critique of the current `tests/with-load.sh`** (N bare CPU spinners + N `dd … conv=fsync`
-create/write/delete loops): it is a *reasonable background-jitter generator* and adequate for
-"run the whole suite under generic pressure," but from first principles it is:
-- **Uncalibrated / non-reproducible:** `LOAD=N` spinners produce wildly different real
-  preemption pressure on a 2-core vs 4-core runner, so "we tested at load N" doesn't mean a
-  fixed thing — violating the reproducible-experiments requirement.
-- **Untargeted:** a box-wide hog perturbs *everyone uniformly* (including the rival you wanted
-  to advance), so it adds jitter but doesn't *bias* the interleaving toward the adversarial
-  order. The high-value windows need a *scalpel* (slow one syscall in one process), which it
-  can't do.
-- **Blind to two windows:** it can't widen the create→write gap (the lock create is one
-  redirect, no fsync to delay) and can't *produce* the Windows delete-pending ghost (it churns
-  unrelated files); its main effect on those is the *poll-starvation false-flake* direction.
-- **Self-defeating at high N:** on a 2-core runner it pushes wall-clock far enough to blow the
-  harness's own timeouts (the workflow already had to raise every step timeout 2–3×) — load
-  manufacturing churn, not findings.
-
-**Recommendations:**
-- **Express load as an oversubscription ratio `R = stressors / nproc`** (e.g. R ∈ {0, 1, 2}),
-  not an absolute hog count, so a level is runner-independent. Note `R` is **per kind**: the
-  current wrapper's `GCL_STRESS_LOAD=N` spawns N hogs per selected kind, so `both` doubles total
-  hogs — define and cap `R_total`, and record cpu- and disk-stressor counts separately.
-- **Prefer calibrated mechanisms:** `stress-ng --cpu $((R*nproc)) --cpu-load … --metrics`
-  (defined, measurable) over bare spinners. On **Linux**, calibrated **CPU** throttling is the
-  cleanest *envelope-validation* tool — `sudo systemd-run --scope -p CPUQuota=10%` gives a
-  runner-independent quota (a 10% quota means the same everywhere; "8 hogs" does not). **Treat
-  this as a probe-required Linux-only option, not a turnkey fact:** it needs cgroup v2 +
-  controller delegation + a usable systemd manager on the GitHub `ubuntu-24.04` runner, so gate
-  it behind a CI capability probe with the `stress-ng`/ratio path as the fallback. **IO** cgroup
-  throttling is *experimental* here — it is not a simple `systemd-run -p io.max`; systemd
-  exposes it as `IOReadBandwidthMax=`/`IOWriteBandwidthMax=` with device/path caveats — so don't
-  rely on it until proven on the runner.
-- **Record a per-run `load-manifest`** artifact next to the suite logs: `{kind, R, nproc,
-  achieved-slowdown, tool versions, runner os/arch, git sha}`, uploaded on *success too* (you
-  need the negatives to interpret the positives). Optionally probe achieved slowdown with a
-  fixed micro-benchmark before/during load.
-- **Cap routine load at ~2× oversubscription;** higher R only on the deep-sweep flake-hunt leg
-  (whose *correctness* assertions stay strict but *wall-clock* assertions are relaxed).
-
----
-
-## 4. Embrace platform asymmetry (don't build a uniform injection layer)
-
-The platforms diverge too much for a "uniform" *calibrated/targeted* load layer (cgroup
-throttling and FUSE fault-injection filesystems are Linux-only for this CI plan; `strace`
-inject is Linux-only; `DYLD_INSERT_LIBRARIES` injection is unreliable on macOS for
-SIP-protected Apple/system binaries like `mv`/`git` — possible only for non-protected helper
-binaries). Don't fight it — structure around it and **record which regime ran per leg**:
-
-- **Deterministic steering** — *everywhere* (portable bash; pwsh equivalent). The real
-  race-coverage tool.
-- **Calibrated / targeted latency** (cgroup CPU quota; optionally `strace -e inject` to slow one
-  syscall in one process; a FUSE fsync-delay shim — charybdefs-style — only if window W7 is
-  prioritized) — **Linux leg only** (probe-gated, per §3).
-- **Uncalibrated oversubscription — the macOS/Windows fallback.** Both **CPU** (`stress-ng` or
-  the bash-spinner fallback) **and the simple disk-churn hog** (the current
-  `dd`/create-write-fsync-delete wrapper) run cross-platform; they are *low-fidelity and
-  uncalibrated* but real metadata-op pressure, which is why the Tier-N macOS/Windows `disk`
-  cells (§5) use them. Document the asymmetry: calibrated latency only on Linux; everywhere else
-  it's blunt oversubscription.
-
-Low-yield, **avoid:** memory/swap pressure (trivial allocation surface; risks OOM-killing the
-harness), raw disk-bandwidth saturation (doesn't touch metadata-op latency), de-prioritizing
-the background hogs. `ulimit`/inode/FD exhaustion belong to the *fault-injection tests* (the
-§4.5 work), not the timing-load regime.
-
----
-
-## 5. The three-tier CI structure (the matrix)
-
-The organizing recommendation. It maps directly onto the already-decided correctness/envelope
-test split (D-c).
-
-### Tier R — Required / per-PR (blocking) — KEEP the existing 4 cells, STRIP the load
-| Cell | OS | Engines | Buys |
+| Cell | OS | Engines / leg | Buys |
 |---|---|---|---|
-| R1 | ubuntu | bash + pwsh7 (all suites) | Linux correctness + interop baseline |
-| R2 | macos | bash + pwsh7 (all suites) | BSD `stat`/`mv` lanes (D1/E3) — *only* place these run |
-| R3 | windows (unit leg) | bash (MINGW) | delete-pending ghosts, FILETIME floor |
-| R4 | windows (interop+integration leg) | bash + pwsh7 + **PowerShell 5.1** | the 5.1 non-atomic-fallback path (D1) + real NTFS commit swarm |
+| ubuntu-24.04 `all` + `canary` | Linux | bash + pwsh7 | Linux correctness + interop baseline |
+| macos-15 `all` + `canary` | macOS | bash + pwsh7 | BSD `stat`/`mv` lanes |
+| windows-2025 `unit` | Windows | bash (MINGW) | delete-pending ghosts, FILETIME floor |
+| windows-2025 `interop-integration` | Windows | bash + pwsh7 + **PowerShell 5.1** | the 5.1 non-atomic-fallback path + real NTFS commit swarm |
+| windows-2025 `canary` | Windows | bash (MINGW) | full-width concurrency under process-spawn overhead |
 
-This is exactly today's matrix **minus the stress env**. Running it at **`none` load** means it
-only ever asserts Tier-1 correctness — it *cannot* flake on a Tier-2 wall-clock bound, so **a
-red required check is never stress-manufactured envelope noise.** It's always actionable — a
-real bug, or at worst runner-image/action-download/infra drift (which is also worth knowing) —
-never a "load was too high" false alarm. Target < ~8 min. (Also: flip the concurrency group
-back to `${{ github.workflow }}-${{ github.ref }}` + `cancel-in-progress: true` — the current
-per-run-unique group is a *deep-sweep* setting, which is exactly why the stress branch is marked
-"do NOT merge to main.")
+The canary runs as a separate parallel cell on every arch because it is about half
+the Windows unit wall-clock; suites must *not* run concurrently inside one runner
+(they are timing-sensitive on 2-core runners). Triggers: `pull_request` and
+`push: main` (both `paths-ignore` docs/`.plans`/license), a weekly `schedule` to
+catch runner-image and tool drift, and `workflow_dispatch`. The concurrency group is
+`${{ github.workflow }}-${{ github.ref }}` with `cancel-in-progress: true`, so rapid
+pushes coalesce. A separate `lint` job gates shellcheck (pinned v0.11.0, `-S style`)
+and PSScriptAnalyzer (warning severity).
 
-### Tier N — Nightly / scheduled (non-blocking, triaged)
-~6 cells adding load **kind** (cpu / disk / both) at **one** oversubscribed level (R≈2), plus
-the §6 parametrization sweeps. Run with **`GCL_ENVELOPE_TIER=relax`** so the three known
-load-sensitive assertions (Test 21 ≤20s, Test 22a warning, Test 29 poll-count) **downgrade to
-warnings** while correctness assertions stay hard. Example cells: ubuntu×{disk, both, cpu},
-macos×disk, windows×{disk on the interop+5.1 leg — highest-value, both on the unit leg}.
-Auto-file a triaged issue on failure tagged `correctness` (investigate) vs `envelope-flake`
-(expected). macOS gets one harsh cell only (it's the scarce/slow runner); ubuntu absorbs the
-extra kinds (cheapest).
+### Tier N — nightly, scheduled (`nightly.yml`)
 
-### Tier D — On-demand deep sweep (`workflow_dispatch`, never gates)
-The current stress-branch design *is* this tier — keep its `stress_kind`/`stress_load` inputs
-and per-run-unique concurrency (many parallel dispatches), add `repeat` (run a cell K times)
-and `width` inputs. This is the "50-clean under both/8-hog" hunt: informational, time-boxed by
-choice, never a contract.
+A non-blocking scheduled stress run (08:23 UTC daily, plus `workflow_dispatch`).
+This project has **no branch protection** (single-dev, decision 2026-06-18), so
+nightly never gates a PR; its job is to catch the load-sensitive flakes and coverage
+regressions the no-load per-PR gate cannot.
 
-**Why this is the linchpin:** keeping artificial load *off the required gate* is what makes the
-gate trustworthy; putting all load in non-blocking tiers with the envelope assertions relaxed is
-what stops load from manufacturing flakes that erode trust. The split needs a small product/test
-change: a `GCL_ENVELOPE_TIER=relax` env that downgrades the wall-clock assertions — nightly/deep
-set it, required never does.
+Six `stress` cells run the suites wrapped in `tests/with-load.sh` at one
+oversubscription level (`GCL_STRESS_RATIO=2`, R≈2), one `GCL_STRESS_KIND` each:
+ubuntu×{cpu, disk, both}, macos×disk, windows interop-integration×disk, windows
+unit×both. macOS gets a single cell (it is the scarce, slow pool); ubuntu absorbs
+the extra kinds (cheapest). The whole workflow runs with two test-level levers
+turned on (§4): `GCL_ENVELOPE_TIER=relax` (the three load-sensitive timing
+assertions warn instead of failing; correctness assertions stay hard) and
+`GCL_TEST_SWEEP=1` (the Axis-A waiter-count sweep). Each cell writes its own
+`cell-conclusion.txt` (ground truth, captured under `always()`) and uploads its logs
+plus the load-manifest on success too — the negatives are needed to read the
+positives.
 
----
+A separate `kcov` job runs the unit + canary suites under kcov v43 (built from
+source) on Linux, **no load, strict envelope, full fan-out**, and gates line
+coverage of `git-commit-lock.sh` at a 0.80 floor (tracks ~0.83 achieved; ratchets up
+as tests land). It explicitly overrides the workflow-level `relax` back to `strict`
+so coverage is measured on a clean run.
 
-## 6. Get more from existing tests: bounded parametrization
+A `triage` job (`always()`) downloads every cell's artifact and classifies each into
+one labelled issue per (date, class): `nightly-correctness` (a correctness assertion
+failed — investigate), `nightly-envelope` (a relaxed timing miss — expected,
+tracked), or `nightly-infra` (missing artifact / timeout / errored — not a product
+failure). An empty-round guard prevents "0 FAIL across 0 logs" being misread as
+green when an artifact set is entirely missing.
 
-Today there are only two coarse knobs: `GCL_TEST_FULL` (global fan-out) and per-case
-hard-coded `AGENT_LOCK_*` values (never swept). Add **one** mechanism — a per-axis sweep over a
-**named handful** of tests (sum the axes, do **not** cross-product):
+### Tier D — on-demand deep sweep (`deep-sweep.yml`)
 
-- **Axis A — waiter/stealer count (highest value):** T2b (frozen at 4), T20, interop T16. Sweep
-  N ∈ {4, 12, 24}. Widens the thundering-herd/claim-serialization and displacement windows that
-  re-running N=4 never will.
-- **Axis B — fail-open ratio (hold ÷ STALE):** a parametrized T4b/T1 variant running hold ≪
-  STALE / hold ≈ STALE / hold > STALE, asserting the *correct verdict per regime* (clean → 0
-  steals; over → exactly one steal + a 98).
-- **Axis C — poll cadence:** {fast 0.05, **default 2s**}. The shipped 2s default is currently
-  never exercised under contention.
-- **Axis D — CLAIM_STALE depth (lower value):** {2, 60} on T21.
+`workflow_dispatch`-only; it never runs on push/PR and never gates anything. This is
+the deep flake-hunting instrument — the "50-clean hunt". A dispatch picks a
+`stress_kind`, an optional raw `stress_load` override, a `repeat` count, and an
+`envelope_tier` (defaults `relax`). Each suite is run `repeat` times under load in a
+fail-fast loop that names the failing iteration. The concurrency group is per-run
+(`deep-${{ github.run_id }}`) so many parallel dispatches fan out freely and accept
+queue waves rather than cancelling each other. Timeouts are deliberately generous
+(deep + loaded + repeated is far slower than the gate).
 
-**Do not sweep:** round count (keep as the nightly *soak* dial, not a coverage axis), MAX_WAIT
-(timeout-only), the deterministic steered protocol tests (T23–T36 — re-running reruns the same
-steered path), or the integration suite's worker count beyond FULL/REDUCED (it's strict in both
-modes by design and wall-clock-bound by serialized commits).
+## 4. The two test-level levers
 
-**Flakiness discipline (critical):** keep correctness assertions **config-independent** — when
-sweeping N, hold STALE ≫ hold so "zero-98 / one-steal" stays a pure correctness statement, and
-**scale MAX_WAIT with N** (more waiters = more serialized turns) so a large-N run doesn't time
-out and *look* like a product failure. Move wall-clock/poll-count assertions to the envelope
-tier. Keep the existing `sync_waiting_fresh`/`backdate_ghost` scaffolding — at higher N it
-matters more.
+These let the existing tests yield more under load without touching the per-PR
+gate's behaviour.
 
-**Cadence:** per-PR runs the floor point of each axis (today's behavior, deterministic);
-nightly runs the sweeps under a `GCL_TEST_SWEEP=1` gate. The sweep (per-suite fan-out/knobs) is
-*orthogonal* to the OS/leg matrix — compose additively (per-PR = matrix × floor; nightly =
-matrix × sweep), never multiply everything on every PR.
+**The Axis-A waiter-count sweep** (`GCL_TEST_SWEEP`, `T_AXIS_A` in
+`tests/_harness.sh`). By default `T_AXIS_A="4"`, so per-PR and plain dev runs are
+byte-identical to the historical behaviour. Under `GCL_TEST_SWEEP=1` (nightly and
+deep only) it becomes `"4 12 24"`, and the fan-out/contention tests iterate over it —
+unit Test 2b, unit Test 20 (which composes its own list from its mode-driven floor
+plus the sweep's higher counts), and interop Test 16 — each naming N in every
+assertion message so a sweep failure says which N broke. This widens the
+thundering-herd / claim-serialization and displacement windows that re-running N=4
+never will. Correctness assertions are kept config-independent (e.g. hold ≫ STALE so
+"zero-98 / one-steal" stays a pure correctness statement) and MAX_WAIT scales with N,
+so a large-N run doesn't time out and *look* like a product failure.
 
----
+**The envelope tier** (`GCL_ENVELOPE_TIER`, default `strict`, in
+`tests/git-commit-lock.test.sh`). A wall-clock or poll-count bound is a best-effort
+liveness property (`guarantees.md` BE-1), not a correctness one. The `ok_envelope` /
+`bad_envelope` assertion helpers behave exactly like the hard `ok`/`bad` under
+`strict`; under `relax` a `bad_envelope` becomes a `WARN` that does not increment
+FAIL. Three assertions are tiered this way — recovery latency ≤20s (Test 21), the
+claim-path config warning firing (Test 22a), and the failed-steal's claim being
+re-created rather than left to age out (Test 29). Nightly and deep set `relax`;
+per-PR and the kcov job never do. So an oversubscribed runner can stretch wall-clock
+to a warning without reddening correctness, while correctness assertions stay hard in
+both tiers.
 
-## 7. GitHub Actions realities (the real constraints — confirm against current docs)
+## 5. How load is calibrated (`tests/with-load.sh`)
 
-- **Minutes are free on public repos; concurrency is the real ceiling.** Free-plan accounts cap
-  concurrent jobs at **20 total, with a 5-job macOS sub-limit** (confirm against GitHub's
-  current limits page). A matrix past that **queues** (serialises into waves), it doesn't fail.
-  Design any single triggered workflow to ≤ ~15–20 jobs to run in one wave; the deep sweep
-  intentionally exceeds this and accepts waves.
-- **Cost-weight is separate from queue scarcity (don't conflate).** On a public repo standard
-  runners are *free* — the per-minute rates don't consume credits or set queue priority. They do
-  signal relative runner *cost/scarcity*: roughly Linux 1×, **Windows ~1.7×** ($0.010 vs
-  $0.006/min), **macOS ~10×** ($0.062/min). The real constraint on macOS is the **5-job
-  sub-limit** above, plus it being the slowest pool. → keep macOS cells **sparse**, ubuntu
-  liberal.
-- **`strategy.matrix`:** `fail-fast: false` (keep — an OS-specific failure is the signal).
-  **`max-parallel` only limits parallelism *within a single matrix run*** — it does **not**
-  reserve capacity across separate workflow runs or the deep sweep's many `workflow_dispatch`
-  invocations. To stop a sweep starving the required gate, **bound the deep/nightly tiers with a
-  workflow-level `concurrency` group (and cap the dispatcher width)**, not `max-parallel` alone.
-  256-job hard cap per workflow run (irrelevant at our scale).
-- **Triggers:** required on `pull_request` + `push: main`; nightly on `schedule` (cron,
-  off-peak minute) + `workflow_dispatch`; deep on `workflow_dispatch` only — heavy load never
-  sits in a PR's critical path. (Note: `schedule` triggers are auto-disabled after ~60 days of
-  repo inactivity.)
-- **`paths-ignore` gotcha on a *required* check.** A workflow skipped by path filtering leaves
-  its checks **Pending**, which *blocks merge* if those checks are required. So **don't** put
-  `paths-ignore` on the workflow whose jobs are the required checks and expect doc-only PRs to
-  merge. Instead either (a) keep the required workflow always-running with a tiny always-green
-  job and path-filter only the expensive test jobs, or (b) make a separate cheap job the
-  required check. (Doc-only-skip is still worth doing — just not on the required-check workflow
-  naively.)
-- **Artifacts:** keep the existing `upload-artifact` (with `include-hidden-files` for the
-  `.git/`-buried lock logs); name uniquely per (os, leg, kind, level) so parallel cells don't
-  collide.
+The wrapper runs a command under a calibrated, reproducible background load, then
+tears it down by *exact spawned PIDs* (never by name — safe on a shared box and on an
+ephemeral runner) and propagates the wrapped command's exit code.
 
----
+- **Load is an oversubscription ratio**, not an absolute hog count:
+  `GCL_STRESS_RATIO` (R, default 1) gives stressors-per-kind = `round(R × nproc)`,
+  floored at 1 for a selected kind. "R=2" means the same pressure on a 2-core and a
+  32-core runner, where a raw hog count would not.
+- **The total ratio is capped** by `GCL_STRESS_RATIO_MAX` (default 2). `both` runs
+  cpu + disk, so its total would be 2R; the cap scales each kind down proportionally
+  so the runner is never wedged. The deep-sweep flake hunt can raise it deliberately.
+- **`GCL_STRESS_KIND`** selects `none` (clean pass-through, zero added load),
+  `cpu`, `disk`, or `both`. **`GCL_STRESS_LOAD`** is a back-compat raw per-kind
+  count override (kept so the deep-sweep `stress_load` input keeps working); empty
+  ⇒ use the ratio.
+- **CPU stressor:** `stress-ng --cpu` when available (calibrated, measurable), else a
+  portable bash spin loop. **Disk stressor:** a tight create / write+fsync / delete
+  loop over a small file on the test scratch volume — real metadata + write-back
+  pressure that contends with the lock-file create/delete the suite itself does
+  (always the portable shell hog; cross-platform, low-fidelity but real).
+- **A per-run `load-manifest` JSON** is written next to the suite logs (on success
+  too): `{kind, R, ratio_max, raw-load override, nproc, cpu/disk/total stressor
+  counts, capped?, cpu mechanism, cgroup probe, baseline/loaded ms, achieved
+  slowdown, tool versions, os/arch, git sha, command}`, so any flake is reproducible.
+  A cheap fixed bash micro-benchmark, timed unloaded then mid-load, records a coarse
+  achieved-slowdown figure (only when load is actually applied).
 
-## 8. Considered, not maximalist — the decision rule
+### Platform asymmetry (current operating facts)
 
-> **A cell enters the routine matrix (R or N) only if it can surface a bug class no other
-> routine cell can. Otherwise it's a deep-sweep cell, or it doesn't exist.**
+The platforms diverge too much for a uniform calibrated injection layer, so the
+wrapper is honest about which regime ran:
 
-- Cap the routine matrix: **R ≤ 4, N ≤ ~8.** New routine cells must *displace* one, forcing the
-  "does this find something the others can't?" question.
-- **Earn the slot:** a config/cell graduates deep → nightly only after the deep sweep actually
-  caught a distinct failure there (mirrors the project's own "tested edge cases earn confidence"
-  philosophy). Demote a cell that's been green for ~60 days and whose window is a subset of
-  another green cell's.
-- Prefer *one* oversubscribed level over a level sweep; prefer *attributable* single-kind cells
-  over `both`-only when you want to localise a flake.
-- **Trustworthiness invariant:** required = always-meaningful-red; nightly = triaged-amber-
-  tolerant; deep = noise-by-design. Don't retry-mask the required tier (a retry that hides a
-  1-in-20 real race is exactly the silent-loss class this tool exists to prevent).
+- Deterministic steering is portable (bash everywhere; pwsh equivalent) — the real
+  race-coverage tool, on every leg.
+- Calibrated CPU throttling via a cgroup v2 quota is **Linux-only and probe-gated**:
+  `GCL_STRESS_CGROUP=1` makes the wrapper *probe* for a writable cgroup v2 cpu
+  controller and record the result in the manifest (`writable` /
+  `present-not-delegated` / `no-cpu-controller` / `no-cgroup-v2`); it does not create
+  scopes here (that needs a usable systemd manager). IO cgroup throttling is
+  experimental and intentionally not attempted.
+- Everywhere else (macOS, Windows) load is blunt CPU/disk oversubscription —
+  uncalibrated but real pressure.
 
----
+## 6. GitHub Actions operating facts
 
-## 9. Open decisions for Ben (what to pick before Phase 2 plans the build)
+- **Minutes are free on public repos; concurrency is the real ceiling.** Free-plan
+  accounts cap concurrent jobs (~20 total, with a smaller macOS sub-limit). A matrix
+  past that *queues* into waves, it doesn't fail. The required gate stays small
+  enough to run in one wave; the deep sweep intentionally exceeds it and accepts
+  waves. macOS is the slowest and scarcest pool, so it is kept sparse across all
+  tiers; ubuntu (cheapest) is used liberally.
+- **`fail-fast: false`** on every matrix — an OS-specific failure is exactly the
+  signal we want, so the other legs finish.
+- **`paths-ignore` and required checks:** `tests.yml` filters docs/`.plans`/license
+  paths. A workflow whose jobs are *required* checks would leave those checks
+  Pending (blocking merge) when skipped by a path filter — but this project has no
+  branch protection, so the filter just saves runner minutes on doc-only pushes
+  without that hazard.
+- **Artifacts** are uploaded with `include-hidden-files: true` (the integration
+  suite's key diagnostics — lock log, repo state — live under the scratch repo's
+  `.git/`) and named uniquely per cell so parallel uploads never collide.
+- All actions are SHA-pinned.
 
-1. **Nightly aggressiveness:** ~6 cells, cron daily vs weekly? (rec: ~6 cells, daily off-peak;
-   start smaller and grow by the earn-the-slot rule.)
-2. **Linux load mechanism:** adopt calibrated cgroup `cpu.max`/`io.max` throttling on the Linux
-   leg (reproducible, the right envelope-validation tool) vs keep the simple wrapper but
-   calibrate it by oversubscription ratio? (rec: cgroup on Linux for the envelope leg; keep a
-   ratio-calibrated `stress-ng`/spinner as the cross-platform race-jitter lane.)
-3. **`stress-ng` dependency:** add an install step (apt/brew) vs keep a pure bash spinner
-   (zero-dep, uncalibrated)? (rec: `stress-ng` where available + spinner fallback on Windows.)
-4. **Parametrization scope now:** Axis A (waiter count) only, or A+B+C? (rec: A first — highest
-   value, lowest flake risk — then B, then C.)
-5. **The envelope-tier switch** (`GCL_ENVELOPE_TIER=relax`): confirm this is how we implement the
-   D-c correctness/envelope split (a small test-harness change downgrading the 3 wall-clock
-   assertions to warnings under load). (rec: yes — it's the cleanest implementation of D-c.)
-6. **Nightly triage channel:** auto-file/track issues on nightly failure, tagged correctness vs
-   envelope? (rec: yes — otherwise scheduled-run reds are invisible.)
+## 7. The discipline: required = always-meaningful-red
 
-These choices feed **Phase 2** (the implementation plan). This doc is a recommendation only —
-no code, no workflow changes, until you've decided.
-
----
-
-## Appendix — provenance
-Synthesized from three parallel first-principles research passes (load fidelity & injection
-mechanisms; CI matrix on free public runners; existing-test parametrization), each grounded in
-`git-commit-lock.sh`/`.ps1`, the three suites, `tests/with-load.sh`, `.github/workflows/tests.yml`,
-and `docs/failure-modes.md`, and cross-checked against the code (one agent's claim that
-`tests/with-load.sh` was absent was verified false — it exists and is tracked). A foreign-model
-(Codex, web-grounded) review has been applied: it confirmed the §2 window→load reachability
-table against the code and the core GitHub-Actions facts (20-total / 5-macOS free-plan
-concurrency, 256-job matrix cap, 60-day schedule auto-disable, `cancel-in-progress`, `stress-ng`
-availability), and its corrections are folded in — the cgroup mechanism is now marked
-**probe-required** (CPU quota only; IO throttling experimental), the `max-parallel` and
-`paths-ignore`-on-required caveats added, billing-weight separated from queue-scarcity, and the
-FUSE/SIP claims hedged.
+The invariant that ties it together: **required is always-meaningful-red; nightly is
+triaged-amber-tolerant; deep is noise-by-design.** Keeping artificial load off the
+required gate is what makes a red gate trustworthy; putting all load in non-blocking
+tiers with the envelope assertions relaxed is what stops load from manufacturing
+flakes that erode that trust. The required tier is never retry-masked — a retry that
+hid a 1-in-20 real race would defeat the silent-loss class this tool exists to
+prevent.
