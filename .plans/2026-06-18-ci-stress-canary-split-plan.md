@@ -132,6 +132,27 @@ they already run.)
   obsoleted by this file-extraction approach; the sharding was unwound (`89de803`+`143e280`).
   (Leave those plan files in place per "leave history be"; add a superseded-by pointer at their top.)
 
+## Results (CI verified — run 27728088150, all 8 jobs green)
+Implemented in `5fe15c9` (canary file + unit removal + harness) + `b1eb0a8` (CI wiring). Local
+proof passed (canary 2/0 standalone; unit-minus-canary 313/0; 313+2=315 disjoint/union==original;
+interop 141/0, integration 12/0; shellcheck + actionlint clean). Cross-platform CI **succeeded**:
+
+| | windows | macOS | ubuntu | overall (slowest) |
+|---|---|---|---|---|
+| **pre-shard** (`27716080146`) | unit **360s** | 194s | 182s | **360s** |
+| **sharding** (`27723744798`) | unit 242s ‖ 99s (imbalanced) | 210s | 181s | 242s |
+| **canary split** (`27728088150`) | unit **181s** ‖ canary 165s ‖ interop 130s | all 167s ‖ canary 33s | all 165s ‖ canary 18s | **~181s** |
+
+- **Overall CI 360s → ~181s (~50% faster)** — gated by the windows unit-minus-canary cell (181s),
+  with the windows canary (165s) well-balanced beside it.
+- macOS dropped 194→167s (the canary moved out of its `leg: all` into a cheap 33s cell); the
+  POSIX canary cells are cheap (ubuntu 18s, macOS 33s) and off the critical path.
+- **Beats the sharding (242s, imbalanced) AND is far simpler** — zero `GCL_TEST_SHARD` machinery;
+  the canary is just its own suite file. The sharding was unwound (`89de803`+`143e280`).
+- The kcov merged-coverage run and the nightly/deep-sweep canary steps are statically validated
+  (actionlint-clean); their first live exercise is post-merge (those workflows dispatch only from
+  the default branch).
+
 ## Out of scope
 - Reducing the canary's own ~151s width (a test-design change — the width *is* its coverage;
   worth a separate look, not here). Sharding/`GCL_TEST_SHARD` (removed). `n>2` (N/A — files, not shards).
