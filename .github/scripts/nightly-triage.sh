@@ -179,7 +179,7 @@ run_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/actions
 filed=0
 
 if [ -n "$correctness_evidence" ]; then
-  body="Nightly stress run on **${RUN_DATE}** has CORRECTNESS failures (a \`FAIL:\` assertion and/or a cell job concluded \`failure\`). **Investigate.**
+  body="Nightly stress run on **${RUN_DATE}** has CORRECTNESS failures (a \`^FAIL:\` assertion line in a suite log). **Investigate.**
 
 $correctness_evidence
 Run: ${run_url}
@@ -190,7 +190,7 @@ Run: ${run_url}
 fi
 
 if [ -n "$infra_evidence" ]; then
-  body="Nightly stress run on **${RUN_DATE}** had INFRA issues (missing artifact / timeout / cancel / errored before suites ran). Not a product failure, but the run did not produce trustworthy results — re-dispatch or investigate the runner.
+  body="Nightly stress run on **${RUN_DATE}** had INFRA issues (missing artifact / timeout / cancel / a cell job that failed or errored WITHOUT any \`^FAIL:\` line). Not a product failure, but the run did not produce trustworthy results — re-dispatch or investigate the runner.
 
 $infra_evidence
 Run: ${run_url}
