@@ -577,7 +577,7 @@ unavailable):
 | `git-commit-lock.sh`                  | the mutex (bash; the authoritative implementation): source for `lock_acquire/lock_release/lock_run`, or `git-commit-lock.sh run -- <cmd>` |
 | `git-commit-lock.ps1`                 | wire-compatible PowerShell port (see [The PowerShell port](#the-powershell-port-git-commit-lockps1) above): `git-commit-lock.ps1 run "<pwsh cmd>"`, or dot-source for `Lock-Acquire`/`Lock-Release` |
 | `tests/git-commit-lock.test.sh`             | self-contained bash tests (throwaway temp dirs); exit 0 == all pass |
-| `tests/git-commit-lock.canary.test.sh`      | bash concurrency canary: mutual exclusion under many concurrent workers, plus the contended crash-recovery / claim-serialization scenarios (throwaway temp dirs) |
+| `tests/git-commit-lock.canary.test.sh`      | bash concurrency canary: mutual exclusion under many concurrent workers over repeated rounds — the statistical full-fan-out scenario (throwaway temp dirs) |
 | `tests/git-commit-lock.interop.test.sh`     | cross-impl tests: pwsh + bash workers share one lock and serialise; run from MINGW/Git-Bash |
 | `tests/git-commit-lock.integration.test.sh` | end-to-end: many concurrent workers make real commits into one shared repo; the history is audited for the tool's guarantees |
 
@@ -588,7 +588,7 @@ Run the suites from a clone of this repository (they are not installed to
 
 ```sh
 bash tests/git-commit-lock.test.sh             # bash implementation
-bash tests/git-commit-lock.canary.test.sh      # bash concurrency canary (mutual exclusion + crash recovery under load)
+bash tests/git-commit-lock.canary.test.sh      # bash concurrency canary (mutual exclusion under many concurrent workers)
 bash tests/git-commit-lock.interop.test.sh     # bash + PowerShell interop (skips if pwsh is absent)
 bash tests/git-commit-lock.integration.test.sh # end-to-end: concurrent real commits into one repo (pwsh half skips if absent)
 ```
