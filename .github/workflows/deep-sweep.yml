@@ -61,8 +61,9 @@ jobs:
     strategy:
       fail-fast: false               # every cell's verdict is a useful deep signal; let the rest finish
       matrix:
-        # Mirrors the tests.yml 4-cell set (ubuntu all / macos all / windows unit /
-        # windows interop+integration). Windows stays split because the bash-only
+        # Mirrors tests.yml's per-OS legs (ubuntu all / macos all / windows unit /
+        # windows interop+integration); the canary runs as a step within the unit/all
+        # legs here, not a separate cell. Windows stays split because the bash-only
         # unit suite is the wall-clock bottleneck there and the suites must not run
         # concurrently inside one timing-sensitive 2-core runner. Generous deep
         # timeouts: deep + loaded + repeated is far slower than the per-PR gate.

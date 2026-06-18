@@ -7,7 +7,7 @@
 #
 # Fan-out: heavy concurrency tests default to REDUCED width so routine dev
 # runs don't lag a live shared machine; set GCL_TEST_FULL=1 (CI does) for the
-# full-strength canary. The suite prints which mode ran — a reduced pass must
+# full-strength fan-out. The suite prints which mode ran — a reduced pass must
 # never masquerade as the full one.
 #
 # On failure the work dir is PRESERVED (path printed) for post-mortem; set
@@ -42,12 +42,15 @@ ROOT="$(cd "$DIR/.." && pwd)"   # the implementations live at the repo root
 LIB="$ROOT/git-commit-lock.sh"
 
 if [ "${GCL_TEST_FULL:-0}" = 1 ]; then
-  GCL_MODE="FULL"; T1_ROUNDS=8; T1_N=25; T2B_ROUNDS=4; T20_N=10
+  GCL_MODE="FULL"; T2B_ROUNDS=4; T20_N=10
 else
-  GCL_MODE="REDUCED"; T1_ROUNDS=3; T1_N=8; T2B_ROUNDS=2; T20_N=5
+  GCL_MODE="REDUCED"; T2B_ROUNDS=2; T20_N=5
 fi
-echo "fan-out mode: $GCL_MODE (T1 ${T1_ROUNDS} rounds x ${T1_N} workers)"
-[ "$GCL_MODE" = REDUCED ] && echo "  (set GCL_TEST_FULL=1 for the full-strength 8x25 canary — CI runs it)"
+# (The full-width concurrency canary, formerly Test 1, now lives in its own file
+# tests/git-commit-lock.canary.test.sh; this suite's heavy fan-out is Test 2b /
+# Test 20.)
+echo "fan-out mode: $GCL_MODE (Test 2b ${T2B_ROUNDS} rounds, Test 20 ${T20_N} concurrent workers)"
+[ "$GCL_MODE" = REDUCED ] && echo "  (set GCL_TEST_FULL=1 for full-strength fan-out — CI runs it)"
 
 WORK="$(mktemp -d 2>/dev/null || echo "${TMPDIR:-/tmp}/git-commit-lock-test.$$")"
 mkdir -p "$WORK"

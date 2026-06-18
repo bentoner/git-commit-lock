@@ -42,8 +42,9 @@ env:
 
 jobs:
   # ── The 6 stress cells. Each runs the relevant suite(s) wrapped in with-load.sh
-  #    under one GCL_STRESS_KIND. `leg` selects which suites run (mirrors tests.yml):
-  #    ubuntu/macos run the full set; windows splits unit vs interop-integration. ──
+  #    under one GCL_STRESS_KIND. `leg` selects which suites run (the all/unit/
+  #    interop-integration legs as in tests.yml; the canary runs as a step here, not a
+  #    leg): ubuntu/macos run the full set; windows splits unit vs interop-integration. ──
   stress:
     name: ${{ matrix.id }} ${{ matrix.os }} (${{ matrix.kind }}${{ matrix.leg != 'all' && format(', {0}', matrix.leg) || '' }})
     runs-on: ${{ matrix.os }}
