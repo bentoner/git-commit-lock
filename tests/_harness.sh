@@ -36,7 +36,7 @@ PASS=0; FAIL=0; TAPN=0; DONE=0; SECTIONS_RUN=0
 GCL_TAP="${GCL_TAP:-0}"           # CI sets GCL_TAP=1 for machine-readable TAP13 output
 GCL_TEST_ONLY="${GCL_TEST_ONLY:-}"  # if set, run ONLY test blocks whose label REGEX-matches (single-test selector)
 
-# Axis-A waiter-count sweep (Bucket 6). GCL_TEST_SWEEP=1 (nightly/deep CI) widens
+# Axis-A waiter-count sweep (see load-testing-strategy.md). GCL_TEST_SWEEP=1 (nightly/deep CI) widens
 # the fan-out/contention tests over several waiter counts to wring more coverage
 # from the existing tests; unset/0 (per-PR default + plain dev) keeps the floor so
 # default runs are byte-identical to today. T_AXIS_A is the shared waiter-count

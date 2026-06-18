@@ -70,7 +70,7 @@ cleanup() {
 # above and fails loudly if the suite died before setting DONE=1.
 trap finish EXIT
 
-# Envelope-tier assertions (Bucket 4 / decision D-c). A wall-clock or poll-count
+# Envelope-tier assertions (see failure-modes.md §K / §4 item 1). A wall-clock or poll-count
 # bound is a Tier-2 (best-effort latency) property, NOT a correctness one (see
 # guarantees.md BE-1). In the default 'strict' tier these behave exactly like
 # ok/bad. Under GCL_ENVELOPE_TIER=relax (nightly/deep stress runs) an envelope FAIL
@@ -160,7 +160,7 @@ if section "Test 2b: crash recovery under CONTENTION — claim-serialized: zero 
 # otherwise discarded and retried (bounded), instead of failing assertions
 # the protocol never violated.
 #
-# Waiter count is swept over $T_AXIS_A (Bucket 6): one iteration at N=4 by
+# Waiter count is swept over $T_AXIS_A (see load-testing-strategy.md): one iteration at N=4 by
 # default (byte-identical to today) and at N=4,12,24 under GCL_TEST_SWEEP=1.
 # Every sweep iteration's assertions carry an " at N=<count>" tag so a sweep
 # failure says which N broke; that tag is SUPPRESSED in the default (non-sweep)
@@ -1090,7 +1090,7 @@ if section "Test 20: claim contention — N concurrent stealers, ONE claim winne
 # STALE must scale with N too (see t20_stale below), keeping "exactly one
 # steal" a strict, config-independent correctness invariant at every N.
 #
-# Waiter count is swept (Bucket 6). Unlike Test 2b/16, this test's floor is NOT
+# Waiter count is swept (see load-testing-strategy.md). Unlike Test 2b/16, this test's floor is NOT
 # 4 — it is the MODE-driven $T20_N (5 REDUCED / 10 FULL), the count CI already
 # stresses. So instead of iterating the shared T_AXIS_A ("4 ...") it builds its
 # own list: just $T20_N by default (byte-identical), and $T20_N plus the sweep's
@@ -3069,7 +3069,7 @@ fi
 
 
 if section "Test 48: unwritable lock dir -> clean 97, command never runs, no false hold (F4)"; then
-# F4 (failure-modes.md §4.5): a read-only / unwritable lock-dir parent makes the
+# F4 (failure-modes.md §4 item 5): a read-only / unwritable lock-dir parent makes the
 # O_EXCL create fail every poll, so the waiter times out at 97 — no corruption, no
 # false hold, and the wrapped command never runs. POSIX-only: chmod 0555 is a no-op
 # for writes on Git-Bash/NTFS (the create would wrongly succeed), so skip-with-note
@@ -3099,7 +3099,7 @@ esac
 fi
 
 if section "Test 49: failing log path -> lock still works, the log write is swallowed (F2/J1)"; then
-# F2/J1 (failure-modes.md §4.5): logging is best-effort (every write ends || true).
+# F2/J1 (failure-modes.md §4 item 5): logging is best-effort (every write ends || true).
 # Point AGENT_LOCK_LOG under a REGULAR FILE so every append/open fails ENOTDIR — the
 # lock must still acquire+release cleanly (rc 0) with the log write swallowed.
 # Portable (no chmod/perms). NOTE: bash's redirection-OPEN failure leaks to stderr
@@ -3122,7 +3122,7 @@ rm -f "$T49P" "$WORK/t49.lock"
 fi
 
 if section "Test 50: ENOSPC on lock create/write -> wait then 97, no false hold (F1)"; then
-# F1 (failure-modes.md §4.5): a full filesystem makes the create's write fail
+# F1 (failure-modes.md §4 item 5): a full filesystem makes the create's write fail
 # (ENOSPC); the created-but-write-failed file is an empty orphan and the waiter
 # times out at 97 — no corruption, no false hold. Real ENOSPC needs a full FS, which
 # needs root (a small tmpfs); `ulimit -f` is NOT usable (it raises SIGXFSZ and kills

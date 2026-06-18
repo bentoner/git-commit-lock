@@ -242,7 +242,7 @@ jobs:
           # Compare rate >= floor with awk (float-safe).
           if awk -v r="$rate" -v f="$floor" 'BEGIN { exit !(r + 0 >= f + 0) }'; then
             echo "PASS: line coverage $rate >= floor $floor"
-            echo "NOTE: the floor ($floor) tracks the achieved coverage (~0.83); ratchet it up toward ~0.90 as Bucket-2 Tier-A tests land. The Linux ceiling is ~0.94 (~30 lines are platform-gated)."
+            echo "NOTE: the floor ($floor) tracks the achieved coverage (~0.83); ratchet it up toward ~0.90 as more Linux-coverable tests land. The Linux ceiling is ~0.94 (~30 lines are platform-gated)."
           else
             echo "::error::line coverage $rate is BELOW the floor $floor — coverage regressed"
             echo "The floor tracks achieved coverage (~0.83) and should only ratchet UP as tests land. A drop means a test stopped exercising lines it used to. Investigate before lowering the floor."

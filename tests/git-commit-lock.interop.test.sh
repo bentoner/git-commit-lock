@@ -862,7 +862,7 @@ if section "Test 16: crash recovery under CONTENTION, mixed impls — claim-seri
 # lock), so the run is discarded and retried (bounded) instead of failing
 # assertions the protocol never violated.
 #
-# Waiter count is swept over $T_AXIS_A (Bucket 6): one iteration at N=4 by
+# Waiter count is swept over $T_AXIS_A (see load-testing-strategy.md): one iteration at N=4 by
 # default (2 bash + 2 pwsh — byte-identical to today) and at N=4,12,24 under
 # GCL_TEST_SWEEP=1. N is split into a bash half (N/2) and a pwsh half (the
 # remainder); at N=4 that is 2+2 exactly. The correctness invariants stay strict

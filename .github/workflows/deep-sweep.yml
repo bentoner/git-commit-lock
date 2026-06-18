@@ -2,8 +2,8 @@
 #
 # ON-DEMAND ONLY. This workflow is `workflow_dispatch`-only: it NEVER runs on push
 # or pull_request, and it NEVER gates anything (it is not a required check — this is
-# a single-dev project with no branch protection; see the Phase-2 build plan's
-# Bucket 6 decision box). It exists purely as a deep flake-hunting tool — the
+# a single-dev project with no branch protection). It exists purely as a deep
+# flake-hunting tool — the
 # "50-clean hunt" instrument from the load-testing strategy: dispatch it (often many
 # times in parallel), pick a stress kind/magnitude, and repeat the full suite N
 # times per job to surface intermittent, scheduling-sensitive flakes that a single

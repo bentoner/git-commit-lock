@@ -8,7 +8,7 @@
 # JSON file. It reads only files on disk + `gh`; it makes no test decisions of its
 # own beyond parsing the preserved logs.
 #
-# CLASSIFICATION (per the Bucket 6 spec):
+# CLASSIFICATION:
 #   correctness  — any `^FAIL:` line in a suite log, OR a cell job concluded
 #                  `failure`. Files/append a `nightly-correctness` issue. The one
 #                  class that demands investigation.
@@ -118,7 +118,7 @@ for cell in $EXPECTED_CELLS; do
     # Logs exist but the job did not cleanly succeed and there is no assertion FAIL:
     # failure-without-^FAIL / timeout / cancelled / errored late ⇒ infra, not
     # correctness and not green (a failure WITHOUT a FAIL line is a step
-    # timeout/late error, which is infra per the Bucket 6 design).
+    # timeout/late error, which is infra).
     infra_evidence+="- ${cell}: logs present but job conclusion='${concl}' (failure/timeout/cancel without ^FAIL: line)"$'\n'
     log "[$cell] INFRA (conclusion=$concl, no FAIL)"
   elif [ "$cell_envwarn" -eq 1 ]; then

@@ -127,10 +127,10 @@ robust-by-code-but-unverified · S static/grep check · (plat) platform-gated.
 | E1 | Network/shared FS (NFS/SMB/9p/Dropbox) | Outside design guarantees (stated) | 3 | ✗ | **Out of scope** (stated). See §E — decide whether to *enforce*. |
 | E2 | Multi-host clock skew / NTP jump | Single-clock assumption; documented (local jump → detected-98, safe) | 3 | ✗ | **Out of scope**; single-clock assumption documented. See §E2. |
 | E3 | mtime probe unreadable (staleness clock broken) | Warns loudly once; treats as not-stale → safe, recovery disabled → 97 | 2 | ✓ U:Test 42 | **Accept** — fails safe + announced. See §E3. |
-| F1 | Disk full (ENOSPC) during create/write | Create fails → wait; torn write ages out | 2/3 | ✓ U:Test 50 (Linux+sudo tmpfs; (plat) skip elsewhere) | **Tested** (§4.5) + document. See §F1. |
-| F2 | ENOSPC during LOG write | Swallowed (`|| true`); silent log loss | 2 | ✓ U:Test 49 (portable failing-log path) | **Tested** (§4.5); logging best-effort, lock unaffected. |
+| F1 | Disk full (ENOSPC) during create/write | Create fails → wait; torn write ages out | 2/3 | ✓ U:Test 50 (Linux+sudo tmpfs; (plat) skip elsewhere) | **Tested** (§4 item 5) + document. See §F1. |
+| F2 | ENOSPC during LOG write | Swallowed (`|| true`); silent log loss | 2 | ✓ U:Test 49 (portable failing-log path) | **Tested** (§4 item 5); logging best-effort, lock unaffected. |
 | F3 | Inode / FD exhaustion | Create fails → wait → 97 | 2 | ○ (document-only) | **Document-only**: no deterministic portable injection. See §F3. |
-| F4 | Read-only / unwritable lock dir or parent | `mkdir -p` best-effort; create fails → wait → 97 | 2 | ✓ U:Test 48 (POSIX `chmod 0555`; (plat) skip on Windows) | **Tested** (§4.5, highest-value). See §F4. |
+| F4 | Read-only / unwritable lock dir or parent | `mkdir -p` best-effort; create fails → wait → 97 | 2 | ✓ U:Test 48 (POSIX `chmod 0555`; (plat) skip on Windows) | **Tested** (§4 item 5, highest-value). See §F4. |
 | G1 | Lock path = a directory / `$HOME` typo | Never stolen/deleted; loud warn; → 97 | 1 | ✓ U:818-840 | **In scope.** Keep. |
 | G2 | Garbage numeric config | Falls back to default + stderr note | 1 | ✓ U:695-703, I:554-608 | **In scope.** Keep. |
 | G3 | `run` outside a git repo, no `AGENT_LOCK_PATH` | Refuses (96) | 1 | ✓ U:705-712 | **In scope.** Keep. |
@@ -141,7 +141,7 @@ robust-by-code-but-unverified · S static/grep check · (plat) platform-gated.
 | H4 | Non-unwinding exit while held (SIGKILL / bash `exec` / `[Environment]::Exit()`) | Skips release → a displaced holder is unwarned (no 98); plain `exit` is safe | 2 | ~ (I:308-334 indirect) | **Document** the no-silent-loss boundary. See §H4. |
 | I1 | bash⇄pwsh wire/format compatibility | Shared format; token grammar tightened to match | 1 | ✓ I:* throughout | **In scope.** Keep. |
 | I2 | Mixed-VERSION tree (old unserialized steal) | Prevention degrades to detection (98); `.dead.*` litter | 3 | ✗ | **Out of scope:** "upgrade both together." Residual 4. |
-| J1 | Logging subsystem failure | All log writes `|| true`; 1 MB self-truncate | 2 | ✓ U:Test 49 (via F2) | **Tested** (§4.5, via F2); logging never blocks the lock. |
+| J1 | Logging subsystem failure | All log writes `|| true`; 1 MB self-truncate | 2 | ✓ U:Test 49 (via F2) | **Tested** (§4 item 5, via F2); logging never blocks the lock. |
 | K1 | Extreme load / CPU oversubscription / slow FS | Correctness holds; wall-clock bounds stretch | 2 | ~ (CI stress) | **Envelope defined** (design doc + envelope tier). See §K — the key analytical section. |
 | K2 | Internal time budgets (poll, MAX_WAIT, read ladder) | Fixed schedules; tunable | 2 | ✓/~ | **In scope** as Tier-2 envelope. See §K. |
 
@@ -475,7 +475,7 @@ comment at `:1341-1343`). A created-but-write-failed file is an empty orphan tha
 ages into the steal lane. A torn write *shorter than `tok.`* (e.g. `to`) is the
 accepted residual at `:299-304`: non-empty, non-prefixed → never stolen, loud,
 fixed by one manual `rm`. *Tier 2 (degrades to wait/97) / Tier 3 (the torn-write
-manual-fix residual).* **Tested** (per §4.5): unit Test 50 mounts a small 64k
+manual-fix residual).* **Tested** (per §4 item 5): unit Test 50 mounts a small 64k
 tmpfs, fills it to ENOSPC, and asserts the waiter times out at 97 with the wrapped
 command never running — no corruption, no false hold. ENOSPC injection needs a full
 FS (root via a tmpfs; `ulimit -f` raises SIGXFSZ — the wrong lane), so the test runs
@@ -486,7 +486,7 @@ documented.
 
 **F2 — ENOSPC during a LOG write.** All log writes end in `|| true`
 (`git-commit-lock.sh:561`); a failed log write is silently lost. *Tier 2.*
-**Tested** (per §4.5): unit Test 49 points `AGENT_LOCK_LOG` at a path *under a
+**Tested** (per §4 item 5): unit Test 49 points `AGENT_LOCK_LOG` at a path *under a
 regular file*, so every open/append fails ENOTDIR, and asserts the lock still
 acquires + releases cleanly (rc 0), the wrapped command runs, the lock is cleaned
 up, and no log file appears — i.e. the failing log write is swallowed and the lock
@@ -509,7 +509,7 @@ behaviour is the same as F1, which is tested.
 best-effort `mkdir -p "$(dirname …)"` (`git-commit-lock.sh:1278`); if the dir is
 unwritable the create fails every poll and the waiter times out at 97. No
 corruption, no false hold. A *release* unlink blocked by an unwritable parent
-routes to the LEFTOVER lane (`:1699-1711`). *Tier 2.* **Tested** (per §4.5 — the
+routes to the LEFTOVER lane (`:1699-1711`). *Tier 2.* **Tested** (per §4 item 5 — the
 highest-value one): unit Test 48 `chmod 0555`s the lock-dir parent and asserts the
 waiter times out at 97, the wrapped command never runs, no lock file is created,
 and the WAITING/TIMEOUT lines are logged — no corruption, no false hold. POSIX-only
@@ -651,7 +651,7 @@ the lock. Under a redirected git dir, log *content* (the owner line) is
 attacker-influenceable — one-line text spoofing, no execution; the tool itself
 writes only its token, owner line, and protocol events, never secrets
 (`docs/git-commit-lock.md:543-551`). *Tier 2.* **Tested — covered by the F2
-log-failure test (per §4.5): unit Test 49** proves a failing log path leaves the
+log-failure test (per §4 item 5): unit Test 49** proves a failing log path leaves the
 lock fully working. Logging is best-effort by design, which is the right call for a
 lock that must keep working when the disk is full or the log path is bad. The
 follow-on (unchanged): don't build automation that *trusts* log text from an
@@ -678,7 +678,7 @@ flakes are real gaps vs harness concerns.
   one timing-sensitive input (mtime, and transient empty reads) cannot corrupt a
   correctness decision: a sub-floor or unsettled reading is treated as "wait,"
   never "steal." A 25-worker round can go 3s → 41s under load
-  (`agents/600-claude.md` observation) and *still* lose no update.
+  and *still* lose no update.
 
 - **Load-dependent (Tier 2, best-effort in an envelope):** every wall-clock bound.
   - **Recovery latency** ≈ STALE (+ CLAIM_STALE if a claimant also crashed) +

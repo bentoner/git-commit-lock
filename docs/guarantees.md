@@ -128,7 +128,7 @@ bug.
   (`failure-modes.md` §F1 — an accepted residual). *Witness:* the read-back-failure lanes —
   create-path Test 32, steal-path Test 32b (`U:1760-1855`); resource lanes —
   unwritable lock dir Test 48 (F4), ENOSPC Test 50 (F1, Linux+sudo; skip-with-note
-  elsewhere) (`failure-modes.md` §4.5); FD/inode exhaustion (F3) is document-only
+  elsewhere) (`failure-modes.md` §4 item 5); FD/inode exhaustion (F3) is document-only
   (no portable injection). *Basis:* §1, §A1, §F.
 
 - **G-S3 — Strict mutual exclusion within the staleness window, with no
@@ -251,9 +251,9 @@ BE-4). Logging is best-effort by design; correctness is not.
 
 These hold under normal conditions and degrade *gracefully and detectably* under
 pathological scheduling or host-health failures. **Correctness (§2) is preserved
-throughout; only liveness/latency degrades.** This tier is the reference Bucket 4
-scopes the suite's wall-clock test assertions against (the strict/envelope test
-split, `failure-modes.md` §4.1 / D-c).
+throughout; only liveness/latency degrades.** This tier is what the suite's
+wall-clock test assertions are scoped against (the strict/envelope test split; see
+`failure-modes.md` §K and §4 item 1).
 
 - **BE-1 — Wall-clock latency bounds are in poll-count, not seconds.** Recovery
   latency (≈ `STALE` + poll cadence), the `MAX_WAIT` timeout, and the ~1.26s
@@ -263,7 +263,7 @@ split, `failure-modes.md` §4.1 / D-c).
   poll-count number (Test 21's ≤20s, Test 22a's warning timing, Test 29's ≥2-CLAIM
   count) assert an *envelope* bound, not a correctness bound, and may be relaxed or
   gated to a defined load level (`GCL_ENVELOPE_TIER=relax`) without any product
-  change. *Basis:* `failure-modes.md` §K, §4.1.
+  change. *Basis:* `failure-modes.md` §K and §4 item 1.
 
 - **BE-2 — Diagnostic warnings are best-effort.** The wrong-type config warning
   and the claim-path warning rely on poll headroom that an oversubscribed runner
@@ -398,7 +398,7 @@ Each guarantee → its witnessing test(s) and the failure-modes section. `U` =
 `C` = `tests/git-commit-lock.canary.test.sh` (the concurrency canary), `integ` =
 `tests/git-commit-lock.integration.test.sh`. The former resource-exhaustion and
 diagnostic-clock coverage gaps are now closed by the fault-injection tests
-(`failure-modes.md` §4.5): F4 (Test 48), F2/J1 (Test 49), F1 (Test 50), and the
+(`failure-modes.md` §4 item 5): F4 (Test 48), F2/J1 (Test 49), F1 (Test 50), and the
 unreadable-mtime fail-safe (Test 42). The one remaining document-only lane is F3
 (FD/inode exhaustion), which has no portable deterministic injection.
 
