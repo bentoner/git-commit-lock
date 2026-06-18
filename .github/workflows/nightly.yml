@@ -188,11 +188,12 @@ jobs:
           set -euo pipefail
           mkdir -p test-output coverage
           # The concurrency canary now lives in its own file; run BOTH the unit suite
-          # and the canary under kcov into the SAME --include-path outdir. kcov
-          # ACCUMULATES coverage across multiple runs that share one output dir (it
-          # merges into the top-level cobertura.xml), so the canary's coverage of
-          # git-commit-lock.sh is preserved and the 0.80 floor cannot regress from
-          # the split.
+          # and the canary under kcov into the SAME output dir. kcov ACCUMULATES
+          # coverage across multiple runs that share one output dir, writing the union
+          # to coverage/kcov-out/kcov-merged/cobertura.xml (NOT a top-level
+          # cobertura.xml — the enforcement step below reads the merged union by
+          # selecting the highest lines-covered), so the canary's coverage of
+          # git-commit-lock.sh is preserved and the 0.80 floor cannot regress from the split.
           /tmp/kcov-build/src/kcov --include-path="$(pwd)/git-commit-lock.sh" \
             coverage/kcov-out tests/git-commit-lock.test.sh 2>&1 | tee test-output/kcov-unit-suite.log
           /tmp/kcov-build/src/kcov --include-path="$(pwd)/git-commit-lock.sh" \

@@ -109,8 +109,9 @@ jobs:
       # Each suite is repeated `repeat` times under load. The loop fails fast: the
       # first failing iteration `exit 1`s the step (so the step — and job — go red on
       # the earliest flake), and every iteration names its index in the log so a
-      # failure is attributable to a specific repeat. `set -e` is NOT in effect
-      # (default bash here), so we check with-load.sh's propagated rc explicitly.
+      # failure is attributable to a specific repeat. Under `shell: bash` (-eo
+      # pipefail) a failing suite pipeline already trips the step; the explicit
+      # PIPESTATUS check is a defensive backstop that also names the failing iteration.
       - name: Unit suite (deep, looped x repeat, under load)
         if: ${{ matrix.leg == 'all' || matrix.leg == 'unit' }}
         timeout-minutes: ${{ matrix.os == 'windows-2025' && 100 || 90 }}
