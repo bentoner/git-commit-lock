@@ -125,7 +125,7 @@ robust-by-code-but-unverified · S static/grep check · (plat) platform-gated.
 | D4 | Non-lock CONTENT at path (user file) | Never stolen (content guard); warn | 1 | ✓ U:1034-1076 | **In scope.** Two accepted residuals (§D4). |
 | D5 | Case-insensitive FS path collision | Not handled explicitly | 3 | ✗ | **Likely non-issue;** see §D5. Decide. |
 | E1 | Network/shared FS (NFS/SMB/9p/Dropbox) | Outside design guarantees (stated) | 3 | ✗ | **Out of scope** (stated). See §E — decide whether to *enforce*. |
-| E2 | Multi-host clock skew / NTP jump | Implicitly single-clock; **not** addressed in docs | 3 (and a doc gap) | ✗ | **Out of scope** but UNDER-documented. See §E2. |
+| E2 | Multi-host clock skew / NTP jump | Single-clock assumption; documented (local jump → detected-98, safe) | 3 | ✗ | **Out of scope**; single-clock assumption documented. See §E2. |
 | E3 | mtime probe unreadable (staleness clock broken) | Warns loudly once; treats as not-stale → safe, recovery disabled → 97 | 2 | ✓ U:Test 42 | **Accept** — fails safe + announced. See §E3. |
 | F1 | Disk full (ENOSPC) during create/write | Create fails → wait; torn write ages out | 2/3 | ✓ U:Test 50 (Linux+sudo tmpfs; (plat) skip elsewhere) | **Tested** (§4.5) + document. See §F1. |
 | F2 | ENOSPC during LOG write | Swallowed (`|| true`); silent log loss | 2 | ✓ U:Test 49 (portable failing-log path) | **Tested** (§4.5); logging best-effort, lock unaffected. |
@@ -142,7 +142,7 @@ robust-by-code-but-unverified · S static/grep check · (plat) platform-gated.
 | I1 | bash⇄pwsh wire/format compatibility | Shared format; token grammar tightened to match | 1 | ✓ I:* throughout | **In scope.** Keep. |
 | I2 | Mixed-VERSION tree (old unserialized steal) | Prevention degrades to detection (98); `.dead.*` litter | 3 | ✗ | **Out of scope:** "upgrade both together." Residual 4. |
 | J1 | Logging subsystem failure | All log writes `|| true`; 1 MB self-truncate | 2 | ✓ U:Test 49 (via F2) | **Tested** (§4.5, via F2); logging never blocks the lock. |
-| K1 | Extreme load / CPU oversubscription / slow FS | Correctness holds; wall-clock bounds stretch | 2 | ~ (CI stress) | **Define the envelope.** See §K — the key analytical section. |
+| K1 | Extreme load / CPU oversubscription / slow FS | Correctness holds; wall-clock bounds stretch | 2 | ~ (CI stress) | **Envelope defined** (design doc + envelope tier). See §K — the key analytical section. |
 | K2 | Internal time budgets (poll, MAX_WAIT, read ladder) | Fixed schedules; tunable | 2 | ✓/~ | **In scope** as Tier-2 envelope. See §K. |
 
 U = `tests/git-commit-lock.test.sh`, I = `tests/git-commit-lock.interop.test.sh`,
@@ -203,7 +203,7 @@ ghost, cross-parsing each other's claim files, `I:1017-1088`).
 file's mtime is older than `STALE_SECS`, a waiter steals it. *Recovery is Tier
 1; recovery latency is Tier 2* (bounded by STALE + poll cadence under normal
 load). Tested via the stale-lock and empty-orphan steals (`U:197-210, 348-361`).
-**Recommend: in scope (recovery). Document the latency bound (§K).**
+**Recommend: in scope (recovery); latency bound documented (§K).**
 
 **B2 — Trappable death mid-claim (INT/TERM).** The EXIT/INT/TERM handlers are
 armed at acquire *start*, not at hold, in "claim-window mode"
@@ -436,13 +436,14 @@ principles about what can go wrong:
   (`git-commit-lock.sh:439-449`, `git-commit-lock.ps1:448-451`), never local
   time.
 
-*Tier 3 for cross-host (rides on E1); Tier 2 for a local NTP jump.* Untested.
-**Recommend:** (a) **document explicitly** that the tool assumes a single time
-source — i.e. single-host use (the common case) or a shared FS with a single
-server clock — and that this is *why* network/multi-host is out of scope; the
-current docs imply it but never say "one clock." (b) Note the reassuring part: a
-*local* clock jump is correctness-safe (degrades to the detected-98 lane), so no
-code change is warranted. This is a **doc gap, not a code gap.**
+*Tier 3 for cross-host (rides on E1); Tier 2 for a local NTP jump.* Untested — and
+no code change is warranted (see below). **Documented:** the design doc now states
+explicitly that the tool assumes a single time source — single-host use (the common
+case) or a shared FS with a single server clock — and that this is *why*
+network/multi-host is out of scope (`git-commit-lock.md`, "One time source"). It
+also records the reassuring part: a *local* clock jump is correctness-safe — a
+forward jump can prematurely steal a still-live lock, but that degrades to the
+detected exit-98 lane, never a silent double-commit. A doc matter, not a code gap.
 
 **E3 — mtime probe fails entirely (the staleness clock is unreadable).** Distinct
 from a *wrong* clock (E2): here the lock file's mtime cannot be read at all. Both
@@ -459,7 +460,7 @@ MAX_WAIT (97). *Tier 2 (safety held, recovery lost — and loudly announced).*
 Tested: unit Test 42 shadows the inner mtime probe to return empty on a present,
 stale ghost and asserts the fail-safe lane — the "Staleness detection is BROKEN"
 warn-once fires, the ghost is NOT stolen (left in place), and the waiter blocks to
-MAX_WAIT → 97. **Recommend: accept and document** — it is a
+MAX_WAIT → 97. **Recommend: accept; documented (§E3, `guarantees.md` BE-3)** — it is a
 host/FS-health failure the tool already detects and announces, and it fails *safe*
 (no false steal); the loud warning is the right behavior. This is also the clean
 reason recovery is a *Tier-1-within-envelope* property, not unconditional (see the
@@ -612,8 +613,8 @@ hard-exits the process **and** returns 0 **while displaced**. The *next* holder
 still recovers via staleness; only the abruptly-exiting one is unwarned. *Tier 2 —
 the residual edge of the fail-open lease.* Exercised indirectly: interop Test 5
 *uses* `[Environment]::Exit()` to fabricate a no-release orphan, confirming the
-bypass (`I:308-334`). **Recommend: document this as the explicit boundary of the
-no-silent-loss guarantee**, alongside the "commits must be fast" golden rule — a
+bypass (`I:308-334`). **Recommend: accept; documented as the explicit boundary of the
+no-silent-loss guarantee** (`guarantees.md` OOS-5 / G-S1), alongside the "commits must be fast" golden rule — a
 command that replaces/hard-exits the process mid-critical-section *after being
 displaced* is exactly the fail-open case the STALE budget exists to make rare. No
 code change closes it without the handle-based ops the design rejected (§H3).
@@ -748,14 +749,17 @@ concern:**
    the regression guard (`I:746-817`). **Recommend: keep that test; treat any
    regression here as Tier 1.**
 
-**Net K recommendation:** adopt the explicit envelope — *"correctness holds under
-any load; wall-clock recovery/timeout latency scales with poll cadence and
-scheduling, bounded by the configured knobs."* Put that sentence in the design
-doc. Then audit the suite's wall-clock assertions and **scope each to the load
-level it's meant to run at** (the stress branch's extreme `both/8-hog` mode is a
-flake-hunting tool, not a contract the product must meet on a 2-core runner).
-This is the cleanest way to stop chasing "flakes" that are really the test
-asserting a Tier-1 bound on a Tier-2 quantity.
+**Net K — the envelope, now adopted.** The explicit envelope — *"correctness holds
+under any load; wall-clock recovery/timeout latency scales with poll cadence and
+scheduling, bounded by the configured knobs"* — is stated in the design doc
+(`git-commit-lock.md`, "operating envelope") and in `load-testing-strategy.md` §1.
+The suite's wall-clock assertions are scoped to a load level via the envelope tier
+(`GCL_ENVELOPE_TIER` strict/relax, `ok_envelope`/`bad_envelope`): an oversubscribed
+runner's latency miss warns rather than reds, while the correctness asserts stay
+strict. So the stress branch's extreme `both/8-hog` mode is a flake-hunting tool,
+not a contract the product must meet on a 2-core runner — which structurally ends
+the chasing of "flakes" that are really a test asserting a Tier-1 bound on a
+Tier-2 quantity.
 
 ---
 
@@ -769,7 +773,7 @@ Item 3 (network FS) is **document-only**: do not build the FS-type probe. Item 5
 edge cases make the tool more maintainable and give future users confidence), rather than
 "accept untested". Every other recommendation is accepted as written.
 
-1. **Define and document the load/timing envelope (§K) — highest value.**
+1. **The load/timing envelope (§K) — highest value.**
    *Recommendation:* state in `docs/git-commit-lock.md` that correctness
    (exclusion, no silent loss, eventual recovery) is load-independent, while all
    wall-clock bounds (recovery latency, MAX_WAIT, the read ladder) are
@@ -779,14 +783,20 @@ edge cases make the tool more maintainable and give future users confidence), ra
    envelope misses, not product regressions. *This resolves the recurring
    "flake" question structurally.* Cost: doc + a test-bound audit; no product
    change.
+   *Status (done):* the envelope is stated in `docs/git-commit-lock.md` ("operating
+   envelope" — correctness load-independent, wall-clock bounds best-effort) and
+   `docs/load-testing-strategy.md` §1, and the suite's wall-clock assertions are
+   scoped to a load level via the envelope tier (`GCL_ENVELOPE_TIER`).
 
-2. **Multi-host / clock-skew assumption is under-documented (§E2) — doc gap, not
+2. **Multi-host / clock-skew assumption (§E2) — a doc matter, not a
    code gap.** The tool implicitly assumes a single time source; a *local* NTP
    jump is correctness-safe (degrades to the detected-98 lane), and cross-host
    skew only bites on a network FS that's already out of scope. *Recommendation:*
    add one explicit sentence — "assumes a single clock, i.e. single-host (the
    common case) or a shared FS with one server clock" — and the reassurance that
    a local clock jump cannot cause a silent double-commit. No code change.
+   *Status (done):* the single-clock sentence + local-jump reassurance are in
+   `docs/git-commit-lock.md` ("One time source").
 
 3. **Network/shared FS is out of scope but fails *silently* if entered (§E1).**
    The boundary is correctly stated in the design doc but only there.
@@ -795,6 +805,8 @@ edge cases make the tool more maintainable and give future users confidence), ra
    **not** attempt to *support* network FS, and **do not build** the optional
    FS-type startup probe — just document. (It would be cross-platform-awkward and
    incomplete anyway; Ben: "don't do the polish, just document.")
+   *Status (done):* the network/sync-FS boundary is stated in `README.md` (the
+   "local filesystems only" note); the FS-type probe was deliberately not built.
 
 4. **ps1-on-POSIX FIFO/device residual (§D3) and ps1 `-File` exit backstop gap
    (§H3) — accept as documented.** Both are real but confined to an unsupported
