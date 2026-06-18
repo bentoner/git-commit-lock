@@ -15,7 +15,10 @@ reference* (why the protocol is shaped this way and how it works). Where they
 appear to disagree, the **code and tests are authoritative**, then this contract,
 then the analysis, then the design narrative. Each guarantee below cites its
 witnessing test(s) and the failure-modes section that justifies it; the
-[Verification map](#7-verification-map) collects those pointers.
+[Verification map](#7-verification-map) collects those pointers. (Test and
+`file:line` citations are **anchors, not exact addresses**: find a test by its
+name/number — the line numbers reflect the tree when written and drift as files
+move.)
 
 This contract makes **no new claims** about behavior — it is a re-statement of
 the decisions recorded in `failure-modes.md` §4 as commitments. It does not

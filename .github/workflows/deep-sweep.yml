@@ -1,4 +1,4 @@
-# deep-sweep — Tier D of the load-testing strategy (docs/load-testing-strategy.md §9).
+# deep-sweep — Tier D of the load-testing strategy (see docs/load-testing-strategy.md).
 #
 # ON-DEMAND ONLY. This workflow is `workflow_dispatch`-only: it NEVER runs on push
 # or pull_request, and it NEVER gates anything (it is not a required check — this is
