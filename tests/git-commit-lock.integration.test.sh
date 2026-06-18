@@ -36,6 +36,13 @@
 # they expand inside a worker's `bash -c` invocation, not here.
 set -uo pipefail
 
+# Shared harness: PASS/FAIL/TAP counters, GCL_TAP/GCL_TEST_ONLY reads, ok/bad,
+# section, the finish EXIT-trap sentinel (calls our cleanup below). Resolved from
+# THIS script's own dir so it sources regardless of CWD.
+_HARNESS_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tests/_harness.sh
+. "$_HARNESS_DIR/_harness.sh"
+
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$DIR/.." && pwd)"   # the implementations live at the repo root
 LIB="$ROOT/git-commit-lock.sh"
@@ -59,11 +66,9 @@ cleanup() {
     rm -rf "$WORK" 2>/dev/null || true
   fi
 }
-trap cleanup EXIT
-
-PASS=0; FAIL=0
-ok()  { echo "PASS: $*"; PASS=$((PASS+1)); }
-bad() { echo "FAIL: $*"; FAIL=$((FAIL+1)); }
+# The finish EXIT-trap sentinel (defined in _harness.sh) calls the cleanup()
+# above and fails loudly if the suite died before setting DONE=1.
+trap finish EXIT
 
 # --- sizing ------------------------------------------------------------------
 # Commits serialise (that's the whole point), so wall time ≈ workers x commit
@@ -94,6 +99,15 @@ echo "fan-out mode: $GCL_MODE (bash swarm ${BROUNDS}x${BN}, mixed swarm ${MSH}+$
 # minutes-long run), fast poll so waiters don't add 2s each, and a generous but
 # bounded max wait so a wedge fails the suite instead of hanging it.
 LK_ENV=(AGENT_LOCK_STALE_SECS=300 AGENT_LOCK_POLL_SECS=0.2 AGENT_LOCK_MAX_WAIT=240)
+
+# Note-and-ignore the per-test selector the unit/interop suites honour: this
+# suite is ONE indivisible scenario (Tests 1-3 share a single repo + the ALL_IDS
+# accumulator, and Test 3 audits Tests 1+2's output), so a per-block selector
+# can't apply. If GCL_TEST_ONLY is set (read by _harness.sh), say so loudly on
+# stderr and run the whole scenario as normal.
+if [ -n "$GCL_TEST_ONLY" ]; then
+    echo "NOTE: integration suite ignores GCL_TEST_ONLY=\"$GCL_TEST_ONLY\" — Tests 1-3 are one indivisible scenario (shared repo + ALL_IDS audit); running the whole suite." >&2
+fi
 
 # --- scratch repo ------------------------------------------------------------
 REPO="$WORK/repo"; OUTD="$WORK/out"; NOHOOKS="$WORK/nohooks"
@@ -301,5 +315,7 @@ done
                   || bad "$n_next leftover claim file(s) beside the lock"
 
 echo
+DONE=1
 echo "==== INTEGRATION RESULT: $PASS passed, $FAIL failed (fan-out: $GCL_MODE) ===="
+[ "$GCL_TAP" = 1 ] && echo "1..$TAPN"
 [ "$FAIL" = 0 ]

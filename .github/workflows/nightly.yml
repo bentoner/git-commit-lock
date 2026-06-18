@@ -1,0 +1,316 @@
+name: nightly
+
+# Scheduled stress run: the test suites under calibrated background load (the
+# `tests/with-load.sh` wrapper) at one oversubscription level R≈2, plus a kcov
+# line-coverage gate and auto-triage of the results into labelled issues.
+#
+# This is NON-BLOCKING: there is no branch protection on this single-dev project
+# (decision 2026-06-18), so nightly never gates a PR. Its job is to catch
+# load-sensitive flakes and coverage regressions that the per-PR `tests.yml`
+# (no-load, strict) cannot.
+#
+# NOTE for a future maintainer: GitHub auto-DISABLES a `schedule` trigger after
+# ~60 days of repo inactivity. If the nightly history is empty, that may mean the
+# schedule was disabled (not that every run passed) — re-enable / revive it with a
+# manual `workflow_dispatch` run from the Actions tab. Rely on `workflow_dispatch`
+# as the always-available manual trigger.
+
+on:
+  schedule:
+    - cron: '23 8 * * *'   # 08:23 UTC daily — off-peak (low GitHub-hosted-runner contention)
+  workflow_dispatch:
+
+# One nightly at a time; a newer run supersedes an in-flight one.
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # The suites run at full fan-out, with the envelope (wall-clock) assertions
+  # RELAXED so an oversubscribed runner cannot turn a latency stretch into a red
+  # (only correctness assertions can fail the suite under load), and with the
+  # Axis-A waiter-count sweep {4,12,24} enabled.
+  GCL_TEST_FULL: 1
+  GCL_ENVELOPE_TIER: relax
+  GCL_TEST_SWEEP: 1
+  # One oversubscription level R≈2 (stressors ≈ 2 * nproc per kind, total capped at
+  # GCL_STRESS_RATIO_MAX * nproc by with-load.sh).
+  GCL_STRESS_RATIO: 2
+
+jobs:
+  # ── The 6 stress cells. Each runs the relevant suite(s) wrapped in with-load.sh
+  #    under one GCL_STRESS_KIND. `leg` selects which suites run (the all/unit/
+  #    interop-integration legs as in tests.yml; the canary runs as a step here, not a
+  #    leg): ubuntu/macos run the full set; windows splits unit vs interop-integration. ──
+  stress:
+    name: ${{ matrix.id }} ${{ matrix.os }} (${{ matrix.kind }}${{ matrix.leg != 'all' && format(', {0}', matrix.leg) || '' }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false   # every cell's verdict is signal — and triage needs them all
+      matrix:
+        include:
+          - { id: N1, os: ubuntu-24.04, leg: all,                  kind: cpu,  job_timeout: 70 }
+          - { id: N2, os: ubuntu-24.04, leg: all,                  kind: disk, job_timeout: 70 }
+          - { id: N3, os: ubuntu-24.04, leg: all,                  kind: both, job_timeout: 70 }
+          - { id: N4, os: macos-15,     leg: all,                  kind: disk, job_timeout: 70 }
+          - { id: N5, os: windows-2025, leg: interop-integration,  kind: disk, job_timeout: 55 }
+          - { id: N6, os: windows-2025, leg: unit,                 kind: both, job_timeout: 60 }
+    timeout-minutes: ${{ matrix.job_timeout }}   # generous: load slows everything; backstop only
+    defaults:
+      run:
+        shell: bash                  # on windows-2025 this is Git Bash (MINGW) — what the interop suite requires
+    env:
+      GCL_STRESS_KIND: ${{ matrix.kind }}
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0   # v6.0.3, SHA-pinned
+        with:
+          persist-credentials: false
+
+      - name: Toolchain versions (for reconstructing failures)
+        run: |
+          uname -a
+          bash --version | head -1
+          git --version
+          command -v stress-ng >/dev/null && stress-ng --version | head -1 || echo "stress-ng: NOT FOUND (with-load.sh uses the portable bash spinner)"
+          if command -v pwsh >/dev/null; then
+            pwsh -NoProfile -Command '"pwsh " + $PSVersionTable.PSVersion.ToString()'
+          else
+            echo "pwsh: NOT FOUND (interop suite will skip; integration runs bash-only)"
+          fi
+          if command -v powershell >/dev/null; then
+            powershell -NoProfile -Command '"powershell " + $PSVersionTable.PSVersion.ToString()'
+          else
+            echo "powershell (Windows PowerShell 5.1): NOT FOUND (interop Test 17 skips; expected on POSIX legs)"
+          fi
+          stat --version 2>/dev/null | head -1 || echo "stat: BSD variant"
+
+      - name: Unit suite (under load)
+        if: ${{ matrix.leg == 'all' || matrix.leg == 'unit' }}
+        timeout-minutes: ${{ matrix.os == 'windows-2025' && 40 || 25 }}   # raised: load + the N=24 sweep stretch wall-clock; a step timeout FAILS the step so the upload still runs
+        env:
+          GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/unit
+        run: |
+          mkdir -p test-output
+          bash tests/with-load.sh bash tests/git-commit-lock.test.sh 2>&1 | tee test-output/unit-suite.log
+
+      - name: Canary suite (under load)
+        # The concurrency canary moved out of the unit suite into its own file; still
+        # exercise it under oversubscription here (concurrency + load is the highest-value
+        # canary scenario). Runs in the same legs the unit suite does (sequentially after
+        # it — nightly is non-blocking, so no separate parallel cell is warranted).
+        if: ${{ !cancelled() && (matrix.leg == 'all' || matrix.leg == 'unit') }}
+        timeout-minutes: ${{ matrix.os == 'windows-2025' && 20 || 12 }}   # load stretches the full-width canary; a step timeout FAILS the step so the upload still runs
+        env:
+          GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/canary
+        run: |
+          mkdir -p test-output
+          bash tests/with-load.sh bash tests/git-commit-lock.canary.test.sh 2>&1 | tee test-output/canary-suite.log
+
+      - name: Interop suite (under load; bash + pwsh)
+        if: ${{ !cancelled() && (matrix.leg == 'all' || matrix.leg == 'interop-integration') }}   # run even if an earlier suite failed — every signal is useful
+        timeout-minutes: 30
+        env:
+          GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/interop
+        run: |
+          mkdir -p test-output
+          bash tests/with-load.sh bash tests/git-commit-lock.interop.test.sh 2>&1 | tee test-output/interop-suite.log
+
+      - name: Integration suite (under load; real concurrent commits)
+        if: ${{ !cancelled() && (matrix.leg == 'all' || matrix.leg == 'interop-integration') }}
+        timeout-minutes: 20           # its internal AGENT_LOCK_MAX_WAIT cap is 240s; load + sweep stretch it
+        env:
+          GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/integration
+        run: |
+          mkdir -p test-output
+          bash tests/with-load.sh bash tests/git-commit-lock.integration.test.sh 2>&1 | tee test-output/integration-suite.log
+
+      - name: Record this cell's conclusion (ground truth for triage)
+        if: ${{ always() }}   # capture the cell's own status — even on timeout/cancel — into its artifact
+        run: |
+          mkdir -p test-output
+          # job.status here reflects THIS cell's run so far: success | failure | cancelled.
+          # A step timeout fails the step, which makes the job status `failure` by the time
+          # this always() step runs — so a no-FAIL timeout is recorded as `failure`, and the
+          # triage script (seeing logs present but conclusion!=success and no ^FAIL:) classes
+          # it infra. The per-cell status file is the authoritative signal triage reads.
+          printf '%s' "${{ job.status }}" > test-output/cell-conclusion.txt
+          echo "cell ${{ matrix.id }} conclusion: $(cat test-output/cell-conclusion.txt)"
+
+      - name: Upload cell logs + load-manifest (on success too — we read the positives by the negatives)
+        if: ${{ always() }}   # upload whether the cell passed, failed, or timed out — triage needs every cell's evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1, SHA-pinned
+        with:
+          name: nightly-logs-${{ matrix.id }}   # unique per cell; the triage job downloads these by name
+          path: test-output/
+          include-hidden-files: true   # lock logs live under the scratch repo's .git/ (hidden); suite-generated, no secrets
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ── kcov line-coverage gate. Linux-only, no load, strict, unit + canary at FULL.
+  #    Build kcov v43 from source (no apt package / prebuilt). Gate at 0.80. ──────
+  kcov:
+    name: kcov coverage (Linux, no load, strict)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      COVERAGE_FLOOR: '0.80'   # tracks achieved (~83%) — RATCHET UP toward ~0.90 as Tier-A tests land; do not let it lead coverage
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0   # v6.0.3, SHA-pinned
+        with:
+          persist-credentials: false
+
+      - name: Install kcov build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ make pkg-config \
+            libdw-dev libelf-dev binutils-dev libcurl4-openssl-dev zlib1g-dev libiberty-dev
+
+      - name: Build kcov v43 from source
+        run: |
+          set -euo pipefail
+          cd /tmp
+          curl -fsSL https://github.com/SimonKagstrom/kcov/archive/refs/tags/v43.tar.gz | tar xz
+          mkdir kcov-build && cd kcov-build
+          cmake ../kcov-43
+          make -j"$(nproc)"
+          ./src/kcov --version
+
+      - name: Run unit + canary suites under kcov (FULL, strict, no load)
+        env:
+          GCL_TEST_FULL: 1
+          # Set strict EXPLICITLY here to override the workflow-level GCL_ENVELOPE_TIER: relax
+          # (which this step would otherwise inherit) — we want a true, clean coverage run with
+          # the wall-clock envelope assertions enforced, no load applied.
+          GCL_ENVELOPE_TIER: strict
+          GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/kcov-unit
+        run: |
+          set -euo pipefail
+          mkdir -p test-output coverage
+          # The concurrency canary now lives in its own file; run BOTH the unit suite
+          # and the canary under kcov into the SAME output dir. kcov ACCUMULATES
+          # coverage across multiple runs that share one output dir, writing the union
+          # to coverage/kcov-out/kcov-merged/cobertura.xml (NOT a top-level
+          # cobertura.xml — the enforcement step below reads the merged union by
+          # selecting the highest lines-covered), so the canary's coverage of
+          # git-commit-lock.sh is preserved and the 0.80 floor cannot regress from the split.
+          /tmp/kcov-build/src/kcov --include-path="$(pwd)/git-commit-lock.sh" \
+            coverage/kcov-out tests/git-commit-lock.test.sh 2>&1 | tee test-output/kcov-unit-suite.log
+          /tmp/kcov-build/src/kcov --include-path="$(pwd)/git-commit-lock.sh" \
+            coverage/kcov-out tests/git-commit-lock.canary.test.sh 2>&1 | tee test-output/kcov-canary-suite.log
+
+      - name: Enforce coverage floor (parse cobertura line-rate)
+        run: |
+          set -euo pipefail
+          # kcov does NOT write a top-level coverage/kcov-out/cobertura.xml. The two runs
+          # (unit + canary) into one outdir produce per-binary reports under
+          # coverage/kcov-out/<binary>.<hash>/cobertura.xml and a merged union at
+          # coverage/kcov-out/kcov-merged/cobertura.xml. All cover the same source
+          # git-commit-lock.sh, so they share an identical lines-valid — a lines-valid
+          # tie-break would keep whatever find returns first (a single-suite report).
+          # Pick the highest lines-COVERED instead: the merged union has the most covered
+          # lines, so this robustly selects it (for a single run there's just one report).
+          cob=""
+          best_covered=-1
+          while IFS= read -r f; do
+            c="$(grep -oE 'lines-covered="[0-9]+"' "$f" 2>/dev/null | head -1 | grep -oE '[0-9]+')"
+            c="${c:-0}"
+            if [ "$c" -gt "$best_covered" ]; then best_covered="$c"; cob="$f"; fi
+          done < <(find coverage/kcov-out -name cobertura.xml 2>/dev/null)
+          if [ -z "$cob" ] || [ ! -f "$cob" ]; then
+            echo "::error::no cobertura.xml found under coverage/kcov-out — kcov produced no report"
+            find coverage/kcov-out -maxdepth 3 -type f 2>/dev/null | sed 's/^/  /'
+            exit 1
+          fi
+          echo "Parsing coverage from: $cob (lines-covered=$best_covered)"
+          # Prefer the precise lines-covered/lines-valid ratio (exact); fall back to the
+          # rounded line-rate attribute. Both live on the top-level <coverage ...> tag.
+          covered="$(grep -oE 'lines-covered="[0-9]+"' "$cob" | head -1 | grep -oE '[0-9]+')"
+          valid="$(grep -oE 'lines-valid="[0-9]+"' "$cob" | head -1 | grep -oE '[0-9]+')"
+          rate="$(grep -oE 'line-rate="[0-9.]+"' "$cob" | head -1 | grep -oE '[0-9.]+')"
+          if [ -n "$covered" ] && [ -n "$valid" ] && [ "$valid" -gt 0 ]; then
+            # exact ratio to 4 dp, integer arithmetic (no bc/python dependency)
+            rate="$(awk -v c="$covered" -v v="$valid" 'BEGIN { printf "%.4f", c / v }')"
+            echo "Line coverage: $covered / $valid = $rate"
+          else
+            echo "Line coverage (from line-rate attribute): $rate (lines-covered/valid unavailable)"
+          fi
+          floor="$COVERAGE_FLOOR"
+          # Compare rate >= floor with awk (float-safe).
+          if awk -v r="$rate" -v f="$floor" 'BEGIN { exit !(r + 0 >= f + 0) }'; then
+            echo "PASS: line coverage $rate >= floor $floor"
+            echo "NOTE: the floor ($floor) tracks the achieved coverage (~0.83); ratchet it up toward ~0.90 as more Linux-coverable tests land. The Linux ceiling is ~0.94 (~30 lines are platform-gated)."
+          else
+            echo "::error::line coverage $rate is BELOW the floor $floor — coverage regressed"
+            echo "The floor tracks achieved coverage (~0.83) and should only ratchet UP as tests land. A drop means a test stopped exercising lines it used to. Investigate before lowering the floor."
+            exit 1
+          fi
+
+      - name: Upload coverage report (HTML + cobertura)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1, SHA-pinned
+        with:
+          name: kcov-coverage
+          path: |
+            coverage/kcov-out/
+            test-output/kcov-unit-suite.log
+            test-output/kcov-canary-suite.log
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ── Auto-triage. Downloads every cell's artifact, classifies (correctness /
+  #    envelope / infra), and files/append ONE labelled issue per (date, class).
+  #    Runs always() so a failed/cancelled cell is still triaged; the empty-round
+  #    guard prevents "0 FAIL across 0 logs" being read as green. ─────────────────
+  triage:
+    name: Triage nightly results
+    needs: [stress, kcov]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0   # v6.0.3, SHA-pinned
+        with:
+          persist-credentials: false
+
+      - name: Download all cell artifacts
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53   # v6.0.0, SHA-pinned
+        with:
+          path: artifacts
+          # pattern restricts to the per-cell logs (not kcov-coverage); merge-multiple off
+          # so each lands in its own `nightly-logs-<id>/` dir, as the triage script expects.
+          pattern: nightly-logs-*
+        continue-on-error: true   # a totally-missing artifact set must reach the empty-round guard, not error the job
+
+      - name: Ensure triage labels exist (idempotent)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          gh label create nightly-correctness -c '#d73a4a' -d 'Nightly stress: a correctness assertion failed — investigate' --force || true
+          gh label create nightly-envelope    -c '#fbca04' -d 'Nightly stress: wall-clock envelope relaxed under load — expected, tracked' --force || true
+          gh label create nightly-infra        -c '#0e8a16' -d 'Nightly stress: infra issue (missing artifact / timeout / errored) — not a product failure' --force || true
+
+      - name: Classify results and file/append issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACTS_DIR: artifacts
+          EXPECTED_CELLS: 'N1 N2 N3 N4 N5 N6'
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          # Each cell's status is ground truth from its OWN artifact
+          # (nightly-logs-<id>/cell-conclusion.txt, written by the stress job under
+          # always()), so the script never relies on the misleading matrix-aggregate
+          # `needs.stress.result`. The empty-round guard fires if NO cell artifact exists.
+          echo "Artifacts present:"; ls -la artifacts 2>/dev/null || echo "  (none)"
+          bash .github/scripts/nightly-triage.sh

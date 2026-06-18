@@ -5,8 +5,7 @@
 # OS / editor cruft
 .DS_Store
 Thumbs.db
-/.agent/review-queue
-/.agent/review-queue.lock
-/.agent/review-queue.lock.*
-/.agent/last-opened
-/.agent/.tmp.*
+*.stackdump
+
+# Test/CI artifact output (manifests, suite logs); created at runtime, never committed.
+test-output/
