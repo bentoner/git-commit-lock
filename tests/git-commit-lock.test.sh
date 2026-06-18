@@ -2578,7 +2578,8 @@ if section "Test 42: mtime unreadable — staleness disabled, fail-safe (no stea
 # PRESENT file), staleness detection is BROKEN. The mtime floor fails closed to
 # "fresh": _lock_verify_stale returns state=fresh, so a crashed/stale holder is
 # NEVER stolen — recovery is disabled and waiters block to MAX_WAIT (97). The
-# tool must say so LOUDLY, exactly once per process. Test 1 only asserts the
+# tool must say so LOUDLY, exactly once per process. The concurrency canary
+# (formerly Test 1, now tests/git-commit-lock.canary.test.sh) only asserts the
 # NEGATIVE (the warning must NOT fire under healthy contention); this drives the
 # positive lane.
 #

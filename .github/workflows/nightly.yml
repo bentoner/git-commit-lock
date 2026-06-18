@@ -149,7 +149,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  # ── kcov line-coverage gate. Linux-only, no load, strict, unit suite at FULL.
+  # ── kcov line-coverage gate. Linux-only, no load, strict, unit + canary at FULL.
   #    Build kcov v43 from source (no apt package / prebuilt). Gate at 0.80. ──────
   kcov:
     name: kcov coverage (Linux, no load, strict)
