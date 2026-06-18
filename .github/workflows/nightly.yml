@@ -101,7 +101,7 @@ jobs:
         # canary scenario). Runs in the same legs the unit suite does (sequentially after
         # it — nightly is non-blocking, so no separate parallel cell is warranted).
         if: ${{ !cancelled() && (matrix.leg == 'all' || matrix.leg == 'unit') }}
-        timeout-minutes: ${{ matrix.os == 'windows-2025' && 20 || 12 }}   # load + sweep stretch the full-width canary; a step timeout FAILS the step so the upload still runs
+        timeout-minutes: ${{ matrix.os == 'windows-2025' && 20 || 12 }}   # load stretches the full-width canary; a step timeout FAILS the step so the upload still runs
         env:
           GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/canary
         run: |
@@ -184,6 +184,7 @@ jobs:
           # GCL_ENVELOPE_TIER unset => strict (we want a true, clean coverage run; no load applied)
           GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/kcov-unit
         run: |
+          set -euo pipefail
           mkdir -p test-output coverage
           # The concurrency canary now lives in its own file; run BOTH the unit suite
           # and the canary under kcov into the SAME --include-path outdir. kcov
@@ -199,23 +200,27 @@ jobs:
       - name: Enforce coverage floor (parse cobertura line-rate)
         run: |
           set -euo pipefail
-          # kcov writes a per-binary report under coverage/kcov-out/<binary>.<hash>/ and a
-          # merged top-level coverage/kcov-out/cobertura.xml. For a single-binary run they
-          # are equivalent; pick the one with the highest lines-valid (most complete) so
-          # this is robust either way.
+          # kcov does NOT write a top-level coverage/kcov-out/cobertura.xml. The two runs
+          # (unit + canary) into one outdir produce per-binary reports under
+          # coverage/kcov-out/<binary>.<hash>/cobertura.xml and a merged union at
+          # coverage/kcov-out/kcov-merged/cobertura.xml. All cover the same source
+          # git-commit-lock.sh, so they share an identical lines-valid — a lines-valid
+          # tie-break would keep whatever find returns first (a single-suite report).
+          # Pick the highest lines-COVERED instead: the merged union has the most covered
+          # lines, so this robustly selects it (for a single run there's just one report).
           cob=""
-          best_valid=-1
+          best_covered=-1
           while IFS= read -r f; do
-            v="$(grep -oE 'lines-valid="[0-9]+"' "$f" 2>/dev/null | head -1 | grep -oE '[0-9]+')"
-            v="${v:-0}"
-            if [ "$v" -gt "$best_valid" ]; then best_valid="$v"; cob="$f"; fi
+            c="$(grep -oE 'lines-covered="[0-9]+"' "$f" 2>/dev/null | head -1 | grep -oE '[0-9]+')"
+            c="${c:-0}"
+            if [ "$c" -gt "$best_covered" ]; then best_covered="$c"; cob="$f"; fi
           done < <(find coverage/kcov-out -name cobertura.xml 2>/dev/null)
           if [ -z "$cob" ] || [ ! -f "$cob" ]; then
             echo "::error::no cobertura.xml found under coverage/kcov-out — kcov produced no report"
             find coverage/kcov-out -maxdepth 3 -type f 2>/dev/null | sed 's/^/  /'
             exit 1
           fi
-          echo "Parsing coverage from: $cob (lines-valid=$best_valid)"
+          echo "Parsing coverage from: $cob (lines-covered=$best_covered)"
           # Prefer the precise lines-covered/lines-valid ratio (exact); fall back to the
           # rounded line-rate attribute. Both live on the top-level <coverage ...> tag.
           covered="$(grep -oE 'lines-covered="[0-9]+"' "$cob" | head -1 | grep -oE '[0-9]+')"
