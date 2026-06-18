@@ -14,7 +14,7 @@ guarantees the suites assert against, see `docs/guarantees.md` and
 This is not a throughput-bound system whose correctness degrades under load. Safety
 and exclusion rest on structural primitives — `O_EXCL` create, atomic `rename(2)`,
 per-attempt token discovery — that never consult the clock for a *correctness*
-decision (`guarantees.md` §E, BE-1; `failure-modes.md` §K). No amount of CPU or IO
+decision (`guarantees.md` §2A, BE-1; `failure-modes.md` §K). No amount of CPU or IO
 pressure makes a rename non-atomic or lets two `O_EXCL` creates both win on a local
 filesystem.
 

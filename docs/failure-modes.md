@@ -8,7 +8,8 @@ we guarantee this" or "no, out of scope."
 
 **Sources of truth, in order:** the product code
 (`git-commit-lock.sh`, `git-commit-lock.ps1`) and the test suites
-(`tests/git-commit-lock.test.sh`, `tests/git-commit-lock.interop.test.sh`,
+(`tests/git-commit-lock.test.sh`, `tests/git-commit-lock.canary.test.sh`,
+`tests/git-commit-lock.interop.test.sh`,
 `tests/git-commit-lock.integration.test.sh`). Every claim below cites
 `file:line`. The narrative docs (`README.md`, `docs/git-commit-lock.md`) and
 the implementation header comments are corroborating, not authoritative — where
@@ -121,7 +122,7 @@ robust-by-code-but-unverified · S static/grep check · (plat) platform-gated.
 | C4 | Leaked claim (unverifiable unlink) | Leaked-token memory keeps ownership discoverable | 1 | ✓ U:1549-1758, U:2013-2164 | **In scope.** Keep. |
 | D1 | Atomic rename-over (steal install) | `mv -T` / `File.Move(...,true)` / 5.1 unlink+move | 1 (local FS) | ✓ U:212-346, I:16d S:1141 | **In scope on local FS.** Boundary = D-axis. |
 | D2 | O_EXCL atomic create | `set -C` redirect / `FileMode.CreateNew` | 1 (local FS) | ✓ throughout | **In scope on local FS.** |
-| D3 | Wrong-type at path (dir/symlink/FIFO/dev/socket) | Never stolen/deleted; loud warn; waiters → 97 | 1 (bash + ps1-on-Win) / 2 (ps1-on-POSIX) | ✓ U:818-892/1156-1262/Test 37 (rename-refused mid-steal), ~(plat) | **In scope.** ps1-on-POSIX residual = accept. |
+| D3 | Wrong-type at path (dir/symlink/FIFO/dev/socket) | Never stolen/deleted; loud warn; waiters → 97 | 1 (bash + ps1-on-Win) / 2 (ps1-on-POSIX) | ✓ U:818-892/1156-1262/Test 37 (rename-refused mid-steal)/Test 44 (socket+device), ~(plat) | **In scope.** ps1-on-POSIX residual = accept. |
 | D4 | Non-lock CONTENT at path (user file) | Never stolen (content guard); warn | 1 | ✓ U:1034-1076 | **In scope.** Two accepted residuals (§D4). |
 | D5 | Case-insensitive FS path collision | Not handled explicitly | 3 | ✗ | **Likely non-issue;** see §D5. Decide. |
 | E1 | Network/shared FS (NFS/SMB/9p/Dropbox) | Outside design guarantees (stated) | 3 | ✗ | **Out of scope** (stated). See §E — decide whether to *enforce*. |
@@ -335,7 +336,8 @@ guards apply to the claim path with independent per-path warn-once state
 noclobber `>` onto a FIFO blocks in `open(2)` before any timeout logic — a hang,
 not a warning. *Tier 1 on bash, and on ps1-on-Windows.* Tested: Test 17
 (dir/symlink/FIFO at lock path), Test 22 (claim path), Test 17d (churn must not
-false-warn) (`U:818-892, 1156-1262, 894-1032`).
+false-warn), and Test 44 (the socket & device-node arms of the same classifier,
+bash; POSIX CI legs) (`U:818-892, 1156-1262, 894-1032`).
 
 > **The one real D3 boundary — ps1 on POSIX (Tier 2, accepted).** The .NET API
 > exposes no portable type bit for FIFO/device/socket on Unix; they stat as size

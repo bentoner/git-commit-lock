@@ -4,14 +4,15 @@
 #
 # Invoked by the `triage` job in .github/workflows/nightly.yml AFTER it has
 # downloaded every matrix cell's `test-output/` artifact (each into a directory
-# named `nightly-logs-<cell-id>/`) and written the per-cell job conclusions to a
-# JSON file. It reads only files on disk + `gh`; it makes no test decisions of its
-# own beyond parsing the preserved logs.
+# named `nightly-logs-<cell-id>/`, each carrying that cell's own
+# `cell-conclusion.txt`). It reads only files on disk + `gh`; it makes no test
+# decisions of its own beyond parsing the preserved logs.
 #
 # CLASSIFICATION:
-#   correctness  — any `^FAIL:` line in a suite log, OR a cell job concluded
-#                  `failure`. Files/append a `nightly-correctness` issue. The one
-#                  class that demands investigation.
+#   correctness  — any `^FAIL:` line in a suite log (a genuine assertion failure).
+#                  Files/append a `nightly-correctness` issue. The one class that
+#                  demands investigation. (A job that concluded `failure`/timed out
+#                  WITHOUT a `^FAIL:` line is infra, not correctness — see below.)
 #   envelope     — no FAIL anywhere, but at least one `WARN[env-relaxed]` line in a
 #                  log of a cell that *succeeded*. Tracked (`nightly-envelope`); the
 #                  three wall-clock envelope assertions stretched under load — by
@@ -33,11 +34,11 @@
 # Inputs (environment):
 #   ARTIFACTS_DIR   dir holding the downloaded per-cell artifact directories
 #                   (default: ./artifacts). Each cell dir is `nightly-logs-<id>/`.
-#   CONCLUSIONS     path to a JSON object { "<cell-id>": "<conclusion>", ... } of
-#                   each matrix cell job's `result` (success|failure|cancelled|
-#                   skipped). Read from `<cell-dir>/cell-conclusion.txt`, which each
-#                   stress cell writes (always()) into its own artifact — so the
-#                   conclusion is ground truth PER CELL, never a matrix aggregate.
+#   (Per-cell job conclusions are read from FILES, not env: each stress cell writes
+#                   its own `result` — success|failure|cancelled|skipped — to
+#                   `<cell-dir>/cell-conclusion.txt` under always(), and the script
+#                   reads that file directly. Ground truth PER CELL, never a matrix
+#                   aggregate.)
 #   EXPECTED_CELLS  space-separated list of cell ids that were supposed to run
 #                   (default: the six N1..N6 ids). Lets the empty-round / missing-
 #                   artifact guard know what to expect.

@@ -162,6 +162,7 @@ bug.
   *Two accepted residuals* bound this and are documented, not bugs: a stale
   *empty* user file, and a stale file whose line 1 happens to start `tok.`, are
   stolen (`git-commit-lock.sh:298-311`). *Witness:* unit Tests 17/17d/18/22
+  (dir/symlink/FIFO/content) and Test 44 (socket & device-node, bash; POSIX CI)
   (`U:818-892,894-1032,1034-1076,1156-1262`). *Basis:* §D3/§D4/§G1. *Scoped
   exception:* ps1-on-POSIX has no .NET type probe for FIFO/device/socket (§5,
   OOS-4).
@@ -407,7 +408,7 @@ unreadable-mtime fail-safe (Test 42). The one remaining document-only lane is F3
 | G-S1 no silent lost update | U Test 4b + Test 16 (unverifiable lane); I Test 8 (both dirs) | §1, §B5 |
 | G-S2 no corruption / no false hold | U Tests 32/32b (read-back failure); **resource lanes: Test 48 (F4), Test 50 (F1); F3 document-only** | §1, §A1, §F |
 | G-S3 strict exclusion in window + no displacement | C Test 1 (8×25 canary); U Tests 2b/20; I Tests 1/6/16/16b; integ | §A1/§A2/§A3 |
-| G-S4 never destroys non-lock-shaped | U Tests 17/17d/18/22 | §D3/§D4/§G1 |
+| G-S4 never destroys non-lock-shaped | U Tests 17/17d/18/22 (dir/symlink/FIFO) + Test 44 (socket/device) | §D3/§D4/§G1 |
 | G-S5 truthful exit codes | U Tests 7/8/4b/5/16; I run-verdict tests | §1, §H4 |
 | G-R1 lock-shaped orphans reclaimed | U Tests 2/3/21 | §B1/§C1/§C2/§C3 |
 | G-R2 one stuck agent can't wedge | stale-steal + crashed-claimant lanes | §1 |
