@@ -577,6 +577,7 @@ unavailable):
 | `git-commit-lock.sh`                  | the mutex (bash; the authoritative implementation): source for `lock_acquire/lock_release/lock_run`, or `git-commit-lock.sh run -- <cmd>` |
 | `git-commit-lock.ps1`                 | wire-compatible PowerShell port (see [The PowerShell port](#the-powershell-port-git-commit-lockps1) above): `git-commit-lock.ps1 run "<pwsh cmd>"`, or dot-source for `Lock-Acquire`/`Lock-Release` |
 | `tests/git-commit-lock.test.sh`             | self-contained bash tests (throwaway temp dirs); exit 0 == all pass |
+| `tests/git-commit-lock.canary.test.sh`      | bash concurrency canary: mutual exclusion under many concurrent workers, plus the contended crash-recovery / claim-serialization scenarios (throwaway temp dirs) |
 | `tests/git-commit-lock.interop.test.sh`     | cross-impl tests: pwsh + bash workers share one lock and serialise; run from MINGW/Git-Bash |
 | `tests/git-commit-lock.integration.test.sh` | end-to-end: many concurrent workers make real commits into one shared repo; the history is audited for the tool's guarantees |
 
@@ -587,20 +588,25 @@ Run the suites from a clone of this repository (they are not installed to
 
 ```sh
 bash tests/git-commit-lock.test.sh             # bash implementation
+bash tests/git-commit-lock.canary.test.sh      # bash concurrency canary (mutual exclusion + crash recovery under load)
 bash tests/git-commit-lock.interop.test.sh     # bash + PowerShell interop (skips if pwsh is absent)
 bash tests/git-commit-lock.integration.test.sh # end-to-end: concurrent real commits into one repo (pwsh half skips if absent)
 ```
 
 Each suite prints a result summary line and exits 0 when everything passes.
-All three use throwaway temp dirs and never touch the repo you launch them
+All four use throwaway temp dirs and never touch the repo you launch them
 from. The heavy fan-out tests run at a REDUCED width by default, so a routine
 run doesn't lag a shared development machine; each suite prints a
 `fan-out mode:` line at the start and tags its result line with the mode, so
 check those say `FULL` when you ran `GCL_TEST_FULL=1` for the full-strength
 canary (CI does).
 
-`tests/git-commit-lock.test.sh` covers the bash implementation: mutual exclusion
-under many concurrent workers (clean acquire/release path), stale-lock theft,
+`tests/git-commit-lock.canary.test.sh` is the concurrency canary: mutual
+exclusion under many concurrent workers (clean acquire/release path) over
+repeated rounds — the statistical scenario that needs the full 8×25 fan-out
+(`GCL_TEST_FULL=1`, which CI runs) to trust a rare exclusion race.
+
+`tests/git-commit-lock.test.sh` covers the bash implementation: stale-lock theft,
 crash recovery under contention (several waiters racing one dead lock —
 claim-serialized: exactly one steal, zero displacements, zero spurious 98s,
 and no move-aside file ever created), claim contention (many concurrent
@@ -664,7 +670,7 @@ is audited for the guarantees this document claims — every commit lands,
 history stays linear, no commit sweeps up another worker's file, no
 `index.lock` races, no stolen leases, and a clean tree at the end.
 
-The same three suites run in CI on Linux, macOS, and Windows
+The same four suites run in CI on Linux, macOS, and Windows
 (`.github/workflows/tests.yml`), at full fan-out strength, alongside a
 shellcheck + PSScriptAnalyzer lint job. The POSIX legs exercise the
 PowerShell implementation purely as cross-implementation protocol
@@ -680,9 +686,10 @@ heavy process fan-out is environmental, not a lock failure — but only the
 interop suite's exclusion test tolerates it (scoring by violations/steals,
 with a minimum-acquired floor so a collapsed fan-out cannot pass vacuously);
 the integration suite is deliberately strict per worker (every worker must
-launch and commit), and the unit suite's counts are exact.
+launch and commit), and the unit and canary suites' counts are exact (the
+canary requires every worker to acquire and release in each round).
 
-For debugging, all three suites copy their logs and work dirs to
+For debugging, all four suites copy their logs and work dirs to
 `$GCL_TEST_PRESERVE_DIR` when it is set, and keep the work dir on disk on any
 failure.
 

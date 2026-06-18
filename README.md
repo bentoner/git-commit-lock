@@ -256,9 +256,10 @@ knobs and how staleness and stealing work.
 
 ## Tests
 
-Three suites — bash unit, bash + PowerShell interop, and an end-to-end
-integration run of concurrent real commits — cover the tool, and CI runs
-them on Linux, macOS, and Windows. How to run them and what each covers:
+Four suites — bash unit, a bash concurrency canary, bash + PowerShell
+interop, and an end-to-end integration run of concurrent real commits —
+cover the tool, and CI runs them on Linux, macOS, and Windows. How to run
+them and what each covers:
 [`docs/git-commit-lock.md#tests`](docs/git-commit-lock.md#tests).
 
 ## Licence
