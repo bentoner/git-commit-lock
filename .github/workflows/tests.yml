@@ -32,16 +32,23 @@ jobs:
     strategy:
       fail-fast: false               # an OS-specific failure is the signal we want; let the others finish
       matrix:
-        # Windows splits into two parallel jobs — the bash-only unit suite is the
-        # wall-clock bottleneck there (~309s vs interop 100s + integration 28s;
-        # process-spawn overhead, not the PowerShell engines). Suites must NOT run
-        # concurrently inside one runner: they're timing-sensitive on 2-core
-        # runners. POSIX legs are fast enough to stay single-job.
+        # The concurrency CANARY (Test 1, full-width 25x8) is its OWN suite file and
+        # runs as a separate parallel `canary` cell on EVERY arch — it is ~half the
+        # Windows unit wall-clock (process-spawn overhead, not the PowerShell engines)
+        # and cheap on POSIX, so parallelising it is the per-PR wall-clock win.
+        # Windows otherwise splits unit vs interop-integration. Suites must NOT run
+        # concurrently inside one runner: they're timing-sensitive on 2-core runners.
+        # `leg: all` runs unit+interop+integration but NOT canary (the canary step
+        # gates on `leg == 'canary'` only). The job-name + artifact-name templates
+        # already key on matrix.leg, so the `canary` leg is named/uploaded uniquely.
         include:
           - { os: ubuntu-24.04, leg: all, job_timeout: 35 }
+          - { os: ubuntu-24.04, leg: canary, job_timeout: 15 }
           - { os: macos-15, leg: all, job_timeout: 35 }
+          - { os: macos-15, leg: canary, job_timeout: 15 }
           - { os: windows-2025, leg: unit, job_timeout: 20 }
           - { os: windows-2025, leg: interop-integration, job_timeout: 22 }
+          - { os: windows-2025, leg: canary, job_timeout: 15 }
     timeout-minutes: ${{ matrix.job_timeout }}   # backstop only: sum of the leg's step budgets + upload headroom
     defaults:
       run:
@@ -69,6 +76,15 @@ jobs:
             echo "powershell (Windows PowerShell 5.1): NOT FOUND (interop Test 17 skips; expected on POSIX legs)"
           fi
           stat --version 2>/dev/null | head -1 || echo "stat: BSD variant"
+
+      - name: Canary suite (full-width concurrency canary)
+        if: ${{ matrix.leg == 'canary' }}
+        timeout-minutes: ${{ matrix.os == 'windows-2025' && 7 || 6 }}   # ~151s on Windows + headroom; a step timeout FAILS the step (not the job) so the upload still runs
+        env:
+          GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/canary
+        run: |
+          mkdir -p test-output
+          bash tests/git-commit-lock.canary.test.sh 2>&1 | tee test-output/canary-suite.log
 
       - name: Unit suite
         if: ${{ matrix.leg == 'all' || matrix.leg == 'unit' }}
@@ -131,6 +147,7 @@ jobs:
             git-commit-lock.sh \
             tests/_harness.sh \
             tests/git-commit-lock.test.sh \
+            tests/git-commit-lock.canary.test.sh \
             tests/git-commit-lock.interop.test.sh \
             tests/git-commit-lock.integration.test.sh \
             .github/scripts/nightly-triage.sh \

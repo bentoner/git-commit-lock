@@ -132,6 +132,31 @@ jobs:
             fi
           done
 
+      - name: Canary suite (deep, looped x repeat, under load)
+        # The concurrency canary moved into its own file; the deep flake hunt should
+        # exercise it (a concurrency canary is exactly what a deep+loaded+repeated hunt
+        # is for). Same legs as the unit suite, same loop/fail-fast wrapping.
+        if: ${{ !cancelled() && (matrix.leg == 'all' || matrix.leg == 'unit') }}
+        timeout-minutes: ${{ matrix.os == 'windows-2025' && 100 || 90 }}
+        env:
+          GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/canary
+        run: |
+          mkdir -p test-output
+          n='${{ inputs.repeat }}'
+          case "$n" in ''|*[!0-9]*) n=1 ;; esac
+          [ "$n" -lt 1 ] && n=1
+          echo "== canary: repeating $n time(s) under load =="
+          for i in $(seq 1 "$n"); do
+            echo "== canary iteration $i/$n =="
+            bash tests/with-load.sh bash tests/git-commit-lock.canary.test.sh 2>&1 \
+              | tee "test-output/canary-suite.iter$i.log"
+            rc=${PIPESTATUS[0]}
+            if [ "$rc" -ne 0 ]; then
+              echo "== canary iteration $i/$n FAILED (rc=$rc) — stopping deep sweep =="
+              exit 1
+            fi
+          done
+
       - name: Interop suite (deep, looped x repeat, under load)
         if: ${{ !cancelled() && (matrix.leg == 'all' || matrix.leg == 'interop-integration') }}   # run even if an earlier suite failed — every signal is useful
         timeout-minutes: 90

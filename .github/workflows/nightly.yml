@@ -95,6 +95,19 @@ jobs:
           mkdir -p test-output
           bash tests/with-load.sh bash tests/git-commit-lock.test.sh 2>&1 | tee test-output/unit-suite.log
 
+      - name: Canary suite (under load)
+        # The concurrency canary moved out of the unit suite into its own file; still
+        # exercise it under oversubscription here (concurrency + load is the highest-value
+        # canary scenario). Runs in the same legs the unit suite does (sequentially after
+        # it — nightly is non-blocking, so no separate parallel cell is warranted).
+        if: ${{ !cancelled() && (matrix.leg == 'all' || matrix.leg == 'unit') }}
+        timeout-minutes: ${{ matrix.os == 'windows-2025' && 20 || 12 }}   # load + sweep stretch the full-width canary; a step timeout FAILS the step so the upload still runs
+        env:
+          GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/canary
+        run: |
+          mkdir -p test-output
+          bash tests/with-load.sh bash tests/git-commit-lock.canary.test.sh 2>&1 | tee test-output/canary-suite.log
+
       - name: Interop suite (under load; bash + pwsh)
         if: ${{ !cancelled() && (matrix.leg == 'all' || matrix.leg == 'interop-integration') }}   # run even if an earlier suite failed — every signal is useful
         timeout-minutes: 30
@@ -165,15 +178,23 @@ jobs:
           make -j"$(nproc)"
           ./src/kcov --version
 
-      - name: Run unit suite under kcov (FULL, strict, no load)
+      - name: Run unit + canary suites under kcov (FULL, strict, no load)
         env:
           GCL_TEST_FULL: 1
           # GCL_ENVELOPE_TIER unset => strict (we want a true, clean coverage run; no load applied)
           GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/kcov-unit
         run: |
           mkdir -p test-output coverage
+          # The concurrency canary now lives in its own file; run BOTH the unit suite
+          # and the canary under kcov into the SAME --include-path outdir. kcov
+          # ACCUMULATES coverage across multiple runs that share one output dir (it
+          # merges into the top-level cobertura.xml), so the canary's coverage of
+          # git-commit-lock.sh is preserved and the 0.80 floor cannot regress from
+          # the split.
           /tmp/kcov-build/src/kcov --include-path="$(pwd)/git-commit-lock.sh" \
             coverage/kcov-out tests/git-commit-lock.test.sh 2>&1 | tee test-output/kcov-unit-suite.log
+          /tmp/kcov-build/src/kcov --include-path="$(pwd)/git-commit-lock.sh" \
+            coverage/kcov-out tests/git-commit-lock.canary.test.sh 2>&1 | tee test-output/kcov-canary-suite.log
 
       - name: Enforce coverage floor (parse cobertura line-rate)
         run: |
@@ -226,6 +247,7 @@ jobs:
           path: |
             coverage/kcov-out/
             test-output/kcov-unit-suite.log
+            test-output/kcov-canary-suite.log
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 30
