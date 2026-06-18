@@ -2638,7 +2638,7 @@ g42="$(head -n 1 -- "$T42_LOCK" 2>/dev/null | tr -d '\r')"
   && ok "mtime-unreadable: waiter blocked to MAX_WAIT and exited 97" \
   || bad "mtime-unreadable: waiter rc=$t42_rc (want 97 — was the stale ghost stolen?)"
 # (4) Warn-once: the broken-staleness warning fires EXACTLY once per process.
-t42_warns="$(grep -c "Staleness detection is BROKEN" "$T42_ERR" 2>/dev/null || echo 0)"
+t42_warns="$(grep -c "Staleness detection is BROKEN" "$T42_ERR" 2>/dev/null)"; t42_warns="${t42_warns:-0}"
 [ "$t42_warns" -le 1 ] \
   && ok "mtime-unreadable: broken-staleness warning fired at most once on stderr ($t42_warns)" \
   || bad "mtime-unreadable: warning repeated ($t42_warns times — warn-once broken)"
@@ -2845,7 +2845,7 @@ rm -f "$LOCK" "$LOG"
 fi
 
 if section "Test 46: EXIT while waiting (no hold) — no-hold trap arc, no spurious release"; then
-# A10 (steering-coverage.md): _lock_on_exit's no-hold arc-end (:1009,1017-1018).
+# Covers _lock_on_exit's no-hold arc-end (sh:1009,1017-1018).
 # A sourced waiter, blocked in the wait loop against a LIVE held lock, exits 0
 # while still parked — the EXIT trap is STILL '_lock_on_exit' (the timeout's
 # trap-restore has NOT run, because we never time out), so EXIT fires the

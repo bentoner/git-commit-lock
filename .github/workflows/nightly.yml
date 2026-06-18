@@ -182,7 +182,10 @@ jobs:
       - name: Run unit + canary suites under kcov (FULL, strict, no load)
         env:
           GCL_TEST_FULL: 1
-          # GCL_ENVELOPE_TIER unset => strict (we want a true, clean coverage run; no load applied)
+          # Set strict EXPLICITLY here to override the workflow-level GCL_ENVELOPE_TIER: relax
+          # (which this step would otherwise inherit) — we want a true, clean coverage run with
+          # the wall-clock envelope assertions enforced, no load applied.
+          GCL_ENVELOPE_TIER: strict
           GCL_TEST_PRESERVE_DIR: ${{ github.workspace }}/test-output/failed-work/kcov-unit
         run: |
           set -euo pipefail

@@ -110,14 +110,16 @@ for cell in $EXPECTED_CELLS; do
     fi
   done
 
-  if [ "$cell_fail" -eq 1 ] || [ "$concl" = "failure" ]; then
-    correctness_evidence+="- ${cell}: job='${concl}'"
-    [ "$cell_fail" -eq 1 ] && correctness_evidence+=", FAIL lines present:"$'\n'"${fail_lines}" || correctness_evidence+=" (job failed; no ^FAIL: in logs — see job log)"$'\n'
+  if [ "$cell_fail" -eq 1 ]; then
+    # A real `^FAIL:` assertion line ⇒ correctness, regardless of job conclusion.
+    correctness_evidence+="- ${cell}: job='${concl}', FAIL lines present:"$'\n'"${fail_lines}"
     log "[$cell] CORRECTNESS (cell_fail=$cell_fail conclusion=$concl)"
   elif [ "$concl" != "success" ]; then
     # Logs exist but the job did not cleanly succeed and there is no assertion FAIL:
-    # timeout / cancelled / errored late ⇒ infra, not green.
-    infra_evidence+="- ${cell}: logs present but job conclusion='${concl}' (timeout/cancel/late error)"$'\n'
+    # failure-without-^FAIL / timeout / cancelled / errored late ⇒ infra, not
+    # correctness and not green (a failure WITHOUT a FAIL line is a step
+    # timeout/late error, which is infra per the Bucket 6 design).
+    infra_evidence+="- ${cell}: logs present but job conclusion='${concl}' (failure/timeout/cancel without ^FAIL: line)"$'\n'
     log "[$cell] INFRA (conclusion=$concl, no FAIL)"
   elif [ "$cell_envwarn" -eq 1 ]; then
     envelope_evidence+="- ${cell}: succeeded with WARN[env-relaxed] (envelope assertion(s) stretched under load — expected)"$'\n'

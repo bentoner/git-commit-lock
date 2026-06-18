@@ -3,9 +3,9 @@
 #
 # Sourced by all four suites (git-commit-lock.test.sh, .canary.test.sh,
 # .interop.test.sh, .integration.test.sh) to share the bits they all
-# copy-pasted: the PASS/FAIL/
-# TAP counters, the GCL_TAP / GCL_TEST_ONLY reads, ok()/bad(), section(), the
-# end-of-suite DONE sentinel (finish), and the per-test selector verdict helper.
+# copy-pasted: the PASS/FAIL/TAP counters, the GCL_TAP / GCL_TEST_ONLY reads,
+# ok()/bad(), section(), the end-of-suite DONE sentinel (finish), and the
+# per-test selector verdict helper.
 # Pure deduplication — ZERO behaviour change vs the inline copies it replaces.
 #
 # Contract for sourcing suites:
