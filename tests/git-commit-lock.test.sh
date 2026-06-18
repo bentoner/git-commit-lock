@@ -21,8 +21,10 @@
 # and command substitutions run inside conditions all over a test suite; the
 # suite runs WITHOUT errexit (set -uo only) and asserts on values, not on
 # implicit exit propagation.
-# shellcheck disable=SC2016  # $INCR is single-quoted on purpose: it expands
-# inside the worker's `bash -c`, not here.
+# shellcheck disable=SC2016  # Single-quoted strings carrying `$…` on purpose —
+# steering-shell bodies (the T*_INNER `bash -c` programs) and grep patterns that
+# match literal `$_LOCK_*` text in the library — expand in their own context, not
+# here.
 set -uo pipefail
 
 # Shared harness: PASS/FAIL/TAP counters, GCL_TAP/GCL_TEST_ONLY reads, ok/bad,
@@ -112,40 +114,10 @@ wait_for_file() {
   [ -e "$f" ]
 }
 
-# Critical section that loses updates without a mutex: read, gap, write+1.
-INCR='n="$(cat "$1")"; sleep 0.03; echo $((n+1)) > "$1"'
-
-if section "Test 1: concurrent workers, mutual exclusion (repeated rounds, $GCL_MODE width)"; then
-# A single pass is too weak to trust a rare exclusion race (the release-steal
-# bug found 2026-05-30 lost ~1 update per 25 only intermittently). Repeat
-# several rounds; ANY lost update across ALL rounds fails the test.
-# MAX_WAIT caps a regression at 180s per worker instead of the 420s default;
-# STALE stays comfortably above any realistic hold so nothing is ever stolen.
-N=$T1_N; ROUNDS=$T1_ROUNDS; t1_fail=0; T1ERR="$WORK/excl.err"; : > "$T1ERR"
-for r in $(seq 1 "$ROUNDS"); do
-  COUNTER="$WORK/counter.$r"; echo 0 > "$COUNTER"
-  LOCK="$WORK/excl.$r.lock"; LOG="$WORK/excl.$r.log"; : > "$LOG"; pids=()
-  for _ in $(seq 1 "$N"); do
-    AGENT_LOCK_PATH="$LOCK" AGENT_LOCK_LOG="$LOG" AGENT_LOCK_STALE_SECS=120 \
-      AGENT_LOCK_POLL_SECS=0.05 AGENT_LOCK_MAX_WAIT=180 \
-      bash "$LIB" run -- bash -c "$INCR" _ "$COUNTER" 2>> "$T1ERR" &
-    pids+=($!)
-  done
-  for p in "${pids[@]}"; do wait "$p"; done
-  c="$(cat "$COUNTER")"; a="$(grep -c ACQUIRED "$LOG")"; rl="$(grep -c RELEASED "$LOG")"
-  if [ "$c" != "$N" ] || [ "$a" != "$N" ] || [ "$rl" != "$N" ] || [ -e "$LOCK" ]; then
-    t1_fail=1; echo "  round $r: counter=$c acquired=$a released=$rl leftover=$([ -e "$LOCK" ] && echo yes || echo no)"
-  fi
-done
-[ "$t1_fail" = 0 ] && ok "$ROUNDS rounds x $N workers ($GCL_MODE): no lost updates, balanced acquire/release, no leftover lock" \
-                    || bad "mutual-exclusion failure in at least one round (see above)"
-# Regression: under contention the lock file routinely vanishes mid-mtime-probe;
-# that must NOT be misdiagnosed as "staleness detection broken" (false WARNING
-# observed 2026-06-10 before the probe got its retry loop).
-grep -q "Staleness detection is BROKEN" "$T1ERR" \
-  && bad "spurious mtime-probe WARNING under contention (see $T1ERR)" \
-  || ok "no spurious mtime-probe warnings under contention"
-fi
+# NB: Test 1 (the full-width concurrency CANARY) now lives in its own suite file,
+# tests/git-commit-lock.canary.test.sh, so it runs as a naturally-parallel CI job
+# (it is ~half the Windows unit wall-clock). The $INCR critical-section string it
+# used moved out with it (no other unit test uses it).
 
 if section "Test 2: stale lock (old file mtime) is stolen; holder comes from line 2"; then
 LOCK="$WORK/steal.lock"; LOG="$WORK/steal.log"; : > "$LOG"; MARKER="$WORK/steal-marker"

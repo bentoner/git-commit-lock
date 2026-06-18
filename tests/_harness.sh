@@ -1,8 +1,9 @@
 # shellcheck shell=bash
 # tests/_harness.sh — shared test harness for the git-commit-lock suites.
 #
-# Sourced by all three suites (git-commit-lock.test.sh, .interop.test.sh,
-# .integration.test.sh) to share the bits they all copy-pasted: the PASS/FAIL/
+# Sourced by all four suites (git-commit-lock.test.sh, .canary.test.sh,
+# .interop.test.sh, .integration.test.sh) to share the bits they all
+# copy-pasted: the PASS/FAIL/
 # TAP counters, the GCL_TAP / GCL_TEST_ONLY reads, ok()/bad(), section(), the
 # end-of-suite DONE sentinel (finish), and the per-test selector verdict helper.
 # Pure deduplication — ZERO behaviour change vs the inline copies it replaces.
